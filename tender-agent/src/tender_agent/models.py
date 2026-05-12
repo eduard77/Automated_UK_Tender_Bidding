@@ -269,3 +269,30 @@ class PollRun(Base):
     error: Mapped[str | None] = mapped_column(Text)
 
     source: Mapped[Source] = relationship(back_populates="runs")
+
+
+class PushSubscription(Base):
+    """Browser Web Push subscription. Anonymous by endpoint — no user accounts yet.
+
+    A subscription with `filter_profile_id IS NULL` receives every new match,
+    regardless of which filter triggered it. A subscription bound to a specific
+    profile receives only matches against that profile.
+    """
+
+    __tablename__ = "push_subscriptions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    filter_profile_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("filter_profiles.id", ondelete="CASCADE"),
+        index=True,
+    )
+    endpoint: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
+    p256dh: Mapped[str] = mapped_column(Text, nullable=False)
+    auth: Mapped[str] = mapped_column(Text, nullable=False)
+    user_agent: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+

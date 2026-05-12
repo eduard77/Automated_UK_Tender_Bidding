@@ -10,6 +10,7 @@ from fastapi import FastAPI
 
 from tender_agent import scheduler
 from tender_agent.api import filters as filters_api
+from tender_agent.api import push as push_api
 from tender_agent.api import tenders as tenders_api
 from tender_agent.config import settings
 
@@ -54,3 +55,4 @@ def health() -> dict:
 
 app.include_router(tenders_api.router)
 app.include_router(filters_api.router)
+app.include_router(push_api.router)

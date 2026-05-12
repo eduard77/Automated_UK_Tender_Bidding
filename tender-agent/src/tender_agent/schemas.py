@@ -157,3 +157,38 @@ class TenderDocumentFileRead(BaseModel):
     download_status: str
     error: str | None
     downloaded_at: datetime | None
+
+
+class PushSubscriptionKeys(BaseModel):
+    p256dh: str
+    auth: str
+
+
+class PushSubscriptionCreate(BaseModel):
+    """Mirrors the browser's PushSubscription.toJSON() plus an optional filter pin."""
+
+    endpoint: str
+    keys: PushSubscriptionKeys
+    filter_profile_id: int | None = None
+
+
+class PushUnsubscribe(BaseModel):
+    endpoint: str
+
+
+class PushSubscriptionRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    endpoint: str
+    filter_profile_id: int | None
+    user_agent: str | None
+    created_at: datetime
+    last_used_at: datetime | None
+
+
+class VapidPublicKey(BaseModel):
+    """Public VAPID key + subject. Public key only — private key never leaves the backend."""
+
+    public_key: str
+    subject: str
