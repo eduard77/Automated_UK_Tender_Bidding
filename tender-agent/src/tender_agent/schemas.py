@@ -87,11 +87,31 @@ class FilterProfileCreate(BaseModel):
     min_days_to_deadline: int | None = None
 
 
+class FilterProfileUpdate(BaseModel):
+    """Partial update — all fields optional. Omitted fields keep their stored value."""
+
+    name: str | None = None
+    enabled: bool | None = None
+    cpv_codes: list[str] | None = None
+    cpv_prefixes: list[str] | None = None
+    keywords_any: list[str] | None = None
+    keywords_all: list[str] | None = None
+    keywords_none: list[str] | None = None
+    buyer_names: list[str] | None = None
+    regions: list[str] | None = None
+    countries: list[str] | None = None
+    notice_types: list[str] | None = None
+    value_min: Decimal | None = None
+    value_max: Decimal | None = None
+    min_days_to_deadline: int | None = None
+
+
 class FilterProfileRead(FilterProfileCreate):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
     created_at: datetime
+    match_count: int = 0
 
 
 class TenderMatchRead(BaseModel):
