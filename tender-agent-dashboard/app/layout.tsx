@@ -19,10 +19,9 @@ export const viewport: Viewport = {
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
-  // VAPID is server-side at the layout level: if the key isn't configured we
-  // skip rendering the bell entirely (rather than render a permanently-disabled
-  // button). Push wiring lands in T3.
-  const vapidPublicKey = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY ?? "";
+  // PushBell is always rendered. It fetches the VAPID public key from
+  // /api/push/vapid-key on mount and hides itself when push isn't supported
+  // by the browser or isn't configured on the backend. No env gate here.
   return (
     <html lang="en">
       <body className="min-h-screen">
@@ -37,7 +36,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                 <Link href="/" className="text-bone/70 hover:text-bone transition">Tenders</Link>
                 <Link href="/filters" className="text-bone/70 hover:text-bone transition">Filters</Link>
               </nav>
-              {vapidPublicKey && <PushBell vapidPublicKey={vapidPublicKey} />}
+              <PushBell />
             </div>
           </div>
         </header>

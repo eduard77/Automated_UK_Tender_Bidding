@@ -1,20 +1,20 @@
-// Browser-side Web Push helpers. Backend subscribe/unsubscribe endpoints land in T3.
+// Browser-side Web Push helpers.
 //
-// Usage:
-//   - isSubscribed() — check current PushSubscription state on the active SW.
-//   - subscribePush(vapidPublicKey) — request permission, register SW, subscribe,
-//     and POST the subscription to the dashboard's local /api/push/subscribe proxy.
+// All backend traffic goes through the dashboard's own API routes (under
+// /api/push/*) which forward to the FastAPI backend — that keeps CORS simple
+// and lets us evolve auth/headers in one place later.
 //
-// The proxy route at /api/push/subscribe is added in T3; until then the POST will
-// 404 and subscribePush will throw.
+// VAPID public key comes from /api/push/vapid-key (proxied + cached) so the key
+// is never baked into the build. The private key is backend-only.
 
 const SW_PATH = "/sw.js";
-const SUBSCRIBE_ENDPOINT = "/api/push/subscribe";
+const SUBSCRIBE_PROXY = "/api/push/subscribe";
+const UNSUBSCRIBE_PROXY = "/api/push/unsubscribe";
+const VAPID_KEY_PROXY = "/api/push/vapid-key";
 
-function assertBrowser(): void {
-  if (typeof window === "undefined") {
-    throw new Error("push: not in a browser");
-  }
+export interface VapidKey {
+  public_key: string;
+  subject: string;
 }
 
 function pushSupported(): boolean {
@@ -27,13 +27,25 @@ function pushSupported(): boolean {
 }
 
 async function getRegistration(): Promise<ServiceWorkerRegistration> {
-  assertBrowser();
   if (!pushSupported()) throw new Error("push: not supported in this browser");
   const existing = await navigator.serviceWorker.getRegistration();
   if (existing) return existing;
   return navigator.serviceWorker.register(SW_PATH);
 }
 
+// Public — used by the layout / bell to decide whether to render the button.
+export async function getVapidPublicKey(): Promise<string | null> {
+  try {
+    const res = await fetch(VAPID_KEY_PROXY, { cache: "force-cache" });
+    if (!res.ok) return null;
+    const data = (await res.json()) as VapidKey;
+    return data.public_key || null;
+  } catch {
+    return null;
+  }
+}
+
+// True iff there is an active browser push subscription on this device.
 export async function isSubscribed(): Promise<boolean> {
   if (!pushSupported()) return false;
   try {
@@ -46,8 +58,10 @@ export async function isSubscribed(): Promise<boolean> {
   }
 }
 
+// Subscribe this browser. Pass a VAPID public key fetched from /api/push/vapid-key.
+// On success, the subscription has been POSTed to the backend and the browser
+// will start receiving pushes for matched tenders.
 export async function subscribePush(vapidPublicKey: string): Promise<PushSubscription> {
-  assertBrowser();
   if (!vapidPublicKey) throw new Error("push: missing VAPID public key");
   if (!pushSupported()) throw new Error("push: not supported in this browser");
 
@@ -67,7 +81,7 @@ export async function subscribePush(vapidPublicKey: string): Promise<PushSubscri
     });
   }
 
-  const res = await fetch(SUBSCRIBE_ENDPOINT, {
+  const res = await fetch(SUBSCRIBE_PROXY, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(sub.toJSON()),
@@ -75,17 +89,32 @@ export async function subscribePush(vapidPublicKey: string): Promise<PushSubscri
   if (!res.ok) {
     throw new Error(`push: subscribe failed (${res.status})`);
   }
-
   return sub;
 }
 
+// Unsubscribe — drops the browser subscription AND tells the backend to delete
+// the record so we don't keep sending to a dead endpoint. Idempotent.
 export async function unsubscribePush(): Promise<boolean> {
   if (!pushSupported()) return false;
   const reg = await navigator.serviceWorker.getRegistration();
   if (!reg) return false;
   const sub = await reg.pushManager.getSubscription();
   if (!sub) return false;
-  return sub.unsubscribe();
+
+  const endpoint = sub.endpoint;
+  const ok = await sub.unsubscribe();
+  // Tell the backend to drop the row even if the browser unsubscribe failed —
+  // we don't want stale rows hanging around.
+  try {
+    await fetch(UNSUBSCRIBE_PROXY, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ endpoint }),
+    });
+  } catch {
+    // best-effort
+  }
+  return ok;
 }
 
 // VAPID keys are url-safe base64; the PushManager wants a BufferSource backed
