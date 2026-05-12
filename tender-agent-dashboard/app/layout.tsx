@@ -3,6 +3,7 @@ import type { Metadata, Viewport } from "next";
 import Link from "next/link";
 
 import PushBell from "@/components/PushBell";
+import { brand } from "@/lib/theme";
 
 export const metadata: Metadata = {
   title: "Tender Agent",
@@ -12,7 +13,7 @@ export const metadata: Metadata = {
 };
 
 export const viewport: Viewport = {
-  themeColor: "#0E1116",
+  themeColor: brand.themeColor,
   width: "device-width",
   initialScale: 1,
   viewportFit: "cover",
