@@ -1,12 +1,9 @@
 """Tests for the Claude-powered requirements extractor."""
 from __future__ import annotations
 
-import json
-from unittest.mock import MagicMock, patch
+from datetime import UTC
 
-import pytest
-
-from tender_agent.services.requirements_extractor import _strip_fences, _build_prompt
+from tender_agent.services.requirements_extractor import _build_prompt, _strip_fences
 
 
 def test_strip_fences_handles_plain_json():
@@ -25,7 +22,7 @@ def test_strip_fences_handles_bare_fence():
 
 
 def test_build_prompt_includes_metadata(monkeypatch):
-    from datetime import datetime, timezone
+    from datetime import datetime
     from decimal import Decimal
 
     from tender_agent.models import Tender
@@ -38,7 +35,7 @@ def test_build_prompt_includes_metadata(monkeypatch):
         buyer_name="Bristol CC",
         value_amount=Decimal("100000"),
         value_currency="GBP",
-        deadline_at=datetime(2025, 12, 1, tzinfo=timezone.utc),
+        deadline_at=datetime(2025, 12, 1, tzinfo=UTC),
         cpv_codes=["909"],
     )
     prompt = _build_prompt(t, "DOC TEXT HERE")

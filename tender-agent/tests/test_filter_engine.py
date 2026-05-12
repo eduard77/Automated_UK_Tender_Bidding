@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from tender_agent.models import FilterProfile, Tender
@@ -6,20 +6,20 @@ from tender_agent.services.filter_engine import matches
 
 
 def _tender(**overrides) -> Tender:
-    base = dict(
-        source_code="FTS",
-        source_ref="ref-1",
-        title="Cleaning services for schools",
-        description="Daily cleaning across primary schools",
-        buyer_name="Bristol City Council",
-        buyer_country="United Kingdom",
-        buyer_region="South West",
-        cpv_codes=["90910000"],
-        value_amount=Decimal("150000"),
-        value_currency="GBP",
-        notice_type="tender",
-        deadline_at=datetime.now(timezone.utc) + timedelta(days=30),
-    )
+    base = {
+        "source_code": "FTS",
+        "source_ref": "ref-1",
+        "title": "Cleaning services for schools",
+        "description": "Daily cleaning across primary schools",
+        "buyer_name": "Bristol City Council",
+        "buyer_country": "United Kingdom",
+        "buyer_region": "South West",
+        "cpv_codes": ["90910000"],
+        "value_amount": Decimal("150000"),
+        "value_currency": "GBP",
+        "notice_type": "tender",
+        "deadline_at": datetime.now(UTC) + timedelta(days=30),
+    }
     base.update(overrides)
     return Tender(**base)
 
