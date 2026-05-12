@@ -1,8 +1,9 @@
 name: Terraform validate
 
-# fmt + validate on every PR that touches terraform/. The sandbox the repo is
-# developed in firewalls registry.terraform.io, so `terraform validate` can't
-# run there — but GHA can, and this job is the gate.
+# fmt + init + validate on every PR that touches terraform/. Run as one step
+# per directory so a failure surfaces with its directory in the job summary —
+# the previous single-loop step hid which directory failed (set -e exited
+# before the per-iteration summary printed).
 
 on:
   push:
@@ -37,21 +38,69 @@ jobs:
         working-directory: terraform
         run: terraform fmt -check -recursive
 
-      - name: terraform validate (every module + env)
-        working-directory: terraform
+      # --- one step per directory below ------------------------------------
+      # Each runs `terraform init -backend=false && terraform validate` so:
+      #  - A failure is attributed to its directory in the GHA UI without
+      #    digging through a combined log.
+      #  - `set -e` (implicit in `run:`) halts on first failure of THAT step,
+      #    not the whole loop, so subsequent steps still report on the rest.
+
+      - name: bootstrap
+        working-directory: terraform/bootstrap
         run: |
-          set -euo pipefail
-          fail=0
-          for d in bootstrap modules/* envs/*; do
-            echo ""
-            echo "::group::$d"
-            pushd "$d" >/dev/null
-            terraform init -backend=false -input=false -no-color
-            terraform validate -no-color || fail=1
-            popd >/dev/null
-            echo "::endgroup::"
-          done
-          if [ "$fail" -ne 0 ]; then
-            echo "terraform validate failed" >&2
-            exit 1
-          fi
+          terraform init -backend=false -input=false -no-color
+          terraform validate -no-color
+
+      - name: modules/vpc
+        working-directory: terraform/modules/vpc
+        run: |
+          terraform init -backend=false -input=false -no-color
+          terraform validate -no-color
+
+      - name: modules/rds
+        working-directory: terraform/modules/rds
+        run: |
+          terraform init -backend=false -input=false -no-color
+          terraform validate -no-color
+
+      - name: modules/s3
+        working-directory: terraform/modules/s3
+        run: |
+          terraform init -backend=false -input=false -no-color
+          terraform validate -no-color
+
+      - name: modules/secrets
+        working-directory: terraform/modules/secrets
+        run: |
+          terraform init -backend=false -input=false -no-color
+          terraform validate -no-color
+
+      - name: modules/alb
+        working-directory: terraform/modules/alb
+        run: |
+          terraform init -backend=false -input=false -no-color
+          terraform validate -no-color
+
+      - name: modules/ecs_service
+        working-directory: terraform/modules/ecs_service
+        run: |
+          terraform init -backend=false -input=false -no-color
+          terraform validate -no-color
+
+      - name: modules/cloudfront
+        working-directory: terraform/modules/cloudfront
+        run: |
+          terraform init -backend=false -input=false -no-color
+          terraform validate -no-color
+
+      - name: envs/staging
+        working-directory: terraform/envs/staging
+        run: |
+          terraform init -backend=false -input=false -no-color
+          terraform validate -no-color
+
+      - name: envs/prod
+        working-directory: terraform/envs/prod
+        run: |
+          terraform init -backend=false -input=false -no-color
+          terraform validate -no-color

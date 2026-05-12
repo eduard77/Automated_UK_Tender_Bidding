@@ -39,6 +39,20 @@ output "anthropic_secret_arn" {
   value = module.secrets.anthropic_api_key_arn
 }
 
-output "vapid_secret_arn" {
-  value = module.secrets.vapid_keys_arn
+# VAPID is now three separate secrets (private/public/subject) so each can
+# be rotated independently — see modules/secrets/README.md.
+output "vapid_private_key_secret_arn" {
+  value = module.secrets.vapid_private_key_arn
+}
+
+output "vapid_public_key_secret_arn" {
+  value = module.secrets.vapid_public_key_arn
+}
+
+output "vapid_subject_secret_arn" {
+  value = module.secrets.vapid_subject_arn
+}
+
+output "dashboard_session_secret_arn" {
+  value = module.secrets.dashboard_session_secret_arn
 }

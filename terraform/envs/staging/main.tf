@@ -25,9 +25,8 @@ module "s3" {
 
 module "secrets" {
   source                  = "../../modules/secrets"
-  name                    = local.name
-  portal_secret_names     = [] # Phase 4 fills this in.
-  recovery_window_in_days = 0  # staging: allow immediate recreate
+  environment             = var.environment
+  recovery_window_in_days = 0 # staging: allow immediate recreate
   tags                    = local.tags
 }
 
@@ -79,20 +78,20 @@ locals {
     DOCUMENT_STORAGE_DIR = "s3://${module.s3.documents_bucket_name}"
     DASHBOARD_BASE_URL   = "https://dashboard-tbd.example.invalid" # operator overrides post genera-system call
   }
-  shared_secrets = {
-    ANTHROPIC_API_KEY = module.secrets.anthropic_api_key_arn
-    VAPID_PUBLIC_KEY  = "${module.secrets.vapid_keys_arn}:public_key::"
-    VAPID_PRIVATE_KEY = "${module.secrets.vapid_keys_arn}:private_key::"
-    VAPID_SUBJECT     = "${module.secrets.vapid_keys_arn}:subject::"
-    # RDS-managed master password injects the connection-string-friendly JSON
-    # at this ARN. The container builds DATABASE_URL from the JSON at startup.
-    DATABASE_PASSWORD_JSON = module.rds.master_user_secret_arn
-  }
-  shared_secret_arns = [
-    module.secrets.anthropic_api_key_arn,
-    module.secrets.vapid_keys_arn,
-    module.rds.master_user_secret_arn,
-  ]
+  # Application secrets injected as env vars at task start. Three separate
+  # VAPID secrets (rather than a single JSON blob) so private-key rotation
+  # doesn't touch the public key or subject. The RDS master password is
+  # injected as a JSON blob the container parses on startup.
+  shared_secrets = merge(
+    module.secrets.arns_by_env_var,
+    {
+      DATABASE_PASSWORD_JSON = module.rds.master_user_secret_arn
+    },
+  )
+  shared_secret_arns = concat(
+    module.secrets.all_arns,
+    [module.rds.master_user_secret_arn],
+  )
 }
 
 module "api_service" {

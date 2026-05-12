@@ -1,4 +1,4 @@
-# ─── Secrets ───────────────────────────────────────────────────────────
+# ─── Secrets ──────────────────────────────────────────────────────────────────────────
 # Never commit any of these — they may contain API keys, portal creds,
 # OAuth tokens, or AWS credentials.
 .env
@@ -9,9 +9,14 @@
 *-credentials.json
 .aws/
 .aws-credentials
+# `secrets/` covers any top-level or app-level "secrets" working folder. The
+# Terraform module `terraform/modules/secrets/` is infrastructure code, not a
+# real secret store, so it's negated below.
 secrets/
+!terraform/modules/secrets/
+!terraform/modules/secrets/**
 
-# ─── Python ────────────────────────────────────────────────────────────
+# ─── Python ───────────────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
@@ -64,7 +69,7 @@ coverage.xml
 .ipynb_checkpoints/
 *.ipynb
 
-# ─── Node / Next.js ────────────────────────────────────────────────────
+# ─── Node / Next.js ──────────────────────────────────────────────────────────────────────
 node_modules/
 .npm
 .yarn-integrity
@@ -74,7 +79,7 @@ out/
 *.tsbuildinfo
 next-env.d.ts
 
-# ─── Editors / IDEs ────────────────────────────────────────────────────
+# ─── Editors / IDEs ──────────────────────────────────────────────────────────────────────
 .vscode/
 !.vscode/settings.json.example
 !.vscode/extensions.json
@@ -85,7 +90,7 @@ next-env.d.ts
 .DS_Store
 Thumbs.db
 
-# ─── Logs & runtime ────────────────────────────────────────────────────
+# ─── Logs & runtime ──────────────────────────────────────────────────────────────────────
 *.log
 npm-debug.log*
 yarn-debug.log*
@@ -96,13 +101,13 @@ logs/
 *.seed
 *.pid.lock
 
-# ─── Build outputs ─────────────────────────────────────────────────────
+# ─── Build outputs ──────────────────────────────────────────────────────────────────────
 *.tar
 *.tar.gz
 *.zip
 !alembic/versions/*.py
 
-# ─── Project-specific ──────────────────────────────────────────────────
+# ─── Project-specific ─────────────────────────────────────────────────────────────────────
 # Local document storage (use S3 in production)
 documents/
 /var/tender-agent/
@@ -134,7 +139,7 @@ vault-cache/
 crash.log
 crash.*.log
 
-# ─── OS / misc ─────────────────────────────────────────────────────────
+# ─── OS / misc ────────────────────────────────────────────────────────────────────────
 *.bak
 *.tmp
 .cache/
