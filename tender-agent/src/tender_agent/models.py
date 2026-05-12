@@ -1,9 +1,10 @@
 """ORM models. Canonical schema for tenders normalised across sources."""
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     JSON,
     BigInteger,
@@ -295,4 +296,109 @@ class PushSubscription(Base):
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class VaultDocument(Base):
+    """A document in the document vault. The vault stores everything the agent
+    might cite back to a buyer (insurance certs, ISO certs, policies, case
+    studies, accounts, capability statements, etc.). Per PROJECT.md §5.4
+    documents are versioned and never deleted — supersede in place.
+    """
+
+    __tablename__ = "vault_documents"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    org_id: Mapped[int] = mapped_column(Integer, nullable=False, default=1, index=True)
+    category: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    subcategory: Mapped[str | None] = mapped_column(String(64))
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    owner_email: Mapped[str | None] = mapped_column(String(256))
+    confidentiality: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="internal"
+    )
+
+    # Pointer to the current (non-superseded) version. Null while uploading
+    # the first version. Set after the first version row is inserted.
+    current_version_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "vault_document_versions.id", ondelete="SET NULL", use_alter=True
+        ),
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    # Soft delete — bids reference specific version IDs, so we never hard-delete.
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    versions: Mapped[list[VaultDocumentVersion]] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+        foreign_keys="VaultDocumentVersion.document_id",
+        order_by="VaultDocumentVersion.version",
+    )
+    current_version: Mapped[VaultDocumentVersion | None] = relationship(
+        foreign_keys=[current_version_id],
+        post_update=True,
+    )
+
+
+class VaultDocumentVersion(Base):
+    """One version of a vault document. Claims are the machine-readable summary
+    of what the document proves (insurance cover amount, ISO scope, policy
+    signatory, case study client + value, etc.) — see services/vault/claims_schemas.py
+    for the per-doc-type shape.
+    """
+
+    __tablename__ = "vault_document_versions"
+    __table_args__ = (
+        UniqueConstraint("document_id", "version", name="uq_vault_version"),
+        Index("ix_vault_versions_expiry", "expiry_date"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    document_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("vault_documents.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # Blob metadata
+    storage_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    mime_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # Issuance / expiry (extracted from claims; mirrored as columns here for
+    # cheap WHERE filtering by the matcher and the /vault/expiring endpoint).
+    expiry_date: Mapped[date | None] = mapped_column(Date)
+    issuing_body: Mapped[str | None] = mapped_column(String(256))
+    issued_date: Mapped[date | None] = mapped_column(Date)
+    last_reviewed_date: Mapped[date | None] = mapped_column(Date)
+
+    superseded_by_version_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("vault_document_versions.id"), index=True
+    )
+
+    # Machine-readable claims (see services/vault/claims_schemas.py).
+    claims: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    claims_confirmed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    text_extracted: Mapped[str | None] = mapped_column(Text)
+    # pgvector 1536-dim. Matches OpenAI text-embedding-3-small (default
+    # production provider per docs/vault.md). Null when no embedder is wired.
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(1536))
+
+    uploaded_by: Mapped[str | None] = mapped_column(String(256))
+    uploaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    document: Mapped[VaultDocument] = relationship(
+        back_populates="versions", foreign_keys=[document_id]
+    )
 
