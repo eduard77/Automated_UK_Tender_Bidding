@@ -22,8 +22,11 @@ If you're a human reading this: feel free, but the audience is the AI agent.
 
 **Status**: Phase 1 ✅ done. Phase 2 ✅ done (all 5 adapters with fixture tests,
 document downloader, Claude requirements extractor + validation harness, dashboard
-PWA, Web Push end-to-end). Phases 3-7 designed but not implemented; AWS deploy
-(Terraform) deferred to Phase 7.
+PWA, Web Push end-to-end). Phases 3-7 designed but not implemented.
+
+**T6 (AWS Terraform deploy)** is parked until deployment decisions are made:
+AWS account access, dashboard domain name, and budget approval. When those are
+confirmed, T6 is the next task.
 
 ---
 

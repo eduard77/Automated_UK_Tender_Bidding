@@ -17,7 +17,11 @@ document vault, drafts responses, and prepares bids for human review and submiss
 | 4 | ⬜ Designed | First portal adapter (Playwright) |
 | 5 | ⬜ Designed | Vault-grounded drafting agent + case study generator |
 | 6 | ⬜ Designed | Email integration + Temporal workflows + notifications |
-| 7 | ⬜ — | Hardening, observability, additional portals, AWS Terraform |
+| 7 | ⬜ — | Hardening, observability, additional portals |
+
+> **T6 (AWS Terraform deploy)** is parked until deployment decisions are made:
+> AWS account access, dashboard domain name, and budget approval. When those
+> are confirmed, T6 is the next task.
 
 Full design in [`tender-agent/PROJECT.md`](tender-agent/PROJECT.md). AI agent
 conventions in [`tender-agent/CLAUDE.md`](tender-agent/CLAUDE.md).
