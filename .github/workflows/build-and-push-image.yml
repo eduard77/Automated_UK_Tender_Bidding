@@ -1,0 +1,75 @@
+name: Build & Push API image
+
+# Build the backend container image and push it to ECR. Gated to push-to-main
+# only — PRs do not push images (they're built by the regular `CI` workflow's
+# Python tests against source, no container needed).
+#
+# Deployment itself stays manual: terraform apply with the new `api_image`
+# value is the human step. See docs/deploy.md.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tender-agent/**"
+      - ".github/workflows/build-and-push-image.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: build-and-push-image
+  cancel-in-progress: false
+
+# OIDC: we assume an IAM role rather than long-lived access keys.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build:
+    name: Build & push to ECR
+    runs-on: ubuntu-latest
+    # Skip until the deploy decisions land — set AWS_ROLE_TO_ASSUME +
+    # AWS_REGION + ECR_REPOSITORY in repo settings to enable.
+    if: vars.ECR_REPOSITORY != ''
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: tender-agent
+          file: tender-agent/Dockerfile
+          target: runtime
+          push: true
+          provenance: false
+          tags: |
+            ${{ steps.login.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ steps.login.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+
+      - name: Summary
+        run: |
+          echo "## Image pushed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`${{ steps.login.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "To deploy: set \`api_image\` to this tag in \`terraform/envs/<env>/terraform.tfvars\` and run \`terraform apply\`." >> $GITHUB_STEP_SUMMARY

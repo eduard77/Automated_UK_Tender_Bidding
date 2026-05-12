@@ -1,0 +1,12 @@
+# Prod tfvars — copy to terraform.tfvars (which is gitignored) and fill in.
+# Both api_image and alb_certificate_arn are REQUIRED in prod.
+
+api_image           = "123456789012.dkr.ecr.eu-west-2.amazonaws.com/tender-agent-api:replace-with-sha"
+alb_certificate_arn = "arn:aws:acm:eu-west-2:123456789012:certificate/REPLACE-ME"
+
+# Optional overrides:
+# aws_region            = "eu-west-2"
+# documents_bucket_name = "tender-agent-prod-documents"
+# debug_bucket_name     = "tender-agent-prod-debug"
+# api_desired_count     = 2
+# worker_desired_count  = 1

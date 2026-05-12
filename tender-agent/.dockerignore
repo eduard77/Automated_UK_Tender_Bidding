@@ -1,0 +1,57 @@
+# Keep the build context lean — everything not needed at runtime stays out.
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+*.egg-info/
+build/
+dist/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual envs (host's, never the one we build in the image)
+.venv/
+venv/
+env/
+ENV/
+
+# Tests + fixtures (not run inside the runtime image)
+tests/
+scripts/
+
+# Caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.tox/
+.nox/
+.cache/
+htmlcov/
+.coverage*
+
+# Local dev artefacts
+*.log
+*.sqlite
+*.sqlite3
+*.db
+documents/
+
+# Editor / VCS / OS
+.git/
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+
+# Docs (kept in repo, not in image)
+README.md
+CLAUDE.md
+PROJECT.md
+docs/
+
+# Docker / compose itself
+Dockerfile
+docker-compose.yml
+.dockerignore
