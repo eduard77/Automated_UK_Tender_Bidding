@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>eTendersNI — Contract Notices</title>
+  <updated>2026-05-01T08:00:00Z</updated>
+  <link rel="self" href="https://etendersni.gov.uk/epps/cft/listContractNotices.do?type=atom"/>
+
+  <entry>
+    <title>Highways winter gritting — Belfast and surrounding areas</title>
+    <link href="https://etendersni.gov.uk/epps/cft/viewContractNotice.do?notice/id/NI-2026-50001"/>
+    <updated>2026-04-28T09:15:00Z</updated>
+    <summary>Provision of winter gritting services across the Belfast metropolitan area.</summary>
+    <author>
+      <name>Department for Infrastructure (NI)</name>
+    </author>
+  </entry>
+
+  <entry>
+    <title>Patient transport services — Western Health and Social Care Trust</title>
+    <link href="https://etendersni.gov.uk/epps/cft/viewContractNotice.do?notice/id/NI-2026-50002"/>
+    <updated>2026-04-25T11:00:00Z</updated>
+    <summary>Non-emergency patient transport across the Western Trust catchment.</summary>
+    <author>
+      <name>Western Health and Social Care Trust</name>
+    </author>
+  </entry>
+
+  <entry>
+    <title>Office stationery supply contract</title>
+    <link href="https://etendersni.gov.uk/epps/cft/viewContractNotice.do?someOpaqueQuery=abc123"/>
+    <updated>2026-04-22T13:30:00Z</updated>
+    <summary>Stationery supply across Northern Ireland Civil Service estate.</summary>
+    <author>
+      <name>Construction and Procurement Delivery</name>
+    </author>
+  </entry>
+
+  <entry>
+    <title>Archive: legacy IT migration services (pre-cutoff)</title>
+    <link href="https://etendersni.gov.uk/epps/cft/viewContractNotice.do?notice/id/NI-2026-49000"/>
+    <updated>2026-02-01T10:00:00Z</updated>
+    <summary>Legacy migration notice — old, used to verify the cutoff is honoured.</summary>
+    <author>
+      <name>Department of Finance (NI)</name>
+    </author>
+  </entry>
+
+  <entry>
+    <title>Minimal entry — title and link only</title>
+    <link href="https://etendersni.gov.uk/epps/cft/viewContractNotice.do?notice/id/NI-2026-50005"/>
+    <updated>2026-04-30T07:00:00Z</updated>
+  </entry>
+
+  <entry>
+    <link href="https://etendersni.gov.uk/epps/cft/viewContractNotice.do?notice/id/NI-2026-MALFORMED"/>
+    <updated>2026-04-15T07:00:00Z</updated>
+    <summary>Malformed entry — no title element, should be skipped by the adapter.</summary>
+    <author>
+      <name>Adapter should NOT yield this</name>
+    </author>
+  </entry>
+</feed>

@@ -1,0 +1,141 @@
+{
+  "uri": "https://www.contractsfinder.service.gov.uk/Published/Notices/OCDS/Search",
+  "publisher": {"name": "Contracts Finder", "scheme": "GB-GOV", "uid": "CF"},
+  "publishedDate": "2026-05-01T10:00:00Z",
+  "license": "https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/",
+  "version": "1.1",
+  "releases": [
+    {
+      "ocid": "ocds-b5fd17-cf-2026-200001",
+      "id": "cf-2026-200001-tender",
+      "date": "2026-04-25T09:00:00Z",
+      "tag": ["tender"],
+      "language": "en",
+      "buyer": {"id": "GB-LAS-WCC", "name": "Wiltshire Council"},
+      "parties": [
+        {
+          "id": "GB-LAS-WCC",
+          "name": "Wiltshire Council",
+          "roles": ["buyer"],
+          "address": {"countryName": "United Kingdom", "region": "South West", "locality": "Trowbridge"}
+        }
+      ],
+      "tender": {
+        "id": "WCC-2026-ITSD-09",
+        "title": "Tier 1 + 2 IT service desk for the council estate",
+        "description": "Two-year service desk contract supporting ~600 council users across multiple sites.",
+        "status": "active",
+        "classification": {"scheme": "CPV", "id": "72611000"},
+        "items": [
+          {"id": "1", "classification": {"scheme": "CPV", "id": "72611000"}},
+          {"id": "2", "classification": {"scheme": "CPV", "id": "72253200"}}
+        ],
+        "value": {"amount": 280000.0, "currency": "GBP"},
+        "tenderPeriod": {"endDate": "2026-05-30T17:00:00Z"},
+        "contractPeriod": {"startDate": "2026-08-01", "endDate": "2028-07-31"},
+        "documents": [
+          {
+            "id": "doc-1",
+            "title": "Specification",
+            "url": "https://www.contractsfinder.service.gov.uk/Notice/cf-2026-200001/spec.pdf",
+            "format": "application/pdf"
+          }
+        ]
+      }
+    },
+    {
+      "ocid": "ocds-b5fd17-cf-2026-200002",
+      "id": "cf-2026-200002-tender",
+      "date": "2026-04-26T08:00:00Z",
+      "tag": ["tender"],
+      "language": "en",
+      "buyer": {"id": "GB-DEPT-DEFRA", "name": "Department for Environment, Food and Rural Affairs"},
+      "parties": [
+        {
+          "id": "GB-DEPT-DEFRA",
+          "name": "Department for Environment, Food and Rural Affairs",
+          "roles": ["buyer"],
+          "address": {"countryName": "United Kingdom"}
+        }
+      ],
+      "tender": {
+        "id": "DEFRA-2026-ENV-44",
+        "title": "Environmental compliance auditing — England regions",
+        "description": "Compliance auditing for permitted waste sites.",
+        "status": "active",
+        "classification": {"scheme": "CPV", "id": "90711000"},
+        "items": [{"id": "1", "classification": {"scheme": "CPV", "id": "90711000"}}],
+        "value": {"amount": 1500000.0, "currency": "GBP"},
+        "tenderPeriod": {"endDate": "2026-06-12T12:00:00Z"}
+      }
+    },
+    {
+      "ocid": "ocds-b5fd17-cf-2026-200003",
+      "id": "cf-2026-200003-tender",
+      "date": "2026-04-27T15:30:00Z",
+      "tag": ["tender"],
+      "language": "en",
+      "buyer": {"id": "GB-NHS-NEEAS", "name": "NHS North East and Yorkshire Ambulance Service"},
+      "parties": [
+        {
+          "id": "GB-NHS-NEEAS",
+          "name": "NHS North East and Yorkshire Ambulance Service",
+          "roles": ["buyer"],
+          "address": {"countryName": "United Kingdom", "region": "Yorkshire and the Humber"}
+        }
+      ],
+      "tender": {
+        "id": "NEEAS-2026-PPE-03",
+        "title": "Single-use PPE supply",
+        "description": "12-month framework for nitrile gloves, masks, and aprons.",
+        "status": "active",
+        "classification": {"scheme": "CPV", "id": "33199000"},
+        "value": {"amount": 850000.0, "currency": "GBP"},
+        "tenderPeriod": {"endDate": "2026-05-25T16:00:00Z"}
+      }
+    },
+    {
+      "ocid": "ocds-b5fd17-cf-2026-200004",
+      "id": "cf-2026-200004-award",
+      "date": "2026-04-28T11:00:00Z",
+      "tag": ["award"],
+      "language": "en",
+      "buyer": {"id": "GB-LAS-MCC", "name": "Manchester City Council"},
+      "parties": [
+        {
+          "id": "GB-LAS-MCC",
+          "name": "Manchester City Council",
+          "roles": ["buyer"],
+          "address": {"countryName": "United Kingdom", "region": "North West"}
+        }
+      ],
+      "tender": {
+        "id": "MCC-2026-HW-07",
+        "title": "Highways winter maintenance — award notice",
+        "description": "Notice of award for winter highways maintenance.",
+        "status": "complete",
+        "classification": {"scheme": "CPV", "id": "90620000"},
+        "value": {"amount": 4200000.0, "currency": "GBP"},
+        "tenderPeriod": {"endDate": "2026-03-15T17:00:00Z"}
+      }
+    },
+    {
+      "ocid": "ocds-b5fd17-cf-2026-200005",
+      "id": "cf-2026-200005-minimal",
+      "date": "2026-05-01T07:30:00Z",
+      "tag": ["tender"],
+      "language": "en",
+      "buyer": {"name": "Borough of Hartlepool"},
+      "tender": {
+        "title": "Catering supplies — small-value notice",
+        "status": "active"
+      }
+    },
+    {
+      "date": "2026-05-02T09:00:00Z",
+      "tag": ["tender"],
+      "tender": {"title": "Malformed: no ocid and no id — should be skipped"}
+    }
+  ],
+  "links": {}
+}

@@ -1,0 +1,142 @@
+{
+  "uri": "https://api.publiccontractsscotland.gov.uk/v1/Notices",
+  "publisher": {"name": "Public Contracts Scotland", "scheme": "GB-GOV-SCT", "uid": "PCS"},
+  "publishedDate": "2026-05-01T11:00:00Z",
+  "license": "https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/",
+  "version": "1.1",
+  "releases": [
+    {
+      "ocid": "ocds-bya2v3-pcs-2026-300001",
+      "id": "pcs-2026-300001-tender",
+      "date": "2026-04-22T09:00:00Z",
+      "tag": ["tender"],
+      "language": "en",
+      "buyer": {"id": "GB-SG-ESTATE", "name": "Scottish Government"},
+      "parties": [
+        {
+          "id": "GB-SG-ESTATE",
+          "name": "Scottish Government",
+          "roles": ["buyer"],
+          "address": {"countryName": "United Kingdom", "region": "Scotland", "locality": "Edinburgh"}
+        }
+      ],
+      "tender": {
+        "id": "SG-2026-EST-15",
+        "title": "Office cleaning — Scottish Government estate",
+        "description": "Cleaning services across nine Scottish Government buildings in Edinburgh and Glasgow.",
+        "status": "active",
+        "classification": {"scheme": "CPV", "id": "90910000"},
+        "items": [{"id": "1", "classification": {"scheme": "CPV", "id": "90910000"}}],
+        "value": {"amount": 1500000.0, "currency": "GBP"},
+        "tenderPeriod": {"endDate": "2026-06-20T17:00:00Z"},
+        "contractPeriod": {"startDate": "2026-09-01", "endDate": "2029-08-31"},
+        "documents": [
+          {
+            "id": "doc-1",
+            "title": "Invitation to Tender",
+            "url": "https://www.publiccontractsscotland.gov.uk/search/show/search_view.aspx?ID=pcs-2026-300001/itt.pdf",
+            "format": "application/pdf"
+          }
+        ]
+      }
+    },
+    {
+      "ocid": "ocds-bya2v3-pcs-2026-300002",
+      "id": "pcs-2026-300002-tender",
+      "date": "2026-04-24T13:00:00Z",
+      "tag": ["tender"],
+      "language": "en",
+      "buyer": {"id": "GB-NHS-LOTH", "name": "NHS Lothian"},
+      "parties": [
+        {
+          "id": "GB-NHS-LOTH",
+          "name": "NHS Lothian",
+          "roles": ["buyer"],
+          "address": {"countryName": "United Kingdom", "region": "Scotland", "locality": "Edinburgh"}
+        }
+      ],
+      "tender": {
+        "id": "NHS-LOTH-2026-FM-22",
+        "title": "Hospital catering — Edinburgh Royal Infirmary",
+        "description": "Patient and staff catering services for ERI.",
+        "status": "active",
+        "classification": {"scheme": "CPV", "id": "55524000"},
+        "items": [{"id": "1", "classification": {"scheme": "CPV", "id": "55524000"}}],
+        "value": {"amount": 6800000.0, "currency": "GBP"},
+        "tenderPeriod": {"endDate": "2026-07-08T12:00:00Z"}
+      }
+    },
+    {
+      "ocid": "ocds-bya2v3-pcs-2026-300003",
+      "id": "pcs-2026-300003-tender",
+      "date": "2026-04-26T08:30:00Z",
+      "tag": ["tender"],
+      "language": "en",
+      "buyer": {"id": "GB-LAS-HC", "name": "The Highland Council"},
+      "parties": [
+        {
+          "id": "GB-LAS-HC",
+          "name": "The Highland Council",
+          "roles": ["buyer"],
+          "address": {"countryName": "United Kingdom", "region": "Scotland", "locality": "Inverness"}
+        }
+      ],
+      "tender": {
+        "id": "HC-2026-ROAD-04",
+        "title": "Road resurfacing — A82 and feeder routes",
+        "description": "Carriageway resurfacing across designated sections.",
+        "status": "active",
+        "classification": {"scheme": "CPV", "id": "45233141"},
+        "value": {"amount": 3200000.0, "currency": "GBP"},
+        "tenderPeriod": {"endDate": "2026-06-30T17:00:00Z"}
+      }
+    },
+    {
+      "ocid": "ocds-bya2v3-pcs-2026-300004",
+      "id": "pcs-2026-300004-tender",
+      "date": "2026-04-29T16:00:00Z",
+      "tag": ["tender"],
+      "language": "en",
+      "buyer": {"id": "GB-LAS-GCC", "name": "Glasgow City Council"},
+      "parties": [
+        {
+          "id": "GB-LAS-GCC",
+          "name": "Glasgow City Council",
+          "roles": ["buyer"],
+          "address": {"countryName": "United Kingdom", "region": "Scotland", "locality": "Glasgow"}
+        }
+      ],
+      "tender": {
+        "id": "GCC-2026-SOCSV-31",
+        "title": "Domiciliary care — North Glasgow",
+        "description": "Home-based personal care provision under framework.",
+        "status": "active",
+        "classification": {"scheme": "CPV", "id": "85311100"},
+        "items": [
+          {"id": "1", "classification": {"scheme": "CPV", "id": "85311100"}},
+          {"id": "2", "classification": {"scheme": "CPV", "id": "85312000"}}
+        ],
+        "value": {"amount": 12500000.0, "currency": "GBP"},
+        "tenderPeriod": {"endDate": "2026-07-22T17:00:00Z"}
+      }
+    },
+    {
+      "ocid": "ocds-bya2v3-pcs-2026-300005",
+      "id": "pcs-2026-300005-minimal",
+      "date": "2026-05-01T07:00:00Z",
+      "tag": ["tender"],
+      "language": "en",
+      "buyer": {"name": "Orkney Islands Council"},
+      "tender": {
+        "title": "Vehicle maintenance — small-value notice",
+        "status": "active"
+      }
+    },
+    {
+      "date": "2026-05-02T10:00:00Z",
+      "tag": ["tender"],
+      "tender": {"title": "Malformed: no ocid and no id — should be skipped"}
+    }
+  ],
+  "links": {}
+}
