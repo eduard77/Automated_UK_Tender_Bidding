@@ -1,0 +1,141 @@
+{
+  "uri": "https://api.sell2wales.gov.wales/v1/Notices",
+  "publisher": {"name": "Sell2Wales", "scheme": "GB-GOV-WLS", "uid": "S2W"},
+  "publishedDate": "2026-05-01T12:00:00Z",
+  "license": "https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/",
+  "version": "1.1",
+  "releases": [
+    {
+      "ocid": "ocds-cy5x9q-s2w-2026-400001",
+      "id": "s2w-2026-400001-tender",
+      "date": "2026-04-21T10:30:00Z",
+      "tag": ["tender"],
+      "language": "en",
+      "buyer": {"id": "GB-WG-ESTATE", "name": "Welsh Government"},
+      "parties": [
+        {
+          "id": "GB-WG-ESTATE",
+          "name": "Welsh Government",
+          "roles": ["buyer"],
+          "address": {"countryName": "United Kingdom", "region": "Wales", "locality": "Cardiff"}
+        }
+      ],
+      "tender": {
+        "id": "WG-2026-EST-09",
+        "title": "Estates security services — Welsh Government buildings",
+        "description": "Manned guarding and access control across Cardiff and Cathays Park sites.",
+        "status": "active",
+        "classification": {"scheme": "CPV", "id": "79710000"},
+        "items": [{"id": "1", "classification": {"scheme": "CPV", "id": "79710000"}}],
+        "value": {"amount": 2200000.0, "currency": "GBP"},
+        "tenderPeriod": {"endDate": "2026-06-25T17:00:00Z"},
+        "contractPeriod": {"startDate": "2026-09-01", "endDate": "2029-08-31"},
+        "documents": [
+          {
+            "id": "doc-1",
+            "title": "Spec and pricing schedule",
+            "url": "https://www.sell2wales.gov.wales/search/show/search_view.aspx?ID=s2w-2026-400001/spec.pdf",
+            "format": "application/pdf"
+          }
+        ]
+      }
+    },
+    {
+      "ocid": "ocds-cy5x9q-s2w-2026-400002",
+      "id": "s2w-2026-400002-tender",
+      "date": "2026-04-23T08:00:00Z",
+      "tag": ["tender"],
+      "language": "en",
+      "buyer": {"id": "GB-NHS-CTM", "name": "Cwm Taf Morgannwg University Health Board"},
+      "parties": [
+        {
+          "id": "GB-NHS-CTM",
+          "name": "Cwm Taf Morgannwg University Health Board",
+          "roles": ["buyer"],
+          "address": {"countryName": "United Kingdom", "region": "Wales", "locality": "Merthyr Tydfil"}
+        }
+      ],
+      "tender": {
+        "id": "CTM-2026-PHARM-04",
+        "title": "Community pharmacy services — Rhondda Cynon Taf",
+        "description": "Community pharmacy lots for chronic medication management.",
+        "status": "active",
+        "classification": {"scheme": "CPV", "id": "85149000"},
+        "value": {"amount": 4500000.0, "currency": "GBP"},
+        "tenderPeriod": {"endDate": "2026-06-30T12:00:00Z"}
+      }
+    },
+    {
+      "ocid": "ocds-cy5x9q-s2w-2026-400003",
+      "id": "s2w-2026-400003-tender",
+      "date": "2026-04-25T11:15:00Z",
+      "tag": ["tender"],
+      "language": "en",
+      "buyer": {"id": "GB-LAS-PCC", "name": "Pembrokeshire County Council"},
+      "parties": [
+        {
+          "id": "GB-LAS-PCC",
+          "name": "Pembrokeshire County Council",
+          "roles": ["buyer"],
+          "address": {"countryName": "United Kingdom", "region": "Wales", "locality": "Haverfordwest"}
+        }
+      ],
+      "tender": {
+        "id": "PCC-2026-WASTE-12",
+        "title": "Kerbside recycling collection — Pembrokeshire",
+        "description": "County-wide weekly recycling collection.",
+        "status": "active",
+        "classification": {"scheme": "CPV", "id": "90511200"},
+        "items": [
+          {"id": "1", "classification": {"scheme": "CPV", "id": "90511200"}},
+          {"id": "2", "classification": {"scheme": "CPV", "id": "90513000"}}
+        ],
+        "value": {"amount": 18000000.0, "currency": "GBP"},
+        "tenderPeriod": {"endDate": "2026-07-10T17:00:00Z"}
+      }
+    },
+    {
+      "ocid": "ocds-cy5x9q-s2w-2026-400004",
+      "id": "s2w-2026-400004-tender",
+      "date": "2026-04-27T14:00:00Z",
+      "tag": ["tender"],
+      "language": "en",
+      "buyer": {"id": "GB-LAS-SCC", "name": "Swansea Council"},
+      "parties": [
+        {
+          "id": "GB-LAS-SCC",
+          "name": "Swansea Council",
+          "roles": ["buyer"],
+          "address": {"countryName": "United Kingdom", "region": "Wales", "locality": "Swansea"}
+        }
+      ],
+      "tender": {
+        "id": "SCC-2026-HSG-21",
+        "title": "Social housing repairs and maintenance",
+        "description": "Responsive repairs framework for council housing stock.",
+        "status": "active",
+        "classification": {"scheme": "CPV", "id": "50700000"},
+        "value": {"amount": 9500000.0, "currency": "GBP"},
+        "tenderPeriod": {"endDate": "2026-07-01T17:00:00Z"}
+      }
+    },
+    {
+      "ocid": "ocds-cy5x9q-s2w-2026-400005",
+      "id": "s2w-2026-400005-minimal",
+      "date": "2026-04-30T07:00:00Z",
+      "tag": ["tender"],
+      "language": "en",
+      "buyer": {"name": "Snowdonia National Park Authority"},
+      "tender": {
+        "title": "Trail repairs — small-value notice",
+        "status": "active"
+      }
+    },
+    {
+      "date": "2026-05-01T08:00:00Z",
+      "tag": ["tender"],
+      "tender": {"title": "Malformed: no ocid and no id — should be skipped"}
+    }
+  ],
+  "links": {}
+}

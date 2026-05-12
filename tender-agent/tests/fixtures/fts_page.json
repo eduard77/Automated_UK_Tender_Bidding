@@ -1,0 +1,166 @@
+{
+  "uri": "https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages",
+  "publisher": {
+    "name": "Find a Tender Service",
+    "scheme": "GB-GOV",
+    "uid": "FTS"
+  },
+  "publishedDate": "2026-05-01T09:00:00Z",
+  "license": "https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/",
+  "publicationPolicy": "https://www.find-tender.service.gov.uk/apidocumentation",
+  "version": "1.1",
+  "releases": [
+    {
+      "ocid": "ocds-h6vhqg-fts-2026-100001",
+      "id": "fts-2026-100001-tender",
+      "date": "2026-04-28T11:30:00Z",
+      "tag": ["tender"],
+      "language": "en",
+      "buyer": {"id": "GB-LAS-BCC", "name": "Bristol City Council"},
+      "parties": [
+        {
+          "id": "GB-LAS-BCC",
+          "name": "Bristol City Council",
+          "roles": ["buyer"],
+          "address": {
+            "countryName": "United Kingdom",
+            "region": "South West",
+            "locality": "Bristol"
+          }
+        }
+      ],
+      "tender": {
+        "id": "BCC-2026-CLEAN-42",
+        "title": "Cleaning services for primary schools, South West region",
+        "description": "Daily and weekly cleaning across 42 primary schools in Bristol and surrounding areas. Three-year contract with options for two further years.",
+        "status": "active",
+        "classification": {"scheme": "CPV", "id": "90910000", "description": "Cleaning services"},
+        "items": [
+          {
+            "id": "1",
+            "classification": {"scheme": "CPV", "id": "90910000"},
+            "additionalClassifications": [{"scheme": "CPV", "id": "90919300"}]
+          }
+        ],
+        "value": {"amount": 480000.0, "currency": "GBP"},
+        "tenderPeriod": {"endDate": "2026-06-15T17:00:00Z"},
+        "contractPeriod": {"startDate": "2026-09-01", "endDate": "2029-08-31"},
+        "documents": [
+          {
+            "id": "doc-1",
+            "title": "Invitation to Tender",
+            "url": "https://www.find-tender.service.gov.uk/Notice/fts-2026-100001/itt.pdf",
+            "format": "application/pdf"
+          },
+          {
+            "id": "doc-2",
+            "title": "Pricing schedule",
+            "url": "https://www.find-tender.service.gov.uk/Notice/fts-2026-100001/pricing.xlsx",
+            "format": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+          }
+        ]
+      }
+    },
+    {
+      "ocid": "ocds-h6vhqg-fts-2026-100002",
+      "id": "fts-2026-100002-tender",
+      "date": "2026-04-29T08:15:00Z",
+      "tag": ["tender"],
+      "language": "en",
+      "buyer": {"id": "GB-NHS-WMS", "name": "NHS West Midlands Shared Services"},
+      "parties": [
+        {
+          "id": "GB-NHS-WMS",
+          "name": "NHS West Midlands Shared Services",
+          "roles": ["buyer"],
+          "address": {"countryName": "United Kingdom", "region": "West Midlands"}
+        }
+      ],
+      "tender": {
+        "id": "NHS-WMS-IT-2026-08",
+        "title": "Managed IT support and service desk",
+        "description": "Provision of tier 1 + 2 service desk for ~3,500 user estate, with on-call escalation outside business hours.",
+        "status": "active",
+        "classification": {"scheme": "CPV", "id": "72611000"},
+        "items": [{"id": "1", "classification": {"scheme": "CPV", "id": "72611000"}}],
+        "value": {"amount": 2750000.0, "currency": "GBP"},
+        "tenderPeriod": {"endDate": "2026-06-01T12:00:00Z"},
+        "documents": []
+      }
+    },
+    {
+      "ocid": "ocds-h6vhqg-fts-2026-100003",
+      "id": "fts-2026-100003-planning",
+      "date": "2026-04-30T14:00:00Z",
+      "tag": ["planning"],
+      "language": "en",
+      "buyer": {"id": "GB-LAS-CCC", "name": "Cornwall Council"},
+      "parties": [
+        {
+          "id": "GB-LAS-CCC",
+          "name": "Cornwall Council",
+          "roles": ["buyer"],
+          "address": {"countryName": "United Kingdom", "region": "South West"}
+        }
+      ],
+      "tender": {
+        "id": "CCC-2026-WASTE-PIN",
+        "title": "Prior information notice: residual waste treatment",
+        "description": "Market engagement for a residual waste treatment contract to commence in 2028.",
+        "status": "planning",
+        "classification": {"scheme": "CPV", "id": "90510000"},
+        "value": {"amount": 95000000.0, "currency": "GBP"},
+        "tenderPeriod": {"endDate": "2026-08-30T17:00:00Z"}
+      }
+    },
+    {
+      "ocid": "ocds-h6vhqg-fts-2026-100004",
+      "id": "fts-2026-100004-tender",
+      "date": "2026-05-01T09:45:00Z",
+      "tag": ["tender"],
+      "language": "en",
+      "buyer": {"id": "GB-DEPT-DFE", "name": "Department for Education"},
+      "parties": [
+        {
+          "id": "GB-DEPT-DFE",
+          "name": "Department for Education",
+          "roles": ["buyer"],
+          "address": {"countryName": "United Kingdom"}
+        }
+      ],
+      "tender": {
+        "id": "DFE-2026-CONSULT-12",
+        "title": "Programme evaluation: post-16 skills bootcamps",
+        "description": "Independent evaluation of bootcamp outcomes across 14 lots.",
+        "status": "active",
+        "classification": {"scheme": "CPV", "id": "73210000"},
+        "items": [
+          {"id": "1", "classification": {"scheme": "CPV", "id": "73210000"}},
+          {"id": "2", "classification": {"scheme": "CPV", "id": "79313000"}}
+        ],
+        "value": {"amount": 320000.0, "currency": "GBP"},
+        "tenderPeriod": {"endDate": "2026-05-29T17:00:00Z"}
+      }
+    },
+    {
+      "ocid": "ocds-h6vhqg-fts-2026-100005",
+      "id": "fts-2026-100005-minimal",
+      "date": "2026-05-02T07:00:00Z",
+      "tag": ["tender"],
+      "language": "en",
+      "buyer": {"name": "Mid Sussex District Council"},
+      "tender": {
+        "title": "Grounds maintenance — under-threshold notice",
+        "status": "active"
+      }
+    },
+    {
+      "date": "2026-05-03T10:00:00Z",
+      "tag": ["tender"],
+      "tender": {
+        "title": "Malformed: no ocid and no id — should be skipped without breaking the page"
+      }
+    }
+  ],
+  "links": {}
+}

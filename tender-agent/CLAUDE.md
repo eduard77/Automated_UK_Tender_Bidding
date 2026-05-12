@@ -182,7 +182,20 @@ about `cd`-ing.
    your adapter.
 4. Register the adapter in `adapters/__init__.py` under `ADAPTERS`.
 5. Add the base URL to `config.Settings` and `.env.example`.
-6. Add tests in `tests/test_adapter_{code}.py` with at least one fixture-based test.
+6. Add a fixture under `tests/fixtures/{code}_page.json` (or `.xml` for Atom-like
+   sources) and a test file `tests/test_adapter_{code}.py` implementing the five
+   patterns established in branch `t4-adapter-fixture-tests`:
+   1. `test_fetch_since_yields_normalised_tenders` — full-fixture round-trip.
+   2. `test_fetch_since_respects_cutoff` (post-filtering adapters only) **or**
+      `test_fetch_since_sends_updated_from_param` (adapters that delegate the
+      cutoff to the upstream query string).
+   3. `test_normalisation_of_known_fields` — exact field mapping on one entry.
+   4. `test_handles_missing_optional_fields` — None/empty stays None/empty.
+   5. `test_handles_malformed_entry_gracefully` — bad entry skipped, others survive.
+
+   All tests use `httpx.MockTransport` via the helpers in `tests/conftest.py`
+   (`build_adapter`, `static_json_handler`/`static_text_handler`, `collect`,
+   `load_json_fixture`/`load_text_fixture`). No network calls in tests, ever.
 7. Update `PROJECT.md` §3 acceptance criteria if scope changes.
 
 ### Adding a new portal adapter (Phase 4)
