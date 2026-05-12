@@ -20,8 +20,13 @@ If you're a human reading this: feel free, but the audience is the AI agent.
 
 **Where things live**: §4 of PROJECT.md has the source tree. Don't re-derive — look it up.
 
-**Status**: Phase 1 ✅. Phase 2 ⏳ (~70%; backend done, dashboard pages and AWS infra
-still needed). Phases 3-7 designed but not implemented.
+**Status**: Phase 1 ✅ done. Phase 2 ✅ done (all 5 adapters with fixture tests,
+document downloader, Claude requirements extractor + validation harness, dashboard
+PWA, Web Push end-to-end). Phases 3-7 designed but not implemented.
+
+**T6 (AWS Terraform deploy)** is parked until deployment decisions are made:
+AWS account access, dashboard domain name, and budget approval. When those are
+confirmed, T6 is the next task.
 
 ---
 
@@ -112,16 +117,21 @@ cd tender-agent
 pip install -e ".[dev]"                       # one-time
 alembic upgrade head                          # apply migrations
 uvicorn tender_agent.main:app --reload        # run dev server
-pytest -v                                     # tests
-ruff check src/ tests/                        # lint
-ruff check src/ tests/ --fix                  # auto-fix
+pytest -v                                     # tests (48 cases)
+ruff check src/ tests/ scripts/               # lint
+ruff check src/ tests/ scripts/ --fix         # auto-fix
 alembic revision -m "add foo table"           # new migration
+
+# Operator scripts
+python scripts/validate_extractor.py --recent 10 --output report.md
+python scripts/validate_extractor.py --tender-id 42 --dry-run
 
 # Frontend
 cd tender-agent-dashboard
 npm install
 npm run dev                                   # localhost:3000
 npm run build && npm start                    # prod build
+npx tsc --noEmit                              # type check (gated by CI)
 npm run generate-vapid                        # generate VAPID keys for push
 
 # Stack via Docker
