@@ -2,7 +2,7 @@
 // Every dashboard fetch goes through here — never call fetch() from a component.
 
 const API_BASE =
-  process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") ?? "http://localhost:8000";
+  process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/$/, "") ?? "http://localhost:8000";
 
 // ---------------------------------------------------------------------------
 // Types — mirror tender_agent/schemas.py. Keep field names/casing in sync.
