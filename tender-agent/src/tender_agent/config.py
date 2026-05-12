@@ -34,6 +34,17 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-sonnet-4-5"
 
+    # Web Push (VAPID). Generate a keypair with `npm run generate-vapid` in the
+    # dashboard. Public key is also exposed via GET /push/vapid-public-key so the
+    # dashboard doesn't need to bake it into its build. If unset, push endpoints
+    # return 503 and ingestion skips dispatch (logs a structured event).
+    vapid_public_key: str = ""
+    vapid_private_key: str = ""
+    vapid_subject: str = "mailto:admin@example.com"
+
+    # Dashboard origin — used as the base for notification `url` paths.
+    dashboard_base_url: str = "http://localhost:3000"
+
 
 @lru_cache
 def get_settings() -> Settings:

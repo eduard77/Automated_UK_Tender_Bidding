@@ -13,7 +13,7 @@ from tender_agent.adapters import ADAPTERS
 from tender_agent.config import settings
 from tender_agent.models import FilterMatch, PollRun, Source, Tender
 from tender_agent.schemas import NormalisedTender
-from tender_agent.services import filter_engine
+from tender_agent.services import filter_engine, push
 from tender_agent.services.deduplicator import find_duplicate
 from tender_agent.services.document_downloader import download_documents_for_tender
 from tender_agent.services.requirements_extractor import extract_requirements
@@ -80,12 +80,17 @@ def _upsert_tender(db: Session, normalised: NormalisedTender) -> tuple[Tender, s
     return existing, "updated"
 
 
-def _record_filter_matches(db: Session, tender: Tender) -> int:
-    """Match tender against enabled filter profiles. Returns count of new matches."""
+def _record_filter_matches(db: Session, tender: Tender) -> list[int]:
+    """Match tender against enabled filter profiles.
+
+    Returns the list of filter_profile_id values for which a NEW FilterMatch was
+    just created (i.e. caller will use this to dispatch one notification per new
+    match). An empty list means nothing new.
+    """
     if tender.duplicate_of_id is not None:
-        return 0  # don't double-alert on duplicates
+        return []  # don't double-alert on duplicates
     profiles = filter_engine.matching_profiles(db, tender)
-    new = 0
+    new_profile_ids: list[int] = []
     for profile in profiles:
         existing = db.execute(
             select(FilterMatch).where(
@@ -95,8 +100,8 @@ def _record_filter_matches(db: Session, tender: Tender) -> int:
         ).scalar_one_or_none()
         if existing is None:
             db.add(FilterMatch(tender_id=tender.id, filter_profile_id=profile.id, score=1.0))
-            new += 1
-    return new
+            new_profile_ids.append(profile.id)
+    return new_profile_ids
 
 
 async def _enrich_matched_tender(db: Session, tender: Tender) -> None:
@@ -137,21 +142,26 @@ async def poll_source(db: Session, source: Source) -> PollRun:
             async for normalised in adapter.fetch_since(since):
                 fetched += 1
                 tender, action = _upsert_tender(db, normalised)
-                matched = 0
+                matched_profile_ids: list[int] = []
                 if action == "new":
                     new_count += 1
-                    matched = _record_filter_matches(db, tender)
+                    matched_profile_ids = _record_filter_matches(db, tender)
                 elif action == "updated":
                     updated_count += 1
-                    matched = _record_filter_matches(db, tender)
+                    matched_profile_ids = _record_filter_matches(db, tender)
                 # commit per record so a later failure doesn't lose progress
                 db.commit()
-                # Enrich matched tenders with documents + requirements
-                if matched > 0:
+                # Enrich matched tenders with documents + requirements, then dispatch
+                # push notifications for the newly created matches. Push is
+                # best-effort; failures are logged in services/push and never
+                # raised, so a dead subscriber can't break ingestion.
+                if matched_profile_ids:
                     try:
                         await _enrich_matched_tender(db, tender)
                     except Exception:  # noqa: BLE001
                         logger.exception("ingest.enrich_failed", tender_id=tender.id)
+                    push.send_match_notifications(db, tender, matched_profile_ids)
+                    db.commit()
         source.last_polled_at = datetime.now(UTC)
         run.status = "ok"
     except Exception as exc:  # noqa: BLE001
