@@ -21,7 +21,11 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16
+        # pgvector/pgvector:pg16 is the official pgvector image — Postgres 16
+        # with the `vector` extension preinstalled. Migration 0004 calls
+        # `CREATE EXTENSION vector`, which the stock postgres:16 image does
+        # not support out of the box.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: tender
           POSTGRES_PASSWORD: tender
