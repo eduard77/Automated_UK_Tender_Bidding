@@ -1,0 +1,24 @@
+from tender_agent.adapters.base import SourceAdapter
+from tender_agent.adapters.contracts_finder import ContractsFinderAdapter
+from tender_agent.adapters.etendersni import ETendersNIAdapter
+from tender_agent.adapters.fts import FTSAdapter
+from tender_agent.adapters.pcs import PCSAdapter
+from tender_agent.adapters.sell2wales import Sell2WalesAdapter
+
+ADAPTERS: dict[str, type[SourceAdapter]] = {
+    "FTS": FTSAdapter,
+    "CF": ContractsFinderAdapter,
+    "PCS": PCSAdapter,
+    "S2W": Sell2WalesAdapter,
+    "NI": ETendersNIAdapter,
+}
+
+__all__ = [
+    "ADAPTERS",
+    "ContractsFinderAdapter",
+    "ETendersNIAdapter",
+    "FTSAdapter",
+    "PCSAdapter",
+    "Sell2WalesAdapter",
+    "SourceAdapter",
+]

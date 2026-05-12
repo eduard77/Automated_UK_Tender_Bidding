@@ -1,0 +1,35 @@
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/tender-agent"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "python"]
+    groups:
+      python-minor:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "npm"
+    directory: "/tender-agent-dashboard"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "javascript"]
+    groups:
+      js-minor:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    labels: ["dependencies", "ci"]
+
+  - package-ecosystem: "docker"
+    directory: "/tender-agent"
+    schedule:
+      interval: "monthly"
+    labels: ["dependencies", "docker"]

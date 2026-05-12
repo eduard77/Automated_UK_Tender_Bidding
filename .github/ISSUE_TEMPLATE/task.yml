@@ -1,0 +1,63 @@
+name: Task
+description: A unit of work to implement (suitable for Claude Code or human)
+labels: ["task"]
+body:
+  - type: input
+    id: title
+    attributes:
+      label: One-line description
+      placeholder: "Implement Public Contracts Scotland adapter integration test"
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: What part of the project does this belong to? Reference PROJECT.md sections.
+      placeholder: |
+        Phase 2 — Discovery service.
+        Relates to PROJECT.md §3 Phase 2 acceptance criterion: "All 5 source adapters
+        ingest cleanly from live endpoints."
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Specific, testable conditions for "done"
+      placeholder: |
+        - [ ] Test reads a recorded HAR fixture, not a live endpoint
+        - [ ] Fixture contains at least 5 representative tender notices
+        - [ ] Test verifies adapter yields NormalisedTender for each
+        - [ ] `pytest tests/test_adapter_pcs.py` passes in CI
+    validations:
+      required: true
+
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of scope
+      description: What this task is NOT — prevents scope creep
+      placeholder: |
+        - Live API calls in CI
+        - Refactoring the OCDS normaliser
+        - Adding new adapter sources
+
+  - type: dropdown
+    id: assignee-type
+    attributes:
+      label: Suitable for
+      multiple: true
+      options:
+        - Claude Code (autonomous)
+        - Claude Code (with human review)
+        - Human only
+        - Either
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Anything else useful — links, references, gotchas

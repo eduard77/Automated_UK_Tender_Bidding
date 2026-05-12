@@ -1,0 +1,58 @@
+name: Bug report
+description: Something is broken or behaving incorrectly
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the bug. What did you expect to happen? What actually happened?
+      placeholder: When I do X, Y happens instead of Z.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Exact steps so someone else can reproduce this.
+      placeholder: |
+        1. Start the app with `docker compose up`
+        2. POST to /filters with payload X
+        3. Trigger /admin/poll-now
+        4. Observe ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      multiple: false
+      options:
+        - Discovery / adapters
+        - Document downloader
+        - Requirements extractor
+        - Filter engine
+        - Dashboard
+        - Database / migrations
+        - Vault (Phase 3)
+        - Portal adapter (Phase 4)
+        - Drafting agent (Phase 5)
+        - Email / workflows (Phase 6)
+        - Other / unsure
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / error output
+      description: Paste relevant logs. Scrub any credentials, document content, or PII.
+      render: shell
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: "macOS 14 · Docker · main @ abc1234"

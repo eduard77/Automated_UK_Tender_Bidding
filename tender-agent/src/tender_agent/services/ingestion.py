@@ -1,0 +1,178 @@
+"""Orchestrates a full poll-and-ingest cycle for one source."""
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import UTC, datetime, timedelta
+
+import structlog
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from tender_agent.adapters import ADAPTERS
+from tender_agent.config import settings
+from tender_agent.models import FilterMatch, PollRun, Source, Tender
+from tender_agent.schemas import NormalisedTender
+from tender_agent.services import filter_engine
+from tender_agent.services.deduplicator import find_duplicate
+from tender_agent.services.document_downloader import download_documents_for_tender
+from tender_agent.services.requirements_extractor import extract_requirements
+
+logger = structlog.get_logger(__name__)
+
+
+def _content_hash(t: NormalisedTender) -> str:
+    payload = {
+        "title": t.title,
+        "description": t.description,
+        "value": str(t.value_amount) if t.value_amount is not None else None,
+        "deadline": t.deadline_at.isoformat() if t.deadline_at else None,
+        "status": t.status,
+        "documents": [d.url for d in t.documents],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _upsert_tender(db: Session, normalised: NormalisedTender) -> tuple[Tender, str]:
+    """Insert or update a tender. Returns (tender, action) where action is
+    'new', 'updated', or 'unchanged'."""
+    now = datetime.now(UTC)
+    chash = _content_hash(normalised)
+
+    existing = db.execute(
+        select(Tender).where(
+            Tender.source_code == normalised.source_code,
+            Tender.source_ref == normalised.source_ref,
+        )
+    ).scalar_one_or_none()
+
+    payload = normalised.model_dump(mode="json")
+    docs_payload = payload.pop("documents", [])
+    raw_payload = payload.pop("raw", {})
+
+    if existing is None:
+        tender = Tender(
+            **payload,
+            documents=docs_payload,
+            raw=raw_payload,
+            content_hash=chash,
+            first_seen_at=now,
+            last_seen_at=now,
+        )
+        # Deduplicate against other sources
+        dup = find_duplicate(db, normalised)
+        if dup is not None:
+            tender.duplicate_of_id = dup.id
+        db.add(tender)
+        db.flush()
+        return tender, "new"
+
+    existing.last_seen_at = now
+    if existing.content_hash == chash:
+        return existing, "unchanged"
+
+    # Apply update
+    for k, v in payload.items():
+        setattr(existing, k, v)
+    existing.documents = docs_payload
+    existing.raw = raw_payload
+    existing.content_hash = chash
+    return existing, "updated"
+
+
+def _record_filter_matches(db: Session, tender: Tender) -> int:
+    """Match tender against enabled filter profiles. Returns count of new matches."""
+    if tender.duplicate_of_id is not None:
+        return 0  # don't double-alert on duplicates
+    profiles = filter_engine.matching_profiles(db, tender)
+    new = 0
+    for profile in profiles:
+        existing = db.execute(
+            select(FilterMatch).where(
+                FilterMatch.tender_id == tender.id,
+                FilterMatch.filter_profile_id == profile.id,
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            db.add(FilterMatch(tender_id=tender.id, filter_profile_id=profile.id, score=1.0))
+            new += 1
+    return new
+
+
+async def _enrich_matched_tender(db: Session, tender: Tender) -> None:
+    """Download docs and extract requirements for a matched tender. Best-effort."""
+    try:
+        await download_documents_for_tender(db, tender)
+    except Exception:  # noqa: BLE001
+        logger.exception("enrich.download_failed", tender_id=tender.id)
+    try:
+        # Refresh document_files relationship
+        db.refresh(tender)
+        extract_requirements(db, tender)
+    except Exception:  # noqa: BLE001
+        logger.exception("enrich.extract_failed", tender_id=tender.id)
+
+
+async def poll_source(db: Session, source: Source) -> PollRun:
+    """Run one polling cycle for the given source."""
+    adapter_cls = ADAPTERS.get(source.code)
+    if adapter_cls is None:
+        raise ValueError(f"No adapter registered for source code {source.code}")
+
+    since = source.last_polled_at or (
+        datetime.now(UTC) - timedelta(days=settings.lookback_days_initial)
+    )
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=UTC)
+
+    run = PollRun(source_id=source.id, status="running")
+    db.add(run)
+    db.flush()
+
+    fetched = new_count = updated_count = 0
+    error: str | None = None
+
+    try:
+        async with adapter_cls() as adapter:
+            async for normalised in adapter.fetch_since(since):
+                fetched += 1
+                tender, action = _upsert_tender(db, normalised)
+                matched = 0
+                if action == "new":
+                    new_count += 1
+                    matched = _record_filter_matches(db, tender)
+                elif action == "updated":
+                    updated_count += 1
+                    matched = _record_filter_matches(db, tender)
+                # commit per record so a later failure doesn't lose progress
+                db.commit()
+                # Enrich matched tenders with documents + requirements
+                if matched > 0:
+                    try:
+                        await _enrich_matched_tender(db, tender)
+                    except Exception:  # noqa: BLE001
+                        logger.exception("ingest.enrich_failed", tender_id=tender.id)
+        source.last_polled_at = datetime.now(UTC)
+        run.status = "ok"
+    except Exception as exc:  # noqa: BLE001
+        error = f"{type(exc).__name__}: {exc}"
+        run.status = "error"
+        logger.exception("ingest.failed", source=source.code)
+        db.rollback()
+
+    run.fetched = fetched
+    run.new_count = new_count
+    run.updated_count = updated_count
+    run.error = error
+    run.finished_at = datetime.now(UTC)
+    db.commit()
+
+    logger.info(
+        "ingest.complete",
+        source=source.code,
+        fetched=fetched,
+        new=new_count,
+        updated=updated_count,
+        status=run.status,
+    )
+    return run

@@ -1,0 +1,16 @@
+# CODEOWNERS — automatic review requests
+
+# Default reviewer for everything
+* @eduard77
+
+# Critical-path areas where extra scrutiny matters
+/tender-agent/PROJECT.md           @eduard77
+/tender-agent/CLAUDE.md            @eduard77
+/tender-agent/alembic/versions/    @eduard77
+/.github/workflows/                @eduard77
+/.github/CODEOWNERS                @eduard77
+/LICENSE                           @eduard77
+
+# Safety-critical code (Phase 4+) — keep an eye on these once they exist
+# /tender-agent/src/tender_agent/services/portals/    @eduard77
+# /tender-agent/src/tender_agent/workflows/           @eduard77
