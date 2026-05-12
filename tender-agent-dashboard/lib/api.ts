@@ -113,7 +113,13 @@ export interface FilterProfileCreate {
 export interface FilterProfile extends FilterProfileCreate {
   id: number;
   created_at: string;
+  match_count: number;
+  // Backend always populates this; narrow from the optional in FilterProfileCreate.
+  enabled: boolean;
 }
+
+// Every field optional — used for PATCH /filters/{id} (e.g. toggling `enabled`).
+export type FilterProfileUpdate = Partial<FilterProfileCreate>;
 
 export interface ListTendersParams {
   source?: SourceCode | string;
@@ -196,6 +202,18 @@ export const listFilters = () => request<FilterProfile[]>("/filters");
 export const createFilter = (payload: FilterProfileCreate) =>
   request<FilterProfile>("/filters", {
     method: "POST",
+    body: JSON.stringify(payload),
+  });
+
+export const replaceFilter = (id: number, payload: FilterProfileCreate) =>
+  request<FilterProfile>(`/filters/${id}`, {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+
+export const updateFilter = (id: number, payload: FilterProfileUpdate) =>
+  request<FilterProfile>(`/filters/${id}`, {
+    method: "PATCH",
     body: JSON.stringify(payload),
   });
 
