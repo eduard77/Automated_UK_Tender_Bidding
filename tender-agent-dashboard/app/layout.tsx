@@ -2,6 +2,8 @@ import "./globals.css";
 import type { Metadata, Viewport } from "next";
 import Link from "next/link";
 
+import PushBell from "@/components/PushBell";
+
 export const metadata: Metadata = {
   title: "Tender Agent",
   description: "UK public tender discovery and bid automation",
@@ -17,19 +19,26 @@ export const viewport: Viewport = {
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
+  // VAPID is server-side at the layout level: if the key isn't configured we
+  // skip rendering the bell entirely (rather than render a permanently-disabled
+  // button). Push wiring lands in T3.
+  const vapidPublicKey = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY ?? "";
   return (
     <html lang="en">
       <body className="min-h-screen">
         <header className="border-b border-bone/10 sticky top-0 z-30 bg-ink/85 backdrop-blur-md">
-          <div className="max-w-6xl mx-auto px-5 py-4 flex items-center justify-between">
+          <div className="max-w-6xl mx-auto px-5 py-4 flex flex-wrap items-center justify-between gap-3">
             <Link href="/" className="flex items-baseline gap-2">
               <span className="font-display text-2xl tracking-tight text-bone">Tender</span>
               <span className="font-display italic text-rust text-2xl">/agent</span>
             </Link>
-            <nav className="flex items-center gap-6 text-sm">
-              <Link href="/" className="text-bone/70 hover:text-bone transition">Tenders</Link>
-              <Link href="/filters" className="text-bone/70 hover:text-bone transition">Filters</Link>
-            </nav>
+            <div className="flex items-center gap-6">
+              <nav className="flex items-center gap-6 text-sm" aria-label="Primary">
+                <Link href="/" className="text-bone/70 hover:text-bone transition">Tenders</Link>
+                <Link href="/filters" className="text-bone/70 hover:text-bone transition">Filters</Link>
+              </nav>
+              {vapidPublicKey && <PushBell vapidPublicKey={vapidPublicKey} />}
+            </div>
           </div>
         </header>
         <main className="max-w-6xl mx-auto px-5 py-8 pb-24">{children}</main>
