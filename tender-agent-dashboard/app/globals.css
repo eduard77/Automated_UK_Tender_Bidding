@@ -2,41 +2,51 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Google Fonts. This URL duplicates `fontImportUrl` in lib/theme.ts because
+ * CSS @import can't reference a TypeScript module. When the font set changes,
+ * edit BOTH this line and theme.ts. See the comment block at the top of
+ * theme.ts for the complete swap surface. */
 @import url("https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,700;9..144,900&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap");
 
 :root {
-  --font-display: "Fraunces";
-  --font-body: "Inter";
-  --font-mono: "JetBrains Mono";
+  /* Monochrome SVG noise — alpha 0.04 on black. Not a brand colour; doesn't
+   * move with the palette. */
   --noise: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/><feColorMatrix values='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.04 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
 }
 
-html, body {
-  background: #0E1116;
-  color: #F5F1E8;
-  font-family: var(--font-body), system-ui, sans-serif;
-  font-feature-settings: "ss01", "cv11";
+/* All brand-coloured base styles below resolve through Tailwind utilities,
+ * which resolve through tailwind.config.ts, which imports from lib/theme.ts.
+ * No hex literals in this file. */
+
+@layer base {
+  html,
+  body {
+    @apply bg-ink text-bone font-body;
+    font-feature-settings: "ss01", "cv11";
+  }
+
+  body {
+    background-image: var(--noise);
+    background-size: 180px 180px;
+  }
+
+  ::selection {
+    @apply bg-rust text-bone;
+  }
 }
 
-body {
-  background-image: var(--noise);
-  background-size: 180px 180px;
-}
-
-::selection { background: #B5471A; color: #F5F1E8; }
-
-.font-display { font-family: var(--font-display), Georgia, serif; }
-.font-mono { font-family: var(--font-mono), ui-monospace, monospace; }
-
-/* Subtle grid lines */
+/* Subtle grid lines used by the (unused-as-of-Phase-2) grid-paper background.
+ * Kept for future "structured background" surfaces; values resolve through
+ * lib/theme.ts via Tailwind's theme() function. */
 .grid-paper {
   background-image:
-    linear-gradient(to right, rgba(245,241,232,0.04) 1px, transparent 1px),
-    linear-gradient(to bottom, rgba(245,241,232,0.04) 1px, transparent 1px);
+    linear-gradient(to right, theme("colors.bone" / 4%) 1px, transparent 1px),
+    linear-gradient(to bottom, theme("colors.bone" / 4%) 1px, transparent 1px);
   background-size: 32px 32px;
 }
 
-/* Tape effect for cards */
+/* Tape effect for editorial cards. The shadow uses pure black at 20% — not a
+ * brand colour, kept as a literal. */
 .tape::before {
   content: "";
   position: absolute;
@@ -45,7 +55,7 @@ body {
   transform: translateX(-50%) rotate(-2deg);
   width: 70px;
   height: 18px;
-  background: rgba(245,241,232,0.18);
+  background: theme("colors.bone" / 18%);
   backdrop-filter: blur(2px);
-  box-shadow: 0 1px 0 rgba(0,0,0,0.2);
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.2);
 }
