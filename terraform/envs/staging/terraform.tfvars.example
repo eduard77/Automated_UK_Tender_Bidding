@@ -1,0 +1,11 @@
+# Staging tfvars — copy to terraform.tfvars (which is gitignored) and fill in.
+# Required:
+api_image = "123456789012.dkr.ecr.eu-west-2.amazonaws.com/tender-agent-api:replace-with-sha"
+
+# Optional overrides:
+# aws_region            = "eu-west-2"
+# documents_bucket_name = "tender-agent-staging-documents"
+# debug_bucket_name     = "tender-agent-staging-debug"
+# alb_certificate_arn   = null      # HTTP-only in staging by default
+# api_desired_count     = 1
+# worker_desired_count  = 1

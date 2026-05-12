@@ -1,0 +1,57 @@
+name: Terraform validate
+
+# fmt + validate on every PR that touches terraform/. The sandbox the repo is
+# developed in firewalls registry.terraform.io, so `terraform validate` can't
+# run there — but GHA can, and this job is the gate.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform-validate.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform-validate.yml"
+
+concurrency:
+  group: terraform-validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: terraform fmt + validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.2"
+          terraform_wrapper: false
+
+      - name: terraform fmt -check -recursive
+        working-directory: terraform
+        run: terraform fmt -check -recursive
+
+      - name: terraform validate (every module + env)
+        working-directory: terraform
+        run: |
+          set -euo pipefail
+          fail=0
+          for d in bootstrap modules/* envs/*; do
+            echo ""
+            echo "::group::$d"
+            pushd "$d" >/dev/null
+            terraform init -backend=false -input=false -no-color
+            terraform validate -no-color || fail=1
+            popd >/dev/null
+            echo "::endgroup::"
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "terraform validate failed" >&2
+            exit 1
+          fi
