@@ -1,3 +1,10 @@
+# Dependabot — version updates intentionally throttled to 0 PRs across the
+# board while Phase 2 stabilises. Security alerts continue to flow via GitHub's
+# Dependabot alerts; this only stops the noise of weekly version-bump PRs.
+#
+# When Phase 7 lands (hardening + AWS deploy + Terraform), revisit each entry
+# below and set `open-pull-requests-limit` back to 5 (or remove the line to
+# accept Dependabot's default of 5).
 version: 2
 updates:
   - package-ecosystem: "pip"
@@ -5,7 +12,7 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     labels: ["dependencies", "python"]
     groups:
       python-minor:
@@ -16,7 +23,7 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     labels: ["dependencies", "javascript"]
     groups:
       js-minor:
@@ -26,10 +33,12 @@ updates:
     directory: "/"
     schedule:
       interval: "monthly"
+    open-pull-requests-limit: 0
     labels: ["dependencies", "ci"]
 
   - package-ecosystem: "docker"
     directory: "/tender-agent"
     schedule:
       interval: "monthly"
+    open-pull-requests-limit: 0
     labels: ["dependencies", "docker"]
