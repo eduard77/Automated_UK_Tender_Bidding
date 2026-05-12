@@ -49,7 +49,9 @@ gating decisions land:
 | Secret | Value | Notes |
 |---|---|---|
 | `<env>/anthropic-api-key` | `sk-ant-api03-…` | Plain string. |
-| `<env>/vapid` | `{"public_key": "...", "private_key": "...", "subject": "mailto:..."}` | JSON. Generate with `cd tender-agent-dashboard && npm run generate-vapid`. |
+| `<env>/vapid-private-key`, `<env>/vapid-public-key`, `<env>/vapid-subject` | Plain strings | Three separate secrets so the private key can rotate independently. Generate with `cd tender-agent-dashboard && npm run generate-vapid`. |
+| `<env>/dashboard-session-secret` | Random 32 bytes (base64) | Reserved for future session signing; safe to leave unset for now. |
+| `<env>/portal-credentials-placeholder` | DO NOT POPULATE | Documents the Phase 4 portal-credential shape. Leave empty. |
 
 The RDS master password is **created automatically** by AWS and stored in
 the Secrets Manager secret referenced by `module.rds.master_user_secret_arn`
@@ -104,31 +106,74 @@ terraform apply staging.tfplan
 
 Expected wall-clock: **15–25 minutes** (RDS is the long pole).
 
-### Post-apply: load secrets + extension + migrations
+### Post-apply: load secret values + pgvector extension + migrations
 
-#### Load Anthropic key
+The `modules/secrets/` Terraform creates **the secret containers** but never
+sets values — real keys never appear in `.tfstate` or `terraform plan`
+output. Operators populate them out-of-band, once per environment.
+
+All six secret slots, with sample commands. Re-run any of these to rotate.
+Replace `staging` with `prod` for the prod environment.
 
 ```bash
+ENV=staging
+
+# 1. Anthropic API key — used by api (requirements extractor) AND worker
+#    (Phase 3 claims extraction).
 aws secretsmanager put-secret-value \
-  --secret-id tender-agent-staging/anthropic-api-key \
-  --secret-string "$ANTHROPIC_API_KEY"
-```
+  --secret-id "tender-agent-${ENV}/anthropic-api-key" \
+  --secret-string "${ANTHROPIC_API_KEY:?set in env}"
 
-#### Load VAPID keypair
-
-```bash
+# 2-4. VAPID keypair + subject. Generate once with the dashboard's helper:
 cd tender-agent-dashboard
 npm run generate-vapid > /tmp/vapid.txt
+# /tmp/vapid.txt contains:
+#   NEXT_PUBLIC_VAPID_PUBLIC_KEY=...
+#   VAPID_PUBLIC_KEY=...
+#   VAPID_PRIVATE_KEY=...
+#   VAPID_SUBJECT=mailto:admin@example.com
+# Source those lines, then push them as three separate secrets so private-key
+# rotation later doesn't touch the public key or subject:
 
-# Paste the JSON below — public_key, private_key, subject lines from vapid.txt.
 aws secretsmanager put-secret-value \
-  --secret-id tender-agent-staging/vapid \
-  --secret-string '{
-    "public_key": "...",
-    "private_key": "...",
-    "subject": "mailto:you@example.com"
-  }'
+  --secret-id "tender-agent-${ENV}/vapid-public-key" \
+  --secret-string "${VAPID_PUBLIC_KEY:?source /tmp/vapid.txt first}"
+
+aws secretsmanager put-secret-value \
+  --secret-id "tender-agent-${ENV}/vapid-private-key" \
+  --secret-string "${VAPID_PRIVATE_KEY:?source /tmp/vapid.txt first}"
+
+aws secretsmanager put-secret-value \
+  --secret-id "tender-agent-${ENV}/vapid-subject" \
+  --secret-string "mailto:ops@yourdomain.example"
+
+# 5. Dashboard session secret. Populate only when session-signing is wired
+#    (no consumer today). 32 random bytes, base64-encoded.
+aws secretsmanager put-secret-value \
+  --secret-id "tender-agent-${ENV}/dashboard-session-secret" \
+  --secret-string "$(openssl rand -base64 32)"
+
+# 6. tender-agent-${ENV}/portal-credentials-placeholder
+#    DO NOT POPULATE. It's a tagged-but-empty marker documenting the Phase 4
+#    shape: one secret per portal at tender-agent-${ENV}/portal/<portal-key>,
+#    value JSON {username, password, totp_seed?}. Phase 4 adds the per-portal
+#    secrets in its own Terraform; leave the placeholder alone.
 ```
+
+Verify they're all populated:
+
+```bash
+for s in anthropic-api-key vapid-private-key vapid-public-key vapid-subject \
+         dashboard-session-secret; do
+  status=$(aws secretsmanager describe-secret \
+    --secret-id "tender-agent-${ENV}/${s}" \
+    --query 'LastChangedDate' --output text 2>/dev/null)
+  echo "tender-agent-${ENV}/${s}: ${status:-NOT SET}"
+done
+```
+
+The `dashboard-session-secret` line can show `NOT SET` until session-signing
+lands; the others must all show a timestamp before bringing api/worker up.
 
 #### Enable pgvector + run migrations
 
