@@ -5,6 +5,7 @@
 .env.*
 !.env.example
 *.pem
+!tender-agent/src/tender_agent/adapters/extra_ca/*.pem
 *.key
 *-credentials.json
 .aws/
