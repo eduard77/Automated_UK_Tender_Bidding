@@ -42,6 +42,10 @@ class SourceAdapter(ABC):
             headers={"User-Agent": settings.http_user_agent, "Accept": "application/json"},
             follow_redirects=True,
         )
+        # Set to True by a subclass when an HTTP request fails permanently so
+        # ingestion can mark the poll run as status="error" while still
+        # persisting any records that were yielded before the failure.
+        self.had_errors = False
 
     async def aclose(self) -> None:
         if self._owns_client:

@@ -39,6 +39,7 @@ class ContractsFinderAdapter(SourceAdapter):
             try:
                 payload = await self._get_json(url, params=params if page == 1 else None)
             except Exception as exc:
+                self.had_errors = True
                 logger.error("cf.fetch_failed", error=str(exc), url=url)
                 break
 

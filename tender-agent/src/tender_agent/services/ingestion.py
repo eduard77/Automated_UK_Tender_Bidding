@@ -136,6 +136,7 @@ async def poll_source(db: Session, source: Source) -> PollRun:
 
     fetched = new_count = updated_count = 0
     error: str | None = None
+    had_errors = False
 
     try:
         async with adapter_cls() as adapter:
@@ -162,8 +163,13 @@ async def poll_source(db: Session, source: Source) -> PollRun:
                         logger.exception("ingest.enrich_failed", tender_id=tender.id)
                     push.send_match_notifications(db, tender, matched_profile_ids)
                     db.commit()
-        source.last_polled_at = datetime.now(UTC)
-        run.status = "ok"
+            had_errors = bool(getattr(adapter, "had_errors", False))
+        if had_errors:
+            run.status = "error"
+            error = "upstream HTTP requests failed (see adapter log events)"
+        else:
+            source.last_polled_at = datetime.now(UTC)
+            run.status = "ok"
     except Exception as exc:  # noqa: BLE001
         error = f"{type(exc).__name__}: {exc}"
         run.status = "error"

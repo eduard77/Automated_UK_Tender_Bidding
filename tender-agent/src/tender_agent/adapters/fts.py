@@ -3,7 +3,6 @@
 FTS publishes notices in Open Contracting Data Standard (OCDS) format via
 release packages. Each release represents a snapshot of a notice at a point in
 time. We page by `updated-from`/`cursor` and yield normalised tenders.
-
 Reference: https://www.find-tender.service.gov.uk/apidocumentation
 """
 from __future__ import annotations
@@ -29,18 +28,17 @@ class FTSAdapter(SourceAdapter):
     async def fetch_since(self, since: datetime) -> AsyncIterator[NormalisedTender]:
         if since.tzinfo is None:
             since = since.replace(tzinfo=UTC)
-        params = {"updated-from": since.strftime("%Y-%m-%dT%H:%M:%S")}
+        params = {"updatedFrom": since.strftime("%Y-%m-%dT%H:%M:%SZ")}
         url = f"{self.base_url}/ocdsReleasePackages"
         page = 0
-
         while url:
             page += 1
             try:
                 payload = await self._get_json(url, params=params if page == 1 else None)
             except Exception as exc:
+                self.had_errors = True
                 logger.error("fts.fetch_failed", error=str(exc), url=url)
                 break
-
             releases = payload.get("releases", [])
             for release in releases:
                 try:
@@ -55,7 +53,6 @@ class FTSAdapter(SourceAdapter):
                         error=str(exc),
                         ocid=release.get("ocid"),
                     )
-
             links = payload.get("links") or {}
             next_url = links.get("next")
             url = next_url if next_url and next_url != url else None

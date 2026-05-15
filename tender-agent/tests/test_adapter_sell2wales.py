@@ -1,7 +1,9 @@
 """Fixture-based tests for the Sell2Wales (S2W) adapter.
 
-S2W publishes OCDS release packages from `/Notices` with `pageSize=100` and
-`updatedFrom=...`. Same normaliser as FTS/CF/PCS.
+S2W shares its OCDS API codebase with PCS. The endpoint is month-granular
+(`dateFrom=MM-YYYY`); the adapter iterates one request per month between
+`since` and now. Tests pin month iteration to a single month so each test
+makes exactly one upstream call.
 """
 from __future__ import annotations
 
@@ -9,14 +11,21 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import httpx
+import pytest
 
+from tender_agent.adapters import sell2wales as s2w_module
 from tender_agent.adapters.sell2wales import Sell2WalesAdapter
 from tender_agent.schemas import NormalisedTender
 
 from .conftest import build_adapter, collect, load_json_fixture, static_json_handler
 
 FIXTURE = "sell2wales_page.json"
-CUTOFF = datetime(2025, 1, 1, tzinfo=UTC)
+CUTOFF = datetime(2026, 4, 1, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def _single_month(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(s2w_module, "_months_between", lambda _s, _e: [(4, 2026)])
 
 
 async def test_fetch_since_yields_normalised_tenders() -> None:
@@ -33,22 +42,24 @@ async def test_fetch_since_yields_normalised_tenders() -> None:
         assert t.title
 
 
-async def test_fetch_since_sends_updated_from_param() -> None:
-    """S2W does NOT post-filter; it passes `updatedFrom` + `pageSize` to /Notices."""
+async def test_fetch_since_sends_date_from_param() -> None:
+    """S2W uses month granularity. The adapter sends `dateFrom=MM-YYYY` plus
+    `noticeType`, `outputType=0` (OCDS), and `locale=2057` (English)."""
     payload = load_json_fixture(FIXTURE)
     captured: list[httpx.Request] = []
     adapter = build_adapter(
         Sell2WalesAdapter, static_json_handler(payload, captured=captured)
     )
 
-    cutoff = datetime(2026, 3, 1, 12, 0, 0, tzinfo=UTC)
-    await collect(adapter, cutoff)
+    await collect(adapter, CUTOFF)
 
-    assert len(captured) >= 1
+    assert len(captured) == 1
     request = captured[0]
     assert "/Notices" in str(request.url)
-    assert request.url.params.get("updatedFrom") == "2026-03-01T12:00:00"
-    assert request.url.params.get("pageSize") == "100"
+    assert request.url.params.get("dateFrom") == "04-2026"
+    assert request.url.params.get("outputType") == "0"
+    assert request.url.params.get("locale") == "2057"
+    assert request.url.params.get("noticeType") == "2"
 
 
 async def test_normalisation_of_known_fields() -> None:
