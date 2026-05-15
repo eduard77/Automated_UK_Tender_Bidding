@@ -43,9 +43,8 @@ async def test_fetch_since_yields_normalised_tenders() -> None:
 
 async def test_fetch_since_sends_updated_from_param() -> None:
     """Pattern 2 (OCDS variant): the FTS adapter does NOT post-filter on `since`
-    — it passes `updated-from` upstream and trusts the response. We assert the
-    param is sent in the right shape; live-filter testing belongs in an
-    integration test against the real endpoint.
+    — it passes `updatedFrom` upstream and trusts the response. The Z suffix is
+    required by FTS; without it the API returns 400.
     """
     payload = load_json_fixture(FIXTURE)
     captured: list[httpx.Request] = []
@@ -57,7 +56,7 @@ async def test_fetch_since_sends_updated_from_param() -> None:
     assert len(captured) >= 1
     request = captured[0]
     assert "/ocdsReleasePackages" in str(request.url)
-    assert request.url.params.get("updated-from") == "2026-03-01T12:00:00"
+    assert request.url.params.get("updatedFrom") == "2026-03-01T12:00:00Z"
 
 
 async def test_normalisation_of_known_fields() -> None:
