@@ -1,6 +1,6 @@
 services:
   db:
-    image: postgres:16
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_USER: tender
       POSTGRES_PASSWORD: tender
@@ -14,7 +14,6 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
-
   app:
     build: .
     depends_on:
@@ -28,6 +27,5 @@ services:
     command: >
       sh -c "alembic upgrade head &&
              uvicorn tender_agent.main:app --host 0.0.0.0 --port 8000"
-
 volumes:
   tender_db:
