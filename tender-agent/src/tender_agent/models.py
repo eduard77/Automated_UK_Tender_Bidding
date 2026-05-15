@@ -85,7 +85,7 @@ class Tender(Base):
     # Buyer
     buyer_name: Mapped[str | None] = mapped_column(String(512))
     buyer_id: Mapped[str | None] = mapped_column(String(128))
-    buyer_country: Mapped[str | None] = mapped_column(String(8))
+    buyer_country: Mapped[str | None] = mapped_column(String(64))
     buyer_region: Mapped[str | None] = mapped_column(String(128))
 
     # Classification

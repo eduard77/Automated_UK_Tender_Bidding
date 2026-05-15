@@ -72,7 +72,7 @@ def upgrade() -> None:
         sa.Column("status", sa.String(length=32)),
         sa.Column("buyer_name", sa.String(length=512)),
         sa.Column("buyer_id", sa.String(length=128)),
-        sa.Column("buyer_country", sa.String(length=8)),
+        sa.Column("buyer_country", sa.String(length=64)),
         sa.Column("buyer_region", sa.String(length=128)),
         sa.Column("cpv_codes", postgresql.ARRAY(sa.String())),
         sa.Column("keywords", postgresql.ARRAY(sa.String())),
