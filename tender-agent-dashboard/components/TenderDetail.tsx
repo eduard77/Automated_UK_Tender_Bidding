@@ -1,13 +1,13 @@
 "use client";
 
 import Link from "next/link";
+import { useState } from "react";
 import useSWR from "swr";
 
+import PillKicker from "./PillKicker";
 import {
   ApiError,
-  daysUntil,
   fetcher,
-  formatValue,
   type DocumentRequired,
   type EvaluationCriterion,
   type QuestionToAnswer,
@@ -16,14 +16,14 @@ import {
   type TenderDocumentFile,
   type TenderRequirements,
 } from "@/lib/api";
-
-const SOURCE_LABEL: Record<string, string> = {
-  FTS: "Find a Tender",
-  CF: "Contracts Finder",
-  PCS: "Public Contracts Scotland",
-  S2W: "Sell2Wales",
-  NI: "eTendersNI",
-};
+import {
+  absoluteDeadline,
+  daysUntil,
+  formatCurrency,
+  formatDate,
+  relativeDeadline,
+  sourceLabel,
+} from "@/lib/format";
 
 export default function TenderDetail({ id }: { id: number }) {
   const tender = useSWR<Tender>(`/tenders/${id}`, fetcher, {
@@ -34,8 +34,8 @@ export default function TenderDetail({ id }: { id: number }) {
     fetcher,
     {
       revalidateOnFocus: false,
-      // Don't retry 404 — that's a known "not yet extracted" state.
-      shouldRetryOnError: (err) => !(err instanceof ApiError && err.status === 404),
+      shouldRetryOnError: (err) =>
+        !(err instanceof ApiError && err.status === 404),
     },
   );
   const documents = useSWR<TenderDocumentFile[]>(
@@ -51,7 +51,7 @@ export default function TenderDetail({ id }: { id: number }) {
     return <TopLevelError onRetry={() => tender.mutate()} />;
   }
   if (!tender.data) {
-    return <SkeletonDetail />;
+    return <DetailSkeleton />;
   }
 
   const brief = requirements.data ?? null;
@@ -59,178 +59,337 @@ export default function TenderDetail({ id }: { id: number }) {
     requirements.error instanceof ApiError && requirements.error.status === 404;
 
   return (
-    <article className="space-y-8">
+    <div className="space-y-14 py-14">
       <Header tender={tender.data} />
-      <Brief
+      <Description description={tender.data.description} />
+      <Sidebar tender={tender.data} />
+      <BriefBlock
+        tenderId={id}
         brief={brief}
         is404={briefIs404}
         otherError={!brief && !briefIs404 && requirements.error ? requirements.error : null}
-        onRetry={() => requirements.mutate()}
+        onReload={() => requirements.mutate()}
       />
-      <AttachedDocuments
+      <DocumentsSection
         files={documents.data ?? null}
         loading={!documents.data && !documents.error}
         error={documents.error}
         onRetry={() => documents.mutate()}
       />
-    </article>
+    </div>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Header
+// Header / hero
 // ---------------------------------------------------------------------------
 
 function Header({ tender }: { tender: Tender }) {
+  const deadline = relativeDeadline(tender.deadline_at);
   const days = daysUntil(tender.deadline_at);
-  const urgent = days !== null && days >= 0 && days <= 7;
   return (
-    <header className="space-y-3 border-b border-bone/10 pb-6">
-      <div className="flex flex-wrap items-center gap-2 text-[10px] font-mono uppercase tracking-widest">
-        <SourceBadge tender={tender} />
+    <header className="space-y-6">
+      <Link
+        href="/"
+        className="inline-flex items-center gap-2 text-[13px] text-text-muted hover:text-text"
+      >
+        ← Back to today
+      </Link>
+
+      <div className="flex flex-wrap items-center gap-3">
+        <span
+          className="font-mono text-text"
+          style={{
+            fontSize: "11px",
+            fontWeight: 500,
+            letterSpacing: "0.08em",
+            padding: "4px 9px",
+            background: "rgba(255, 255, 255, 0.06)",
+            border: "1px solid rgba(255, 255, 255, 0.16)",
+            borderRadius: "5px",
+          }}
+          title={sourceLabel(tender.source_code)}
+        >
+          {tender.source_code}
+        </span>
         {tender.notice_type && (
-          <>
-            <span className="text-bone/30">·</span>
-            <span className="text-bone/50">{tender.notice_type}</span>
-          </>
+          <span
+            className="text-text-muted"
+            style={{
+              fontSize: "12px",
+              letterSpacing: "0.08em",
+              textTransform: "uppercase",
+            }}
+          >
+            {tender.notice_type}
+          </span>
         )}
-        {tender.status && tender.status !== "active" && (
-          <>
-            <span className="text-bone/30">·</span>
-            <span className="text-sage/80">{tender.status}</span>
-          </>
+        {deadline.urgent && days !== null && days >= 0 && (
+          <PillKicker withDot={false} className="ml-1">
+            <span className="text-amber">
+              Closes in {days} day{days === 1 ? "" : "s"}
+            </span>
+          </PillKicker>
         )}
       </div>
 
-      <h1 className="font-display text-3xl md:text-4xl text-bone leading-tight">
+      <h1
+        className="font-display text-text text-balance"
+        style={{
+          fontSize: "clamp(36px, 5vw, 64px)",
+          fontWeight: 400,
+          letterSpacing: "-0.03em",
+          lineHeight: 1.04,
+          fontVariationSettings: '"opsz" 96',
+          maxWidth: "1100px",
+        }}
+      >
         {tender.title}
       </h1>
 
       {tender.buyer_name && (
-        <p className="italic text-bone/70">{tender.buyer_name}</p>
-      )}
-
-      <div className="flex flex-wrap items-center gap-4 pt-2">
-        <div className="font-mono text-lg text-bone">
-          {formatValue(tender.value_amount, tender.value_currency)}
-        </div>
-        {days !== null && (
-          <span
-            className={`text-xs font-mono uppercase tracking-wider px-2 py-1 border ${
-              urgent
-                ? "border-rust text-rust bg-rust/10"
-                : days < 0
-                  ? "border-bone/20 text-bone/40"
-                  : "border-bone/30 text-bone/70"
-            }`}
-          >
-            {days < 0 ? "closed" : days === 0 ? "today" : `${days}d left`}
+        <p
+          className="text-text-muted"
+          style={{ fontSize: "18px" }}
+        >
+          <span className="text-text" style={{ fontWeight: 500 }}>
+            {tender.buyer_name}
           </span>
-        )}
-        {tender.source_url && (
-          <a
-            href={tender.source_url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-xs font-mono uppercase tracking-wider px-4 py-2 border border-bone/30 text-bone hover:border-rust hover:text-rust transition focus:outline-none focus:ring-1 focus:ring-rust"
-          >
-            ↗ open in source portal
-          </a>
-        )}
-      </div>
-
-      {tender.description && (
-        <p className="text-sm text-bone/70 max-w-3xl pt-4 leading-relaxed">
-          {tender.description}
         </p>
       )}
     </header>
   );
 }
 
-function SourceBadge({ tender }: { tender: Tender }) {
-  const label = SOURCE_LABEL[tender.source_code] || tender.source_code;
-  const content = <span className="text-rust">{label}</span>;
-  if (!tender.source_url) return content;
+function Description({ description }: { description: string | null }) {
+  if (!description) return null;
+  // Split on double newlines into paragraphs for breathing room.
+  const paragraphs = description.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
   return (
-    <a
-      href={tender.source_url}
-      target="_blank"
-      rel="noopener noreferrer"
-      className="text-rust hover:underline"
-      aria-label={`${label} (opens in new tab)`}
-    >
-      {label} ↗
-    </a>
+    <section className="max-w-3xl">
+      <div className="section-eyebrow mb-6">About this opportunity</div>
+      <div className="space-y-5 text-text/90" style={{ fontSize: "16px", lineHeight: 1.7 }}>
+        {paragraphs.length > 0 ? (
+          paragraphs.map((p, i) => <p key={i}>{p}</p>)
+        ) : (
+          <p>{description}</p>
+        )}
+      </div>
+    </section>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Brief (requirements)
+// Sidebar — value, deadline, dates, cpv, source url, documents teaser
 // ---------------------------------------------------------------------------
 
-function Brief({
+function Sidebar({ tender }: { tender: Tender }) {
+  const value = formatCurrency(tender.value_amount, tender.value_currency);
+  const days = daysUntil(tender.deadline_at);
+  return (
+    <section
+      className="rounded-2xl border border-border-strong bg-bg-elevated p-8 backdrop-blur-md"
+      style={{ borderRadius: "24px" }}
+    >
+      <div className="grid grid-cols-1 gap-x-12 gap-y-8 md:grid-cols-2">
+        <DataPoint label="Estimated value">
+          <span
+            className={`display-num ${value ? "text-mint-pale" : "text-text-dim italic"}`}
+            style={{ fontSize: "28px", lineHeight: 1 }}
+          >
+            {value ?? "Value not stated"}
+          </span>
+        </DataPoint>
+        <DataPoint label="Closes">
+          <span
+            className={`display-num ${days !== null && days >= 0 && days <= 14 ? "text-amber" : "text-text"}`}
+            style={{ fontSize: "28px", lineHeight: 1 }}
+          >
+            {days !== null && days >= 0
+              ? `${days} day${days === 1 ? "" : "s"}`
+              : days !== null && days < 0
+                ? "Closed"
+                : "TBC"}
+          </span>
+          {tender.deadline_at && (
+            <span
+              className="block text-text-dim mt-1"
+              style={{ fontSize: "13px" }}
+            >
+              {absoluteDeadline(tender.deadline_at)}
+            </span>
+          )}
+        </DataPoint>
+        {tender.published_at && (
+          <DataPoint label="Published">
+            <span className="text-text" style={{ fontSize: "16px" }}>
+              {formatDate(tender.published_at)}
+            </span>
+          </DataPoint>
+        )}
+        <DataPoint label="Source">
+          <span className="text-text" style={{ fontSize: "16px" }}>
+            {sourceLabel(tender.source_code)}
+          </span>
+        </DataPoint>
+      </div>
+
+      {tender.cpv_codes && tender.cpv_codes.length > 0 && (
+        <div className="mt-8 border-t border-border pt-6">
+          <div
+            className="mb-3 text-text-dim"
+            style={{
+              fontSize: "11px",
+              letterSpacing: "0.12em",
+              textTransform: "uppercase",
+              fontWeight: 500,
+            }}
+          >
+            CPV codes
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {tender.cpv_codes.map((c) => (
+              <span
+                key={c}
+                className="font-mono text-text-muted"
+                style={{
+                  fontSize: "11px",
+                  padding: "3px 8px",
+                  background: "rgba(255, 255, 255, 0.04)",
+                  border: "1px solid rgba(255, 255, 255, 0.08)",
+                  borderRadius: "4px",
+                  letterSpacing: "0.02em",
+                }}
+              >
+                {c}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {tender.source_url && (
+        <div className="mt-8 flex flex-wrap gap-3">
+          <a
+            href={tender.source_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="btn-secondary"
+          >
+            Open in source portal ↗
+          </a>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function DataPoint({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="flex flex-col gap-2">
+      <span
+        className="text-text-dim"
+        style={{
+          fontSize: "11px",
+          letterSpacing: "0.12em",
+          textTransform: "uppercase",
+          fontWeight: 500,
+        }}
+      >
+        {label}
+      </span>
+      <div>{children}</div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Brief block (requirements)
+// ---------------------------------------------------------------------------
+
+function BriefBlock({
+  tenderId,
   brief,
   is404,
   otherError,
-  onRetry,
+  onReload,
 }: {
+  tenderId: number;
   brief: TenderRequirements | null;
   is404: boolean;
   otherError: unknown;
-  onRetry: () => void;
+  onReload: () => void;
 }) {
   if (otherError) {
     return (
-      <section className="border border-oxblood/60 bg-oxblood/10 p-5 space-y-2">
-        <h2 className="font-display text-lg text-bone">Couldn't load brief</h2>
-        <button
-          type="button"
-          onClick={onRetry}
-          className="text-xs font-mono uppercase tracking-wider px-4 py-2 border border-bone/30 text-bone hover:border-bone transition focus:outline-none focus:ring-1 focus:ring-rust"
-        >
-          ↻ retry
+      <section
+        role="alert"
+        className="rounded-2xl border border-danger/40 bg-bg-elevated p-8 backdrop-blur-md"
+        style={{ borderRadius: "24px" }}
+      >
+        <h2 className="font-display text-text" style={{ fontSize: "22px" }}>
+          Couldn&apos;t load brief
+        </h2>
+        <button type="button" onClick={onReload} className="btn-secondary mt-5">
+          ↻ Retry
         </button>
       </section>
     );
   }
 
   if (is404 || !brief) {
-    return <NotYetExtractedCallout />;
+    return <GenerateBriefCta tenderId={tenderId} onSuccess={onReload} />;
   }
 
   return (
-    <section className="space-y-6" aria-label="Tender brief">
-      <RiskFlags flags={brief.risk_flags} />
-      <RecommendationBanner brief={brief} />
+    <section className="space-y-10">
+      <div className="section-eyebrow">Brief</div>
+
+      {brief.recommendation && <RecommendationBanner brief={brief} />}
+      {brief.risk_flags && brief.risk_flags.length > 0 && <RiskFlags flags={brief.risk_flags} />}
+
       {brief.summary && (
-        <div className="text-sm text-bone/85 leading-relaxed max-w-3xl">
+        <div
+          className="max-w-3xl text-text"
+          style={{ fontSize: "16px", lineHeight: 1.7 }}
+        >
           {brief.summary}
         </div>
       )}
-      <EvaluationCriteriaList items={brief.evaluation_criteria} />
+
+      <EvaluationCriteriaCards items={brief.evaluation_criteria} />
+
       <RequirementsList
         title="Mandatory requirements"
         items={brief.mandatory_requirements}
         prominence="primary"
-        emptyText="No mandatory requirements extracted."
       />
       <RequirementsList
         title="Desired requirements"
         items={brief.desired_requirements}
         prominence="secondary"
-        emptyText="No desired requirements extracted."
       />
+
       <DocumentsRequiredList items={brief.documents_required} />
       <QuestionsList items={brief.questions_to_answer} />
+
       {(brief.estimated_effort_days || brief.model) && (
-        <footer className="text-[10px] font-mono uppercase tracking-wider text-bone/40 pt-2 border-t border-bone/10 flex flex-wrap gap-4">
+        <footer
+          className="flex flex-wrap gap-6 border-t border-border pt-6 text-text-dim"
+          style={{ fontSize: "11px", letterSpacing: "0.1em", textTransform: "uppercase" }}
+        >
           {brief.estimated_effort_days != null && (
-            <span>estimated effort: {brief.estimated_effort_days} days</span>
+            <span>Estimated effort: {brief.estimated_effort_days} days</span>
           )}
-          {brief.model && <span>model: {brief.model}</span>}
+          {brief.model && <span>Model: {brief.model}</span>}
           {brief.extracted_at && (
-            <span>extracted: {formatDate(brief.extracted_at)}</span>
+            <span>Extracted: {formatDate(brief.extracted_at)}</span>
           )}
         </footer>
       )}
@@ -238,50 +397,72 @@ function Brief({
   );
 }
 
-function NotYetExtractedCallout() {
+function GenerateBriefCta({
+  tenderId,
+  onSuccess,
+}: {
+  tenderId: number;
+  onSuccess: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const trigger = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const apiBase =
+        process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/$/, "") ?? "/__api";
+      const res = await fetch(`${apiBase}/admin/extract-requirements/${tenderId}`, {
+        method: "POST",
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new Error(body || `HTTP ${res.status}`);
+      }
+      onSuccess();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to generate brief");
+    } finally {
+      setBusy(false);
+    }
+  };
   return (
-    <section className="border border-rust/40 bg-rust/5 p-5 space-y-3">
-      <h2 className="font-display text-lg text-bone">Brief not yet generated</h2>
-      <p className="text-sm text-bone/70 max-w-2xl">
-        Documents haven't been parsed yet for this tender. Generating a brief runs
-        the requirements extractor over the attached documents and produces a
-        structured summary — mandatory and desired requirements, risk flags, and
-        a recommendation.
-      </p>
-      <button
-        type="button"
-        onClick={() => {
-          // Wired in T5 (extractor validation + admin trigger).
-          // eslint-disable-next-line no-console
-          console.log("Generate brief: not yet wired");
-        }}
-        className="text-xs font-mono uppercase tracking-wider px-4 py-2 border border-rust text-rust hover:bg-rust hover:text-bone transition focus:outline-none focus:ring-1 focus:ring-rust"
-      >
-        → generate brief
-      </button>
-    </section>
-  );
-}
-
-function RiskFlags({ flags }: { flags: string[] | null }) {
-  if (!flags?.length) return null;
-  return (
-    <div
-      role="note"
-      aria-label="Risk flags"
-      className="border border-rust/60 bg-rust/10 p-4 space-y-2"
+    <section
+      className="featured-glow-line relative overflow-hidden rounded-2xl border border-border-strong bg-bg-elevated p-10 backdrop-blur-md"
+      style={{ borderRadius: "24px" }}
     >
-      <div className="text-[10px] font-mono uppercase tracking-widest text-rust">
-        ⚠ risk flags
+      <PillKicker withDot={false}>Brief draft</PillKicker>
+      <h2
+        className="font-display text-text mt-5 mb-4"
+        style={{ fontSize: "32px", letterSpacing: "-0.02em", lineHeight: 1.1 }}
+      >
+        No brief generated yet.
+      </h2>
+      <p
+        className="text-text-muted mb-7 max-w-2xl"
+        style={{ fontSize: "15px", lineHeight: 1.6 }}
+      >
+        Run the requirements extractor over the attached documents to produce
+        a structured brief: mandatory and desired requirements, evaluation
+        criteria, risk flags, and a recommendation.
+      </p>
+      <div className="flex flex-wrap items-center gap-3">
+        <button
+          type="button"
+          onClick={trigger}
+          disabled={busy}
+          className="btn-primary"
+        >
+          {busy ? "Generating…" : "Generate brief"}
+          {!busy && <span className="arrow">→</span>}
+        </button>
+        {error && (
+          <span role="alert" className="text-danger" style={{ fontSize: "13px" }}>
+            {error}
+          </span>
+        )}
       </div>
-      <ul className="space-y-1">
-        {flags.map((flag, i) => (
-          <li key={`${i}-${flag}`} className="text-sm text-bone/90">
-            · {flag}
-          </li>
-        ))}
-      </ul>
-    </div>
+    </section>
   );
 }
 
@@ -290,20 +471,30 @@ function RecommendationBanner({ brief }: { brief: TenderRequirements }) {
   const r = brief.recommendation.toLowerCase();
   const palette =
     r === "pursue"
-      ? { border: "border-sage/60", bg: "bg-sage/10", text: "text-sage" }
+      ? { border: "border-mint/40", bg: "bg-mint/10", text: "text-mint" }
       : r === "decline"
-        ? { border: "border-oxblood/60", bg: "bg-oxblood/15", text: "text-oxblood" }
-        : { border: "border-rust/50", bg: "bg-rust/10", text: "text-rust" };
+        ? { border: "border-danger/40", bg: "bg-danger/10", text: "text-danger" }
+        : { border: "border-amber/40", bg: "bg-amber/10", text: "text-amber" };
   return (
     <div
       role="status"
-      className={`border ${palette.border} ${palette.bg} p-4 space-y-2`}
+      className={`rounded-2xl border ${palette.border} ${palette.bg} p-6 backdrop-blur-md`}
+      style={{ borderRadius: "18px" }}
     >
-      <div className={`text-[10px] font-mono uppercase tracking-widest ${palette.text}`}>
-        recommendation · {brief.recommendation}
+      <div
+        className={`${palette.text}`}
+        style={{
+          fontSize: "11px",
+          fontWeight: 500,
+          letterSpacing: "0.14em",
+          textTransform: "uppercase",
+          marginBottom: "10px",
+        }}
+      >
+        Recommendation · {brief.recommendation}
       </div>
       {brief.recommendation_reason && (
-        <p className="text-sm text-bone/85 leading-relaxed">
+        <p className="text-text" style={{ fontSize: "15px", lineHeight: 1.6 }}>
           {brief.recommendation_reason}
         </p>
       )}
@@ -311,31 +502,72 @@ function RecommendationBanner({ brief }: { brief: TenderRequirements }) {
   );
 }
 
-function EvaluationCriteriaList({ items }: { items: EvaluationCriterion[] | null }) {
-  if (!items?.length) return null;
+function RiskFlags({ flags }: { flags: string[] }) {
   return (
-    <section className="space-y-2">
-      <h3 className="font-display text-base text-bone">Evaluation criteria</h3>
+    <div
+      role="note"
+      aria-label="Risk flags"
+      className="rounded-xl border border-amber/30 bg-amber/5 p-5"
+      style={{ borderRadius: "18px" }}
+    >
+      <div
+        className="text-amber mb-3"
+        style={{
+          fontSize: "11px",
+          fontWeight: 500,
+          letterSpacing: "0.14em",
+          textTransform: "uppercase",
+        }}
+      >
+        ⚠ Risk flags
+      </div>
       <ul className="space-y-2">
-        {items.map((c, i) => (
-          <li
-            key={`${i}-${c.name}`}
-            className="flex items-baseline justify-between gap-4 border-b border-bone/5 pb-2"
-          >
-            <div>
-              <div className="text-sm text-bone">{c.name}</div>
-              {c.description && (
-                <div className="text-xs text-bone/55 mt-0.5">{c.description}</div>
-              )}
-            </div>
-            {c.weight != null && (
-              <span className="text-xs font-mono text-bone/70 whitespace-nowrap">
-                {c.weight}%
-              </span>
-            )}
+        {flags.map((f, i) => (
+          <li key={`${i}-${f}`} className="text-text" style={{ fontSize: "14px", lineHeight: 1.55 }}>
+            · {f}
           </li>
         ))}
       </ul>
+    </div>
+  );
+}
+
+function EvaluationCriteriaCards({
+  items,
+}: {
+  items: EvaluationCriterion[] | null;
+}) {
+  if (!items?.length) return null;
+  return (
+    <section className="space-y-4">
+      <h3 className="font-display text-text" style={{ fontSize: "22px", letterSpacing: "-0.02em" }}>
+        Evaluation criteria
+      </h3>
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+        {items.map((c, i) => (
+          <div
+            key={`${i}-${c.name}`}
+            className="rounded-xl border border-border bg-bg-elevated p-5 backdrop-blur-sm"
+            style={{ borderRadius: "18px" }}
+          >
+            <div className="flex items-baseline justify-between gap-3 mb-2">
+              <span className="text-text" style={{ fontWeight: 500 }}>
+                {c.name}
+              </span>
+              {c.weight != null && (
+                <span className="display-num text-mint-pale" style={{ fontSize: "20px" }}>
+                  {c.weight}%
+                </span>
+              )}
+            </div>
+            {c.description && (
+              <p className="text-text-muted" style={{ fontSize: "13px", lineHeight: 1.55 }}>
+                {c.description}
+              </p>
+            )}
+          </div>
+        ))}
+      </div>
     </section>
   );
 }
@@ -344,84 +576,93 @@ function RequirementsList({
   title,
   items,
   prominence,
-  emptyText,
 }: {
   title: string;
   items: RequirementItem[] | null;
   prominence: "primary" | "secondary";
-  emptyText: string;
 }) {
-  if (!items?.length) {
-    return (
-      <section className="space-y-2">
-        <h3
-          className={`font-display ${
-            prominence === "primary" ? "text-lg text-bone" : "text-base text-bone/70"
-          }`}
-        >
-          {title}
-        </h3>
-        <p className="text-xs text-bone/40 italic">{emptyText}</p>
-      </section>
-    );
-  }
+  if (!items?.length) return null;
   return (
-    <section className="space-y-2">
+    <section className="space-y-4">
       <h3
-        className={`font-display ${
-          prominence === "primary" ? "text-lg text-bone" : "text-base text-bone/70"
-        }`}
+        className={`font-display ${prominence === "primary" ? "text-text" : "text-text-muted"}`}
+        style={{
+          fontSize: prominence === "primary" ? "24px" : "20px",
+          letterSpacing: "-0.02em",
+        }}
       >
         {title}
       </h3>
-      <ul className="space-y-3">
+      <ol className="space-y-3">
         {items.map((req, i) => (
           <li
             key={i}
-            className={`${
+            className={`flex gap-5 ${
               prominence === "primary"
-                ? "border border-bone/10 bg-ink-soft/30 p-3"
-                : "border-l border-bone/10 pl-3"
+                ? "rounded-xl border border-border bg-bg-elevated p-5 backdrop-blur-sm"
+                : "border-l border-border pl-5 py-2"
             }`}
+            style={prominence === "primary" ? { borderRadius: "18px" } : undefined}
           >
-            <div className="flex items-start justify-between gap-3">
-              <p
-                className={`text-sm leading-snug ${
-                  prominence === "primary" ? "text-bone/90" : "text-bone/70"
-                }`}
-              >
-                {req.text}
-              </p>
-              {req.confidence && <ConfidenceChip confidence={req.confidence} />}
-            </div>
-            {(req.category || req.evidence_required) && (
-              <div className="mt-1.5 text-[10px] font-mono uppercase tracking-wider text-bone/40 flex flex-wrap gap-3">
-                {req.category && <span>cat: {req.category}</span>}
-                {req.evidence_required && <span>evidence: {req.evidence_required}</span>}
+            <span
+              className="display-num text-mint-pale shrink-0"
+              style={{ fontSize: "20px", lineHeight: 1.4, width: "32px" }}
+              aria-hidden="true"
+            >
+              {String(i + 1).padStart(2, "0")}
+            </span>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-start justify-between gap-3">
+                <p
+                  className={prominence === "primary" ? "text-text" : "text-text-muted"}
+                  style={{ fontSize: "15px", lineHeight: 1.55 }}
+                >
+                  {req.text}
+                </p>
+                {req.confidence && <ConfidenceChip confidence={req.confidence} />}
               </div>
-            )}
-            {req.source_excerpt && (
-              <blockquote className="mt-2 text-xs text-bone/50 italic border-l-2 border-bone/10 pl-2">
-                "{req.source_excerpt}"
-              </blockquote>
-            )}
+              {(req.category || req.evidence_required) && (
+                <div
+                  className="mt-2 flex flex-wrap gap-3 text-text-dim font-mono"
+                  style={{ fontSize: "10px", letterSpacing: "0.1em", textTransform: "uppercase" }}
+                >
+                  {req.category && <span>cat: {req.category}</span>}
+                  {req.evidence_required && (
+                    <span>evidence: {req.evidence_required}</span>
+                  )}
+                </div>
+              )}
+              {req.source_excerpt && (
+                <blockquote
+                  className="mt-3 border-l-2 border-border-strong pl-3 italic text-text-dim"
+                  style={{ fontSize: "13px", lineHeight: 1.5 }}
+                >
+                  &ldquo;{req.source_excerpt}&rdquo;
+                </blockquote>
+              )}
+            </div>
           </li>
         ))}
-      </ul>
+      </ol>
     </section>
   );
 }
 
-function ConfidenceChip({ confidence }: { confidence: "low" | "medium" | "high" }) {
-  const palette =
+function ConfidenceChip({
+  confidence,
+}: {
+  confidence: "low" | "medium" | "high";
+}) {
+  const tone =
     confidence === "high"
-      ? "border-sage/60 text-sage"
+      ? "border-mint/40 text-mint"
       : confidence === "medium"
-        ? "border-rust/60 text-rust"
-        : "border-oxblood/60 text-oxblood";
+        ? "border-amber/40 text-amber"
+        : "border-danger/40 text-danger";
   return (
     <span
-      className={`text-[10px] font-mono uppercase tracking-wider px-1.5 py-0.5 border whitespace-nowrap ${palette}`}
+      className={`shrink-0 whitespace-nowrap rounded-pill border px-2 py-0.5 font-mono ${tone}`}
+      style={{ fontSize: "10px", letterSpacing: "0.1em", textTransform: "uppercase" }}
       aria-label={`Confidence: ${confidence}`}
     >
       {confidence}
@@ -429,47 +670,69 @@ function ConfidenceChip({ confidence }: { confidence: "low" | "medium" | "high" 
   );
 }
 
-function DocumentsRequiredList({ items }: { items: DocumentRequired[] | null }) {
+function DocumentsRequiredList({
+  items,
+}: {
+  items: DocumentRequired[] | null;
+}) {
   if (!items?.length) return null;
   return (
-    <section className="space-y-2">
-      <h3 className="font-display text-lg text-bone">Documents required</h3>
-      <ul className="space-y-2">
+    <section className="space-y-4">
+      <h3 className="font-display text-text" style={{ fontSize: "22px", letterSpacing: "-0.02em" }}>
+        Documents required
+      </h3>
+      <ul className="space-y-3">
         {items.map((doc, i) => (
           <li
             key={`${i}-${doc.name}`}
-            className="flex items-start gap-3 border border-bone/10 p-3 bg-ink-soft/30"
+            className="flex items-start gap-4 rounded-xl border border-border bg-bg-elevated p-5"
+            style={{ borderRadius: "18px" }}
           >
-            <KindBadge name={doc.name} />
+            <span
+              className="font-mono text-text-muted shrink-0"
+              style={{
+                fontSize: "10px",
+                padding: "4px 8px",
+                background: "rgba(255, 255, 255, 0.04)",
+                border: "1px solid rgba(255, 255, 255, 0.08)",
+                borderRadius: "4px",
+                letterSpacing: "0.08em",
+                textTransform: "uppercase",
+              }}
+            >
+              {classifyDocumentKind(doc.name)}
+            </span>
             <div className="flex-1 min-w-0">
-              <div className="flex items-center gap-2">
-                <p className="text-sm text-bone">{doc.name}</p>
+              <div className="flex flex-wrap items-baseline gap-3">
+                <p className="text-text" style={{ fontSize: "15px" }}>
+                  {doc.name}
+                </p>
                 {doc.mandatory && (
-                  <span className="text-[10px] font-mono uppercase tracking-wider text-rust border border-rust/50 px-1.5 py-0.5">
-                    mandatory
+                  <span
+                    className="font-mono text-amber"
+                    style={{
+                      fontSize: "10px",
+                      padding: "2px 7px",
+                      border: "1px solid rgba(245, 166, 35, 0.4)",
+                      borderRadius: "4px",
+                      letterSpacing: "0.1em",
+                      textTransform: "uppercase",
+                    }}
+                  >
+                    Mandatory
                   </span>
                 )}
               </div>
               {doc.description && (
-                <p className="text-xs text-bone/55 mt-1">{doc.description}</p>
+                <p className="text-text-muted mt-2" style={{ fontSize: "13px", lineHeight: 1.55 }}>
+                  {doc.description}
+                </p>
               )}
             </div>
           </li>
         ))}
       </ul>
     </section>
-  );
-}
-
-function KindBadge({ name }: { name: string }) {
-  const kind = classifyDocumentKind(name);
-  return (
-    <span
-      className="text-[10px] font-mono uppercase tracking-wider text-bone/60 border border-bone/20 px-2 py-1 whitespace-nowrap self-start"
-      aria-label={`Document kind: ${kind}`}
-    >
-      {kind}
-    </span>
   );
 }
 
@@ -481,20 +744,30 @@ function classifyDocumentKind(name: string): string {
   if (/case\s*stud(y|ies)|reference/.test(n)) return "case study";
   if (/financ(es|ial)|account|turnover/.test(n)) return "financial";
   if (/cv|bio|profile/.test(n)) return "cv";
-  if (/method|approach|statement/.test(n)) return "method statement";
+  if (/method|approach|statement/.test(n)) return "method";
   return "other";
 }
 
 function QuestionsList({ items }: { items: QuestionToAnswer[] | null }) {
   if (!items?.length) return null;
   return (
-    <section className="space-y-2">
-      <h3 className="font-display text-lg text-bone">Questions to answer</h3>
-      <ol className="space-y-3">
+    <section className="space-y-4">
+      <h3 className="font-display text-text" style={{ fontSize: "22px", letterSpacing: "-0.02em" }}>
+        Questions to answer
+      </h3>
+      <ol className="space-y-4">
         {items.map((q, i) => (
-          <li key={i} className="border-l-2 border-rust/30 pl-4 space-y-1">
-            <p className="text-sm text-bone/90 leading-snug">{q.question}</p>
-            <div className="flex flex-wrap gap-3 text-[10px] font-mono uppercase tracking-wider text-bone/40">
+          <li
+            key={i}
+            className="border-l-2 border-mint/40 pl-5 space-y-2"
+          >
+            <p className="text-text" style={{ fontSize: "15px", lineHeight: 1.55 }}>
+              {q.question}
+            </p>
+            <div
+              className="flex flex-wrap gap-3 text-text-dim font-mono"
+              style={{ fontSize: "10px", letterSpacing: "0.1em", textTransform: "uppercase" }}
+            >
               {q.word_limit != null && <span>{q.word_limit} words max</span>}
               {q.weight != null && <span>weight {q.weight}%</span>}
               {q.section && <span>section: {q.section}</span>}
@@ -507,10 +780,10 @@ function QuestionsList({ items }: { items: QuestionToAnswer[] | null }) {
 }
 
 // ---------------------------------------------------------------------------
-// Attached documents (downloaded files)
+// Documents (downloaded files)
 // ---------------------------------------------------------------------------
 
-function AttachedDocuments({
+function DocumentsSection({
   files,
   loading,
   error,
@@ -522,29 +795,37 @@ function AttachedDocuments({
   onRetry: () => void;
 }) {
   return (
-    <section className="space-y-3">
-      <h3 className="font-display text-lg text-bone">Attached documents</h3>
+    <section className="space-y-4">
+      <div className="section-eyebrow">Attached documents</div>
       {error ? (
-        <div role="alert" className="border border-oxblood/60 bg-oxblood/10 p-3 text-sm text-bone flex items-center justify-between">
-          <span>Couldn't load documents.</span>
-          <button
-            type="button"
-            onClick={onRetry}
-            className="text-xs font-mono uppercase tracking-wider px-3 py-1.5 border border-bone/30 text-bone hover:border-bone transition focus:outline-none focus:ring-1 focus:ring-rust"
-          >
-            ↻ retry
+        <div
+          role="alert"
+          className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-danger/40 bg-bg-elevated p-5"
+          style={{ borderRadius: "18px" }}
+        >
+          <span className="text-text" style={{ fontSize: "14px" }}>
+            Couldn&apos;t load documents.
+          </span>
+          <button type="button" onClick={onRetry} className="btn-ghost">
+            ↻ Retry
           </button>
         </div>
       ) : loading ? (
-        <ul className="space-y-2" aria-busy="true">
+        <ul className="space-y-2.5" aria-busy="true">
           {Array.from({ length: 3 }).map((_, i) => (
-            <li key={i} className="h-14 border border-bone/10 bg-ink-soft/30 animate-pulse" />
+            <li
+              key={i}
+              className="shimmer rounded-xl"
+              style={{ height: "64px", borderRadius: "18px" }}
+            />
           ))}
         </ul>
       ) : !files?.length ? (
-        <p className="text-sm text-bone/40 italic">No documents downloaded yet.</p>
+        <p className="text-text-dim italic" style={{ fontSize: "14px" }}>
+          No documents downloaded yet.
+        </p>
       ) : (
-        <ul className="space-y-2">
+        <ul className="space-y-2.5">
           {files.map((f) => (
             <li key={f.id}>
               <DocumentRow file={f} />
@@ -558,36 +839,56 @@ function AttachedDocuments({
 
 function DocumentRow({ file }: { file: TenderDocumentFile }) {
   return (
-    <div className="border border-bone/10 bg-ink-soft/30 p-3 flex items-center gap-3">
+    <div
+      className="flex items-center gap-4 rounded-xl border border-border bg-bg-elevated p-5 backdrop-blur-sm"
+      style={{ borderRadius: "18px" }}
+    >
       <DownloadStatusBadge status={file.download_status} />
       <div className="flex-1 min-w-0">
         <a
           href={file.url}
           target="_blank"
           rel="noopener noreferrer"
-          className="text-sm text-bone hover:text-rust transition truncate block focus:outline-none focus:ring-1 focus:ring-rust"
+          className="block truncate text-text hover:text-mint-pale focus:outline-none"
+          style={{ fontSize: "14px" }}
           aria-label={`Open ${file.title ?? "document"} (opens in new tab)`}
         >
           {file.title || file.url}
         </a>
         {file.error && (
-          <p className="text-xs text-oxblood mt-1 truncate">{file.error}</p>
+          <p className="text-danger truncate mt-1" style={{ fontSize: "12px" }}>
+            {file.error}
+          </p>
         )}
       </div>
-      <div className="flex items-center gap-2 whitespace-nowrap">
+      <div className="flex shrink-0 items-center gap-2 whitespace-nowrap">
         {file.format && (
-          <span className="text-[10px] font-mono uppercase tracking-wider text-bone/60 border border-bone/20 px-1.5 py-0.5">
+          <span
+            className="font-mono text-text-muted"
+            style={{
+              fontSize: "10px",
+              padding: "3px 8px",
+              border: "1px solid rgba(255, 255, 255, 0.08)",
+              borderRadius: "4px",
+              letterSpacing: "0.08em",
+              textTransform: "uppercase",
+            }}
+          >
             {file.format}
           </span>
         )}
         {file.bytes != null && (
-          <span className="text-[10px] font-mono text-bone/50">
+          <span
+            className="font-mono text-text-dim"
+            style={{ fontSize: "11px" }}
+          >
             {formatBytes(file.bytes)}
           </span>
         )}
         {file.sha256 && (
           <span
-            className="text-[10px] font-mono text-bone/30"
+            className="font-mono text-text-dim"
+            style={{ fontSize: "11px" }}
             title={file.sha256}
             aria-label={`SHA256 ${file.sha256}`}
           >
@@ -601,15 +902,16 @@ function DocumentRow({ file }: { file: TenderDocumentFile }) {
 
 function DownloadStatusBadge({ status }: { status: string }) {
   const s = status.toLowerCase();
-  const palette =
+  const tone =
     s === "ok" || s === "success"
-      ? "border-sage/60 text-sage"
+      ? "border-mint/40 text-mint"
       : s === "error" || s === "failed"
-        ? "border-oxblood/60 text-oxblood"
-        : "border-bone/20 text-bone/50";
+        ? "border-danger/40 text-danger"
+        : "border-border-strong text-text-muted";
   return (
     <span
-      className={`text-[10px] font-mono uppercase tracking-wider px-1.5 py-0.5 border whitespace-nowrap ${palette}`}
+      className={`shrink-0 whitespace-nowrap rounded-md border px-2 py-0.5 font-mono ${tone}`}
+      style={{ fontSize: "10px", letterSpacing: "0.1em", textTransform: "uppercase" }}
       aria-label={`Download status: ${status}`}
     >
       {status}
@@ -618,25 +920,23 @@ function DownloadStatusBadge({ status }: { status: string }) {
 }
 
 // ---------------------------------------------------------------------------
-// States + helpers
+// States
 // ---------------------------------------------------------------------------
 
-function SkeletonDetail() {
+function DetailSkeleton() {
   return (
-    <div className="space-y-6 animate-pulse" aria-busy="true" aria-label="Loading tender">
-      <div className="space-y-3 border-b border-bone/10 pb-6">
-        <div className="h-3 w-40 bg-bone/10" />
-        <div className="h-9 w-3/4 bg-bone/15" />
-        <div className="h-4 w-1/3 bg-bone/10" />
-        <div className="flex gap-4">
-          <div className="h-6 w-24 bg-bone/10" />
-          <div className="h-6 w-20 bg-bone/10" />
-        </div>
+    <div className="space-y-10 py-14" aria-busy="true" aria-label="Loading tender">
+      <div className="space-y-5">
+        <div className="shimmer rounded-md h-4 w-32" />
+        <div className="shimmer rounded-md h-12 w-3/4" />
+        <div className="shimmer rounded-md h-5 w-1/3" />
       </div>
-      <div className="space-y-2">
-        <div className="h-4 w-1/4 bg-bone/10" />
-        <div className="h-3 w-full bg-bone/5" />
-        <div className="h-3 w-5/6 bg-bone/5" />
+      <div className="shimmer rounded-2xl" style={{ height: "180px", borderRadius: "24px" }} />
+      <div className="shimmer rounded-md h-5 w-1/3" />
+      <div className="space-y-3">
+        <div className="shimmer rounded-md h-4 w-full" />
+        <div className="shimmer rounded-md h-4 w-5/6" />
+        <div className="shimmer rounded-md h-4 w-4/6" />
       </div>
     </div>
   );
@@ -644,34 +944,44 @@ function SkeletonDetail() {
 
 function NotFound() {
   return (
-    <div className="border border-bone/10 bg-ink-soft/30 p-8 text-center space-y-3">
-      <h1 className="font-display text-2xl text-bone">Tender not found</h1>
-      <p className="text-sm text-bone/60 max-w-md mx-auto">
-        Nothing exists at this ID. It may have been deduplicated into another
-        record, or it was never imported.
-      </p>
-      <Link
-        href="/"
-        className="inline-block text-xs font-mono uppercase tracking-wider px-4 py-2 border border-rust text-rust hover:bg-rust hover:text-bone transition focus:outline-none focus:ring-1 focus:ring-rust"
+    <div className="py-24 text-center">
+      <div
+        className="mx-auto max-w-xl rounded-2xl border border-border bg-bg-elevated p-12 backdrop-blur-md"
+        style={{ borderRadius: "24px" }}
       >
-        ← back to tenders
-      </Link>
+        <h1 className="font-display text-text mb-4" style={{ fontSize: "32px" }}>
+          Tender not found.
+        </h1>
+        <p className="text-text-muted mb-7" style={{ fontSize: "15px", lineHeight: 1.55 }}>
+          Nothing exists at this ID. It may have been deduplicated into another
+          record, or never imported.
+        </p>
+        <Link href="/" className="btn-secondary">
+          ← Back to today
+        </Link>
+      </div>
     </div>
   );
 }
 
 function TopLevelError({ onRetry }: { onRetry: () => void }) {
   return (
-    <div role="alert" className="border border-oxblood/60 bg-oxblood/10 p-6 space-y-3">
-      <h1 className="font-display text-lg text-bone">Couldn't load this tender</h1>
-      <p className="text-sm text-bone/70">The backend didn't respond. Retry?</p>
-      <button
-        type="button"
-        onClick={onRetry}
-        className="text-xs font-mono uppercase tracking-wider px-4 py-2 border border-bone/30 text-bone hover:border-bone transition focus:outline-none focus:ring-1 focus:ring-rust"
+    <div className="py-14">
+      <div
+        role="alert"
+        className="rounded-2xl border border-danger/40 bg-bg-elevated p-10 backdrop-blur-md"
+        style={{ borderRadius: "24px" }}
       >
-        ↻ retry
-      </button>
+        <h1 className="font-display text-text mb-3" style={{ fontSize: "24px" }}>
+          Couldn&apos;t load this tender.
+        </h1>
+        <p className="text-text-muted mb-6" style={{ fontSize: "15px" }}>
+          The backend didn&apos;t respond. Retry?
+        </p>
+        <button type="button" onClick={onRetry} className="btn-secondary">
+          ↻ Retry
+        </button>
+      </div>
     </div>
   );
 }
@@ -681,10 +991,4 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-}
-
-function formatDate(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
 }
