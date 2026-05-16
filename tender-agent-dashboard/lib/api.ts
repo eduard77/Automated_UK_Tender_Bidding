@@ -228,6 +228,247 @@ export const triggerPollNow = () =>
   request<{ status: string }>("/admin/poll-now", { method: "POST" });
 
 // ---------------------------------------------------------------------------
+// Vault types + helpers
+// ---------------------------------------------------------------------------
+
+export type VaultCategory =
+  | "corporate"
+  | "financial"
+  | "insurance"
+  | "accreditation"
+  | "policy"
+  | "capability"
+  | "people"
+  | "technical"
+  | "past_bid"
+  | "uncategorised";
+
+export type DocType =
+  | "insurance_certificate"
+  | "iso_certificate"
+  | "policy"
+  | "case_study"
+  | "accounts";
+
+export interface InsuranceClaims {
+  doc_type: "insurance_certificate";
+  insurance_type?:
+    | "employers_liability"
+    | "public_liability"
+    | "professional_indemnity"
+    | "product"
+    | "cyber"
+    | null;
+  cover_amount?: string | number | null;
+  currency?: string | null;
+  insurer?: string | null;
+  insurer_uk_authorised?: boolean | null;
+  policy_holder?: string | null;
+  policy_number?: string | null;
+  valid_from?: string | null;
+  valid_until?: string | null;
+  territory?: string | null;
+  low_confidence_fields?: string[];
+  notes?: string[];
+}
+
+export interface IsoClaims {
+  doc_type: "iso_certificate";
+  standard?: string | null;
+  standard_version?: string | null;
+  scope?: string | null;
+  certifying_body?: string | null;
+  certificate_number?: string | null;
+  issued_date?: string | null;
+  valid_until?: string | null;
+  holder?: string | null;
+  low_confidence_fields?: string[];
+  notes?: string[];
+}
+
+export interface PolicyClaims {
+  doc_type: "policy";
+  policy_kind?: string | null;
+  title?: string | null;
+  covers?: string[];
+  references_standards?: string[];
+  signed_by_director?: boolean | null;
+  signatory_name?: string | null;
+  signed_date?: string | null;
+  review_due?: string | null;
+  low_confidence_fields?: string[];
+  notes?: string[];
+}
+
+export interface CaseStudyClaims {
+  doc_type: "case_study";
+  client?: string | null;
+  client_sector?: string | null;
+  client_anonymised?: boolean | null;
+  value?: string | number | null;
+  currency?: string | null;
+  delivered_from?: string | null;
+  delivered_to?: string | null;
+  services?: string[];
+  outcomes?: string[];
+  team_size?: number | null;
+  location?: string | null;
+  consent_to_name_client?: boolean | null;
+  low_confidence_fields?: string[];
+  notes?: string[];
+}
+
+export interface AccountsClaims {
+  doc_type: "accounts";
+  fiscal_year_end?: string | null;
+  turnover?: string | number | null;
+  currency?: string | null;
+  profit_before_tax?: string | number | null;
+  audited?: boolean | null;
+  auditor?: string | null;
+  low_confidence_fields?: string[];
+  notes?: string[];
+}
+
+export type ClaimsRecord =
+  | InsuranceClaims
+  | IsoClaims
+  | PolicyClaims
+  | CaseStudyClaims
+  | AccountsClaims
+  | { doc_type?: string; [k: string]: unknown };
+
+export interface VaultDocumentVersion {
+  id: number;
+  document_id: number;
+  version: number;
+  storage_key: string;
+  bytes: number;
+  sha256: string;
+  mime_type: string;
+  title: string;
+  expiry_date: string | null;
+  issuing_body: string | null;
+  issued_date: string | null;
+  last_reviewed_date: string | null;
+  superseded_by_version_id: number | null;
+  claims: ClaimsRecord;
+  claims_confirmed: boolean;
+  text_extracted: string | null;
+  uploaded_by: string | null;
+  uploaded_at: string;
+}
+
+export interface VaultDocument {
+  id: number;
+  org_id: number;
+  category: VaultCategory;
+  subcategory: string | null;
+  title: string;
+  owner_email: string | null;
+  confidentiality: string;
+  created_at: string;
+  current_version: VaultDocumentVersion | null;
+}
+
+export const listVaultDocuments = () =>
+  request<VaultDocument[]>("/vault/documents");
+
+export const getVaultDocument = (id: number) =>
+  request<VaultDocument>(`/vault/documents/${id}`);
+
+export const listExpiringVaultDocuments = (days: number = 30) =>
+  request<VaultDocument[]>(`/vault/expiring?days=${days}`);
+
+export const archiveVaultDocument = (id: number) =>
+  request<void>(`/vault/documents/${id}`, { method: "DELETE" });
+
+export interface VaultClaimsPatch {
+  claims: ClaimsRecord;
+  claims_confirmed?: boolean | null;
+  expiry_date?: string | null;
+  issuing_body?: string | null;
+  issued_date?: string | null;
+}
+
+export const updateVaultClaims = (
+  documentId: number,
+  versionId: number,
+  payload: VaultClaimsPatch,
+) =>
+  request<VaultDocument>(
+    `/vault/documents/${documentId}/versions/${versionId}/claims`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    },
+  );
+
+// Multipart upload — fetch directly because the JSON `request` helper sets a
+// JSON content-type. Browser sets the multipart boundary automatically.
+export async function uploadVaultDocument(formData: FormData): Promise<VaultDocument> {
+  const base = API_BASE;
+  const res = await fetch(`${base}/vault/documents`, {
+    method: "POST",
+    body: formData,
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    let detail: unknown = null;
+    try {
+      detail = await res.json();
+    } catch {
+      // ignore
+    }
+    throw new ApiError(res.status, res.statusText, detail);
+  }
+  return (await res.json()) as VaultDocument;
+}
+
+export async function supersedeVaultDocument(
+  documentId: number,
+  formData: FormData,
+): Promise<VaultDocument> {
+  const base = API_BASE;
+  const res = await fetch(`${base}/vault/documents/${documentId}/supersede`, {
+    method: "POST",
+    body: formData,
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    let detail: unknown = null;
+    try {
+      detail = await res.json();
+    } catch {
+      // ignore
+    }
+    throw new ApiError(res.status, res.statusText, detail);
+  }
+  return (await res.json()) as VaultDocument;
+}
+
+const VAULT_CATEGORY_LABELS: Record<VaultCategory, string> = {
+  corporate: "Corporate",
+  financial: "Financial",
+  insurance: "Insurance",
+  accreditation: "Accreditation",
+  policy: "Policy",
+  capability: "Capability",
+  people: "People",
+  technical: "Technical",
+  past_bid: "Past bid",
+  uncategorised: "Uncategorised",
+};
+
+export function vaultCategoryLabel(c: string): string {
+  return VAULT_CATEGORY_LABELS[c as VaultCategory] ?? c;
+}
+
+export function isPlaceholderTitle(title: string): boolean {
+  return title.startsWith("PLACEHOLDER -- ") || title.startsWith("PLACEHOLDER — ");
+}
+
+// ---------------------------------------------------------------------------
 // View helpers (used by TenderCard and detail page)
 // ---------------------------------------------------------------------------
 
