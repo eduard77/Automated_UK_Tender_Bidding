@@ -2,60 +2,293 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Google Fonts. This URL duplicates `fontImportUrl` in lib/theme.ts because
- * CSS @import can't reference a TypeScript module. When the font set changes,
- * edit BOTH this line and theme.ts. See the comment block at the top of
- * theme.ts for the complete swap surface. */
-@import url("https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,700;9..144,900&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap");
+/* Google Fonts. Mirrors `fontImportUrl` in lib/theme.ts — keep in sync. */
+@import url("https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,500;9..144,600&family=Inter:wght@400;450;500;600&family=JetBrains+Mono:wght@400;500&display=swap");
 
-:root {
-  /* Monochrome SVG noise — alpha 0.04 on black. Not a brand colour; doesn't
-   * move with the palette. */
-  --noise: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/><feColorMatrix values='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.04 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
-}
-
-/* All brand-coloured base styles below resolve through Tailwind utilities,
- * which resolve through tailwind.config.ts, which imports from lib/theme.ts.
- * No hex literals in this file. */
+/* ===================================================================
+ * Elevated Genera — base layer
+ * ------------------------------------------------------------------- */
 
 @layer base {
   html,
   body {
-    @apply bg-ink text-bone font-body;
-    font-feature-settings: "ss01", "cv11";
+    @apply bg-bg text-text font-body;
+    font-size: 16px;
+    line-height: 1.5;
+    letter-spacing: -0.01em;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    overflow-x: hidden;
   }
 
   body {
-    background-image: var(--noise);
-    background-size: 180px 180px;
+    /* Mint glow top-left, mint shadow bottom-right, dot grid everywhere. */
+    background-image:
+      radial-gradient(ellipse 1200px 800px at 0% 0%, rgba(57, 216, 111, 0.06), transparent 60%),
+      radial-gradient(ellipse 800px 600px at 100% 100%, rgba(57, 216, 111, 0.03), transparent 60%),
+      radial-gradient(circle at center, rgba(255, 255, 255, 0.018) 1px, transparent 1px);
+    background-size: 100% 100%, 100% 100%, 32px 32px;
+    background-attachment: fixed;
+    min-height: 100vh;
+    position: relative;
   }
 
   ::selection {
-    @apply bg-rust text-bone;
+    @apply bg-mint text-bg;
+  }
+
+  /* Mint focus ring — global. Decorative elements may opt out via outline-0. */
+  :focus-visible {
+    outline: 2px solid theme("colors.mint.DEFAULT");
+    outline-offset: 2px;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-family: theme("fontFamily.display");
   }
 }
 
-/* Subtle grid lines used by the (unused-as-of-Phase-2) grid-paper background.
- * Kept for future "structured background" surfaces; values resolve through
- * lib/theme.ts via Tailwind's theme() function. */
-.grid-paper {
-  background-image:
-    linear-gradient(to right, theme("colors.bone" / 4%) 1px, transparent 1px),
-    linear-gradient(to bottom, theme("colors.bone" / 4%) 1px, transparent 1px);
-  background-size: 32px 32px;
+/* ===================================================================
+ * Animation keyframes — duplicated here for the AtmosphereBackground
+ * SVG paths that rely on `offset-path` / `stroke-dasharray` properties
+ * Tailwind can't generate via utility classes alone.
+ * ------------------------------------------------------------------- */
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.4; }
 }
 
-/* Tape effect for editorial cards. The shadow uses pure black at 20% — not a
- * brand colour, kept as a literal. */
-.tape::before {
-  content: "";
-  position: absolute;
-  top: -10px;
-  left: 50%;
-  transform: translateX(-50%) rotate(-2deg);
-  width: 70px;
-  height: 18px;
-  background: theme("colors.bone" / 18%);
-  backdrop-filter: blur(2px);
-  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.2);
+@keyframes trail-flow {
+  0% {
+    stroke-dasharray: 0 2200;
+    stroke-dashoffset: 0;
+    opacity: 0;
+  }
+  10%  { opacity: 1; }
+  50% {
+    stroke-dasharray: 320 2200;
+    stroke-dashoffset: -1600;
+    opacity: 1;
+  }
+  85%  { opacity: 1; }
+  100% {
+    stroke-dasharray: 0 2200;
+    stroke-dashoffset: -2200;
+    opacity: 0;
+  }
+}
+
+@keyframes trail-flow-2 {
+  0% {
+    stroke-dasharray: 0 2400;
+    stroke-dashoffset: 0;
+    opacity: 0;
+  }
+  15% { opacity: 0.8; }
+  50% {
+    stroke-dasharray: 280 2400;
+    stroke-dashoffset: -1800;
+    opacity: 0.8;
+  }
+  85% { opacity: 0.6; }
+  100% {
+    stroke-dasharray: 0 2400;
+    stroke-dashoffset: -2400;
+    opacity: 0;
+  }
+}
+
+@keyframes trail-dot {
+  0%   { offset-distance: 0%;   opacity: 0;   r: 2; }
+  10%  { opacity: 1; r: 3; }
+  50%  { offset-distance: 50%;  opacity: 1;   r: 3.5; }
+  85%  { opacity: 0.7; r: 2.5; }
+  100% { offset-distance: 100%; opacity: 0;   r: 2; }
+}
+
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position:  200% 0; }
+}
+
+/* ===================================================================
+ * Reusable component classes used by JSX. Kept here when Tailwind
+ * utilities would require excessive repetition.
+ * ------------------------------------------------------------------- */
+
+@layer components {
+  /* Pill kicker — uppercase tracked-letter label, optional pulse dot. */
+  .pill-kicker {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 14px 7px;
+    border: 1px solid rgba(159, 242, 178, 0.3);
+    border-radius: 100px;
+    background: rgba(57, 216, 111, 0.06);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: theme("colors.mint.pale");
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+  }
+
+  /* Section eyebrow — small uppercase label with trailing hairline. */
+  .section-eyebrow {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: theme("colors.mint.pale");
+    font-weight: 500;
+  }
+  .section-eyebrow::after {
+    content: "";
+    flex: 1;
+    height: 1px;
+    background: theme("colors.border.DEFAULT");
+  }
+
+  /* Featured card top-edge mint glow line. */
+  .featured-glow-line::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: linear-gradient(
+      90deg,
+      transparent,
+      rgba(57, 216, 111, 0.6),
+      transparent
+    );
+  }
+
+  /* Shimmer skeleton — uses the keyframe above. */
+  .shimmer {
+    background: linear-gradient(
+      90deg,
+      rgba(255, 255, 255, 0.04) 0%,
+      rgba(255, 255, 255, 0.08) 50%,
+      rgba(255, 255, 255, 0.04) 100%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.6s linear infinite;
+  }
+
+  /* Buttons — match mockup exactly. */
+  .btn-primary {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 26px;
+    background: theme("colors.mint.DEFAULT");
+    color: theme("colors.bg.DEFAULT");
+    border: 1px solid theme("colors.mint.DEFAULT");
+    border-radius: 100px;
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 500;
+    letter-spacing: -0.005em;
+    cursor: pointer;
+    text-decoration: none;
+    transition: all 0.15s;
+  }
+  .btn-primary:hover {
+    background: theme("colors.mint.pale");
+    border-color: theme("colors.mint.pale");
+  }
+  .btn-primary:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .btn-primary .arrow {
+    display: inline-block;
+    transition: transform 0.15s;
+  }
+  .btn-primary:hover .arrow {
+    transform: translateX(3px);
+  }
+
+  .btn-secondary {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 26px;
+    background: transparent;
+    color: theme("colors.text.DEFAULT");
+    border: 1px solid theme("colors.border.strong");
+    border-radius: 100px;
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    text-decoration: none;
+    transition: all 0.15s;
+  }
+  .btn-secondary:hover {
+    border-color: theme("colors.mint.pale");
+    color: theme("colors.mint.pale");
+  }
+  .btn-secondary:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .btn-ghost {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 18px;
+    background: transparent;
+    color: theme("colors.text.muted");
+    border: 1px solid theme("colors.border.DEFAULT");
+    border-radius: 100px;
+    font-size: 13px;
+    font-weight: 450;
+    cursor: pointer;
+    text-decoration: none;
+    transition: all 0.15s;
+  }
+  .btn-ghost:hover {
+    color: theme("colors.text.DEFAULT");
+    border-color: theme("colors.border.strong");
+  }
+
+  .btn-danger {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 18px;
+    background: transparent;
+    color: theme("colors.danger");
+    border: 1px solid rgba(248, 113, 113, 0.35);
+    border-radius: 100px;
+    font-size: 13px;
+    font-weight: 450;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .btn-danger:hover {
+    background: rgba(248, 113, 113, 0.08);
+    border-color: theme("colors.danger");
+  }
+
+  /* Numeric / display value text — Fraunces, tight tracking. */
+  .display-num {
+    font-family: theme("fontFamily.display");
+    letter-spacing: -0.015em;
+    font-weight: 400;
+  }
+}
+
+@layer utilities {
+  .mix-screen { mix-blend-mode: screen; }
+  .text-balance { text-wrap: balance; }
 }

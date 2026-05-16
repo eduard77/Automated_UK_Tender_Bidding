@@ -1,8 +1,12 @@
 // Typed client for the Tender Agent backend.
 // Every dashboard fetch goes through here — never call fetch() from a component.
 
+// Browser-side calls go through the Next.js rewrite at /__api/* so they're
+// same-origin (avoids backend CORS). Server-side renders / route handlers can
+// override this with NEXT_PUBLIC_API_BASE_URL when the backend lives on a
+// different origin than the dashboard process can reach via /__api.
 const API_BASE =
-  process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/$/, "") ?? "http://localhost:8000";
+  process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/$/, "") ?? "/__api";
 
 // ---------------------------------------------------------------------------
 // Types — mirror tender_agent/schemas.py. Keep field names/casing in sync.

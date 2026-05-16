@@ -1,12 +1,12 @@
 {
-  "name": "Tender Agent",
+  "name": "Genera / Tenders",
   "short_name": "Tenders",
   "description": "UK public tender discovery and bid automation",
   "start_url": "/",
   "display": "standalone",
   "orientation": "portrait",
-  "background_color": "#0E1116",
-  "theme_color": "#0E1116",
+  "background_color": "#07111a",
+  "theme_color": "#07111a",
   "icons": [
     {
       "src": "/icons/icon-192.png",

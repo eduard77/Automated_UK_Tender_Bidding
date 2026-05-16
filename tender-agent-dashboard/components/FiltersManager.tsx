@@ -3,6 +3,7 @@
 import { useState } from "react";
 import useSWR from "swr";
 
+import PillKicker from "./PillKicker";
 import {
   ApiError,
   createFilter,
@@ -13,6 +14,7 @@ import {
   type FilterProfile,
   type FilterProfileCreate,
 } from "@/lib/api";
+import { formatCurrencyCompact } from "@/lib/format";
 
 const FILTERS_KEY = "/filters";
 
@@ -54,7 +56,6 @@ export default function FiltersManager() {
 
   const handleToggleEnabled = async (filter: FilterProfile) => {
     const next = !filter.enabled;
-    // Optimistic update.
     await mutate(
       (cur) =>
         (cur ?? []).map((f) => (f.id === filter.id ? { ...f, enabled: next } : f)),
@@ -64,7 +65,7 @@ export default function FiltersManager() {
       await updateFilter(filter.id, { enabled: next });
     } catch (err) {
       setTopError(formatError(err));
-      await mutate(); // roll back via fresh fetch
+      await mutate();
     }
   };
 
@@ -73,7 +74,6 @@ export default function FiltersManager() {
       `Delete filter "${filter.name}"? This will also delete its match history.`,
     );
     if (!ok) return;
-    // Optimistic remove.
     await mutate(
       (cur) => (cur ?? []).filter((f) => f.id !== filter.id),
       { revalidate: false },
@@ -82,32 +82,65 @@ export default function FiltersManager() {
       await deleteFilter(filter.id);
     } catch (err) {
       setTopError(formatError(err));
-      await mutate(); // roll back
+      await mutate();
     }
   };
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div className="text-sm text-bone/60">
-          {data ? `${data.length} filter${data.length === 1 ? "" : "s"}` : "—"}
+    <div className="space-y-12 py-14">
+      <header className="space-y-6">
+        <PillKicker withDot={false}>Bid profiles</PillKicker>
+        <h1
+          className="font-display text-text text-balance"
+          style={{
+            fontSize: "clamp(40px, 5.5vw, 64px)",
+            fontWeight: 400,
+            letterSpacing: "-0.03em",
+            lineHeight: 1.04,
+            fontVariationSettings: '"opsz" 96',
+            maxWidth: "900px",
+          }}
+        >
+          What you bid for.
+        </h1>
+        <p
+          className="text-text-muted"
+          style={{ fontSize: "17px", lineHeight: 1.6, maxWidth: "720px" }}
+        >
+          Filter profiles decide which tenders are surfaced to the top of your
+          desk and which trigger a push notification. CPV codes, keywords,
+          regions, contract value, deadline window — anything that
+          characterises a winnable opportunity for you.
+        </p>
+        <div className="flex flex-wrap items-center gap-4 pt-2">
+          {!isCreating && (
+            <button
+              type="button"
+              onClick={() => {
+                setIsCreating(true);
+                setEditingId(null);
+              }}
+              className="btn-primary"
+            >
+              + New profile <span className="arrow">→</span>
+            </button>
+          )}
+          <span className="text-text-dim" style={{ fontSize: "13px" }}>
+            {data
+              ? `${data.length} profile${data.length === 1 ? "" : "s"}`
+              : isLoading
+                ? "Loading…"
+                : ""}
+          </span>
         </div>
-        {!isCreating && (
-          <button
-            type="button"
-            onClick={() => {
-              setIsCreating(true);
-              setEditingId(null);
-            }}
-            className="text-xs font-mono uppercase tracking-wider px-4 py-2 border border-rust text-rust hover:bg-rust hover:text-bone transition focus:outline-none focus:ring-1 focus:ring-rust"
-          >
-            + new filter profile
-          </button>
-        )}
-      </div>
+      </header>
 
       {topError && (
-        <div role="alert" className="border border-oxblood/60 bg-oxblood/10 p-3 text-sm text-bone">
+        <div
+          role="alert"
+          className="rounded-xl border border-danger/40 bg-danger/5 p-5 text-text"
+          style={{ borderRadius: "18px", fontSize: "14px" }}
+        >
           {topError}
         </div>
       )}
@@ -125,7 +158,7 @@ export default function FiltersManager() {
       ) : isLoading && !data ? (
         <SkeletonList />
       ) : data && data.length > 0 ? (
-        <ul className="space-y-3">
+        <ul className="space-y-4">
           {data.map((filter) =>
             editingId === filter.id ? (
               <li key={filter.id}>
@@ -158,6 +191,10 @@ export default function FiltersManager() {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Filter card
+// ---------------------------------------------------------------------------
+
 function FilterCard({
   filter,
   onEdit,
@@ -169,52 +206,142 @@ function FilterCard({
   onToggle: () => void;
   onDelete: () => void;
 }) {
-  const summary = summarise(filter);
   return (
-    <article className="border border-bone/10 bg-ink-soft/40 p-5">
-      <div className="flex items-start justify-between gap-4 mb-3">
-        <div>
-          <h2 className="font-display text-lg text-bone">{filter.name}</h2>
-          <p className="text-xs font-mono uppercase tracking-wider text-bone/40 mt-1">
-            matched: {filter.match_count} tender{filter.match_count === 1 ? "" : "s"}
-          </p>
+    <article
+      className="rounded-2xl border border-border-strong p-8 backdrop-blur-md"
+      style={{
+        background: "rgba(17, 23, 32, 0.82)",
+        borderRadius: "18px",
+      }}
+    >
+      <div className="flex flex-wrap items-start justify-between gap-6 mb-6">
+        <div className="flex-1 min-w-0">
+          <h2
+            className="font-display text-text"
+            style={{
+              fontSize: "22px",
+              fontWeight: 400,
+              letterSpacing: "-0.02em",
+              lineHeight: 1.2,
+            }}
+          >
+            {filter.name}
+          </h2>
+          <div
+            className="mt-2 flex flex-wrap items-center gap-3 text-text-muted"
+            style={{ fontSize: "13px" }}
+          >
+            <span className="inline-flex items-center gap-2">
+              <span
+                className="display-num text-mint-pale"
+                style={{ fontSize: "16px" }}
+              >
+                {filter.match_count}
+              </span>{" "}
+              match{filter.match_count === 1 ? "" : "es"}
+            </span>
+          </div>
         </div>
         <EnabledToggle enabled={filter.enabled} onChange={onToggle} />
       </div>
 
-      {summary.length > 0 ? (
-        <ul className="text-sm text-bone/70 space-y-1 mb-4">
-          {summary.map((line) => (
-            <li key={line.label} className="flex gap-2">
-              <span className="text-[10px] font-mono uppercase tracking-wider text-bone/40 min-w-[80px] pt-1">
-                {line.label}
-              </span>
-              <span className="font-mono text-xs">{line.value}</span>
-            </li>
-          ))}
-        </ul>
-      ) : (
-        <p className="text-sm text-bone/40 italic mb-4">No criteria — matches every tender.</p>
-      )}
+      <FilterSummary filter={filter} />
 
-      <div className="flex gap-2 pt-3 border-t border-bone/10">
-        <button
-          type="button"
-          onClick={onEdit}
-          className="text-xs font-mono uppercase tracking-wider px-3 py-1.5 border border-bone/30 text-bone/70 hover:border-bone hover:text-bone transition focus:outline-none focus:ring-1 focus:ring-rust"
-        >
-          edit
+      <div className="mt-6 flex flex-wrap gap-3 border-t border-border pt-5">
+        <button type="button" onClick={onEdit} className="btn-ghost">
+          Edit
         </button>
         <button
           type="button"
           onClick={onDelete}
+          className="btn-danger"
           aria-label={`Delete filter ${filter.name}`}
-          className="text-xs font-mono uppercase tracking-wider px-3 py-1.5 border border-oxblood/60 text-oxblood hover:bg-oxblood hover:text-bone transition focus:outline-none focus:ring-1 focus:ring-oxblood"
         >
-          delete
+          Delete
         </button>
       </div>
     </article>
+  );
+}
+
+function FilterSummary({ filter }: { filter: FilterProfile }) {
+  const cpv = [
+    ...(filter.cpv_codes ?? []),
+    ...((filter.cpv_prefixes ?? []).map((p) => `${p}*`)),
+  ];
+  const tags: { label: string; values: string[]; mono?: boolean }[] = [];
+  if (cpv.length) tags.push({ label: "CPV", values: cpv, mono: true });
+  if (filter.keywords_any?.length)
+    tags.push({ label: "Any of", values: filter.keywords_any });
+  if (filter.keywords_all?.length)
+    tags.push({ label: "All of", values: filter.keywords_all });
+  if (filter.keywords_none?.length)
+    tags.push({ label: "None of", values: filter.keywords_none });
+  if (filter.buyer_names?.length)
+    tags.push({ label: "Buyers", values: filter.buyer_names });
+  if (filter.regions?.length)
+    tags.push({ label: "Regions", values: filter.regions });
+  if (filter.countries?.length)
+    tags.push({ label: "Countries", values: filter.countries });
+  if (filter.notice_types?.length)
+    tags.push({ label: "Notices", values: filter.notice_types });
+  if (filter.value_min || filter.value_max) {
+    const lo = filter.value_min ? formatCurrencyCompact(filter.value_min, "GBP") : "£0";
+    const hi = filter.value_max ? formatCurrencyCompact(filter.value_max, "GBP") : "∞";
+    tags.push({ label: "Value", values: [`${lo}–${hi}`] });
+  }
+  if (filter.min_days_to_deadline != null)
+    tags.push({
+      label: "Deadline",
+      values: [`≥ ${filter.min_days_to_deadline} days`],
+    });
+
+  if (tags.length === 0) {
+    return (
+      <p className="italic text-text-dim" style={{ fontSize: "14px" }}>
+        No criteria — matches every tender.
+      </p>
+    );
+  }
+
+  return (
+    <dl className="space-y-3">
+      {tags.map((row) => (
+        <div key={row.label} className="flex flex-wrap items-baseline gap-3">
+          <dt
+            className="text-text-dim shrink-0"
+            style={{
+              fontSize: "11px",
+              letterSpacing: "0.12em",
+              textTransform: "uppercase",
+              fontWeight: 500,
+              minWidth: "84px",
+            }}
+          >
+            {row.label}
+          </dt>
+          <dd className="flex flex-wrap gap-1.5">
+            {row.values.map((v) => (
+              <span
+                key={v}
+                className={row.mono ? "font-mono" : ""}
+                style={{
+                  fontSize: row.mono ? "11px" : "13px",
+                  padding: "3px 8px",
+                  background: "rgba(255, 255, 255, 0.04)",
+                  border: "1px solid rgba(255, 255, 255, 0.08)",
+                  borderRadius: row.mono ? "4px" : "6px",
+                  color: "rgba(255, 255, 255, 0.78)",
+                  letterSpacing: row.mono ? "0.02em" : "0",
+                }}
+              >
+                {v}
+              </span>
+            ))}
+          </dd>
+        </div>
+      ))}
+    </dl>
   );
 }
 
@@ -232,70 +359,36 @@ function EnabledToggle({
       aria-checked={enabled}
       aria-label={enabled ? "Disable filter" : "Enable filter"}
       onClick={onChange}
-      className={`relative inline-flex h-6 w-11 items-center transition focus:outline-none focus:ring-1 focus:ring-rust ${
-        enabled ? "bg-sage/60" : "bg-bone/15"
+      className={`relative inline-flex h-7 w-12 shrink-0 items-center rounded-full border transition-colors ${
+        enabled
+          ? "border-mint/60 bg-mint/30"
+          : "border-border-strong bg-bg-elevated"
       }`}
     >
       <span
-        className={`inline-block h-4 w-4 transform bg-bone transition ${
-          enabled ? "translate-x-6" : "translate-x-1"
+        className={`inline-block h-5 w-5 transform rounded-full transition-transform ${
+          enabled
+            ? "translate-x-[24px] bg-mint"
+            : "translate-x-1 bg-text-muted"
         }`}
       />
     </button>
   );
 }
 
-function summarise(filter: FilterProfile): { label: string; value: string }[] {
-  const out: { label: string; value: string }[] = [];
-  const cpv = [
-    ...(filter.cpv_codes ?? []),
-    ...((filter.cpv_prefixes ?? []).map((p) => `${p}*`)),
-  ];
-  if (cpv.length) out.push({ label: "cpv", value: cpv.join(", ") });
-  if (filter.keywords_any?.length)
-    out.push({ label: "any of", value: filter.keywords_any.join(", ") });
-  if (filter.keywords_all?.length)
-    out.push({ label: "all of", value: filter.keywords_all.join(", ") });
-  if (filter.keywords_none?.length)
-    out.push({ label: "none of", value: filter.keywords_none.join(", ") });
-  if (filter.buyer_names?.length)
-    out.push({ label: "buyers", value: filter.buyer_names.join(", ") });
-  if (filter.regions?.length)
-    out.push({ label: "regions", value: filter.regions.join(", ") });
-  if (filter.countries?.length)
-    out.push({ label: "countries", value: filter.countries.join(", ") });
-  if (filter.notice_types?.length)
-    out.push({ label: "notices", value: filter.notice_types.join(", ") });
-  if (filter.value_min || filter.value_max) {
-    const lo = filter.value_min ? fmtVal(filter.value_min) : "0";
-    const hi = filter.value_max ? fmtVal(filter.value_max) : "∞";
-    out.push({ label: "value", value: `${lo}–${hi}` });
-  }
-  if (filter.min_days_to_deadline != null)
-    out.push({ label: "deadline", value: `≥ ${filter.min_days_to_deadline}d` });
-  return out;
-}
-
-function fmtVal(v: string | number): string {
-  const n = typeof v === "string" ? Number(v) : v;
-  if (!Number.isFinite(n)) return String(v);
-  if (n >= 1_000_000) return `£${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `£${Math.round(n / 1_000)}k`;
-  return `£${n}`;
-}
+// ---------------------------------------------------------------------------
+// States
+// ---------------------------------------------------------------------------
 
 function SkeletonList() {
   return (
-    <ul className="space-y-3" aria-busy="true" aria-label="Loading filters">
+    <ul className="space-y-4" aria-busy="true" aria-label="Loading filter profiles">
       {Array.from({ length: 3 }).map((_, i) => (
         <li
           key={i}
-          className="border border-bone/10 bg-ink-soft/30 p-5 animate-pulse"
-        >
-          <div className="h-5 w-1/3 bg-bone/10 mb-3" />
-          <div className="h-3 w-2/3 bg-bone/10 mb-2" />
-          <div className="h-3 w-1/2 bg-bone/5" />
-        </li>
+          className="shimmer rounded-2xl"
+          style={{ height: "200px", borderRadius: "18px" }}
+        />
       ))}
     </ul>
   );
@@ -303,40 +396,62 @@ function SkeletonList() {
 
 function EmptyState({ onCreate }: { onCreate: () => void }) {
   return (
-    <div className="border border-bone/10 bg-ink-soft/30 p-8 text-center space-y-3">
-      <h2 className="font-display text-xl text-bone">No filter profiles yet</h2>
-      <p className="text-sm text-bone/60 max-w-md mx-auto">
-        Filters define which tenders are worth a push notification. Set criteria
-        like CPV codes, keywords, buyer region, or contract value — anything that
-        characterises a winnable opportunity for you.
+    <div
+      className="rounded-2xl border border-border bg-bg-elevated p-14 text-center backdrop-blur-md"
+      style={{ borderRadius: "24px" }}
+    >
+      <svg
+        width="90"
+        height="90"
+        viewBox="0 0 100 100"
+        className="mx-auto mb-6 text-text-dim"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="0.8"
+        aria-hidden="true"
+      >
+        <rect x="20" y="25" width="60" height="50" />
+        <line x1="20" y1="40" x2="80" y2="40" />
+        <line x1="35" y1="55" x2="65" y2="55" />
+        <line x1="40" y1="65" x2="60" y2="65" />
+      </svg>
+      <h2
+        className="font-display text-text mb-4"
+        style={{ fontSize: "28px", letterSpacing: "-0.02em" }}
+      >
+        No bid profiles yet.
+      </h2>
+      <p
+        className="text-text-muted mb-7 mx-auto max-w-md"
+        style={{ fontSize: "15px", lineHeight: 1.55 }}
+      >
+        A profile is how you tell the system what a winnable tender looks like:
+        which CPV codes, which regions, which deadline window. Add one and the
+        next poll will surface matches.
       </p>
-      <div className="pt-2">
-        <button
-          type="button"
-          onClick={onCreate}
-          className="inline-block text-xs font-mono uppercase tracking-wider px-4 py-2 border border-rust text-rust hover:bg-rust hover:text-bone transition focus:outline-none focus:ring-1 focus:ring-rust"
-        >
-          + create your first filter
-        </button>
-      </div>
+      <button type="button" onClick={onCreate} className="btn-primary">
+        + Create your first profile <span className="arrow">→</span>
+      </button>
     </div>
   );
 }
 
 function ErrorState({ onRetry }: { onRetry: () => void }) {
   return (
-    <div role="alert" className="border border-oxblood/60 bg-oxblood/10 p-6 space-y-3">
-      <h2 className="font-display text-lg text-bone">Couldn't load filters</h2>
-      <p className="text-sm text-bone/70">
-        The backend at <span className="font-mono text-bone/90">/filters</span> didn't
-        respond.
+    <div
+      role="alert"
+      className="rounded-2xl border border-danger/40 bg-bg-elevated p-10 backdrop-blur-md"
+      style={{ borderRadius: "24px" }}
+    >
+      <h2 className="font-display text-text" style={{ fontSize: "24px" }}>
+        Couldn&apos;t load filters
+      </h2>
+      <p className="text-text-muted mt-3" style={{ fontSize: "15px" }}>
+        The backend at <code className="font-mono text-text">/filters</code>{" "}
+        didn&apos;t respond.
       </p>
-      <button
-        type="button"
-        onClick={onRetry}
-        className="text-xs font-mono uppercase tracking-wider px-4 py-2 border border-bone/30 hover:border-bone text-bone transition focus:outline-none focus:ring-1 focus:ring-rust"
-      >
-        ↻ retry
+      <button type="button" onClick={onRetry} className="btn-secondary mt-6">
+        ↻ Retry
       </button>
     </div>
   );
@@ -354,7 +469,7 @@ function formatError(err: unknown): string {
 }
 
 // ---------------------------------------------------------------------------
-// Inline form (create + edit share the same shape).
+// Filter form (create + edit share the same shape)
 // ---------------------------------------------------------------------------
 
 function FilterForm({
@@ -382,7 +497,9 @@ function FilterForm({
   const [valueMin, setValueMin] = useState(asString(initial?.value_min));
   const [valueMax, setValueMax] = useState(asString(initial?.value_max));
   const [minDaysToDeadline, setMinDaysToDeadline] = useState(
-    initial?.min_days_to_deadline != null ? String(initial.min_days_to_deadline) : "",
+    initial?.min_days_to_deadline != null
+      ? String(initial.min_days_to_deadline)
+      : "",
   );
   const [busy, setBusy] = useState(false);
 
@@ -413,179 +530,314 @@ function FilterForm({
     }
   };
 
-  const fieldClass =
-    "w-full bg-ink border border-bone/20 px-3 py-2 text-sm font-mono text-bone placeholder:text-bone/30 focus:outline-none focus:border-rust";
-  const labelClass = "block space-y-1";
-  const captionClass = "text-[10px] font-mono uppercase tracking-wider text-bone/40";
-
   return (
     <form
       onSubmit={submit}
-      className="border border-rust/40 bg-ink-soft/60 p-5 space-y-4"
+      className="rounded-2xl border border-mint/30 p-8 backdrop-blur-md space-y-8"
+      style={{
+        borderRadius: "24px",
+        background: "rgba(17, 23, 32, 0.92)",
+      }}
       aria-label={mode === "create" ? "Create filter profile" : "Edit filter profile"}
     >
-      <header>
-        <h2 className="font-display text-lg text-bone">
-          {mode === "create" ? "New filter profile" : `Editing: ${initial?.name}`}
+      <header className="flex flex-wrap items-baseline justify-between gap-4">
+        <h2
+          className="font-display text-text"
+          style={{ fontSize: "24px", letterSpacing: "-0.02em" }}
+        >
+          {mode === "create" ? "New profile" : `Editing: ${initial?.name}`}
         </h2>
-      </header>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <label className={labelClass}>
-          <span className={captionClass}>name *</span>
-          <input
-            type="text"
-            required
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            className={fieldClass}
-            placeholder="e.g. South-West cleaning contracts"
-          />
-        </label>
-
-        <label className="flex items-center gap-2 mt-6">
+        <label className="flex items-center gap-3 text-text-muted text-[13px]">
           <input
             type="checkbox"
             checked={enabled}
             onChange={(e) => setEnabled(e.target.checked)}
-            className="accent-rust h-4 w-4"
+            className="h-4 w-4 cursor-pointer accent-mint"
           />
-          <span className="text-xs font-mono uppercase tracking-wider text-bone/70">
-            enabled (deliver pushes)
-          </span>
+          Enabled (deliver pushes)
         </label>
-      </div>
+      </header>
 
-      <fieldset className="space-y-3">
-        <legend className={captionClass}>cpv classification</legend>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <ListField
-            label="exact cpv codes"
-            placeholder="90910000, 79993100"
+      <FieldGroup>
+        <Field
+          label="Profile name"
+          required
+          value={name}
+          onChange={setName}
+          placeholder="Construction — broad"
+        />
+      </FieldGroup>
+
+      <Fieldset legend="CPV classification">
+        <FieldGroup cols={2}>
+          <Field
+            label="Exact CPV codes"
             value={cpvCodes}
             onChange={setCpvCodes}
+            placeholder="45000000, 45210000"
+            mono
+            help="Comma-separated"
           />
-          <ListField
-            label="cpv prefixes (909*, 7999*)"
-            placeholder="909, 7999"
+          <Field
+            label="CPV prefixes"
             value={cpvPrefixes}
             onChange={setCpvPrefixes}
+            placeholder="45, 4521"
+            mono
+            help="Match any code starting with this prefix"
           />
-        </div>
-      </fieldset>
+        </FieldGroup>
+      </Fieldset>
 
-      <fieldset className="space-y-3">
-        <legend className={captionClass}>keywords</legend>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <ListField label="any of" placeholder="cleaning, janitorial" value={keywordsAny} onChange={setKeywordsAny} />
-          <ListField label="all of" placeholder="schools, weekly" value={keywordsAll} onChange={setKeywordsAll} />
-          <ListField label="none of" placeholder="construction" value={keywordsNone} onChange={setKeywordsNone} />
-        </div>
-      </fieldset>
+      <Fieldset legend="Keywords">
+        <FieldGroup cols={3}>
+          <Field
+            label="Any of"
+            value={keywordsAny}
+            onChange={setKeywordsAny}
+            placeholder="cleaning, janitorial"
+            help="At least one keyword must appear"
+          />
+          <Field
+            label="All of"
+            value={keywordsAll}
+            onChange={setKeywordsAll}
+            placeholder="schools, weekly"
+            help="Every keyword must appear"
+          />
+          <Field
+            label="None of"
+            value={keywordsNone}
+            onChange={setKeywordsNone}
+            placeholder="demolition"
+            help="Reject if any appear"
+          />
+        </FieldGroup>
+      </Fieldset>
 
-      <fieldset className="space-y-3">
-        <legend className={captionClass}>buyer + geography</legend>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <ListField label="buyer names" placeholder="Bristol City Council" value={buyerNames} onChange={setBuyerNames} />
-          <ListField label="notice types" placeholder="contract, prior" value={noticeTypes} onChange={setNoticeTypes} />
-          <ListField label="regions" placeholder="South West, Wales" value={regions} onChange={setRegions} />
-          <ListField label="countries (ISO)" placeholder="GB, IE" value={countries} onChange={setCountries} />
-        </div>
-      </fieldset>
+      <Fieldset legend="Buyer + geography">
+        <FieldGroup cols={2}>
+          <Field
+            label="Buyer names"
+            value={buyerNames}
+            onChange={setBuyerNames}
+            placeholder="Bristol City Council"
+          />
+          <Field
+            label="Notice types"
+            value={noticeTypes}
+            onChange={setNoticeTypes}
+            placeholder="contract, prior"
+          />
+          <Field
+            label="Regions"
+            value={regions}
+            onChange={setRegions}
+            placeholder="South West, Wales"
+          />
+          <Field
+            label="Countries (ISO)"
+            value={countries}
+            onChange={setCountries}
+            placeholder="GB, IE"
+          />
+        </FieldGroup>
+      </Fieldset>
 
-      <fieldset className="space-y-3">
-        <legend className={captionClass}>value + deadline</legend>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <label className={labelClass}>
-            <span className={captionClass}>value min (£)</span>
-            <input
-              type="number"
-              inputMode="decimal"
-              min="0"
-              step="any"
-              value={valueMin}
-              onChange={(e) => setValueMin(e.target.value)}
-              className={fieldClass}
-              placeholder="50000"
-            />
-          </label>
-          <label className={labelClass}>
-            <span className={captionClass}>value max (£)</span>
-            <input
-              type="number"
-              inputMode="decimal"
-              min="0"
-              step="any"
-              value={valueMax}
-              onChange={(e) => setValueMax(e.target.value)}
-              className={fieldClass}
-              placeholder="500000"
-            />
-          </label>
-          <label className={labelClass}>
-            <span className={captionClass}>min days to deadline</span>
-            <input
-              type="number"
-              inputMode="numeric"
-              min="0"
-              step="1"
-              value={minDaysToDeadline}
-              onChange={(e) => setMinDaysToDeadline(e.target.value)}
-              className={fieldClass}
-              placeholder="14"
-            />
-          </label>
-        </div>
-      </fieldset>
+      <Fieldset legend="Value + deadline">
+        <FieldGroup cols={3}>
+          <NumberField
+            label="Value min"
+            value={valueMin}
+            onChange={setValueMin}
+            placeholder="50000"
+            prefix="£"
+          />
+          <NumberField
+            label="Value max"
+            value={valueMax}
+            onChange={setValueMax}
+            placeholder="500000"
+            prefix="£"
+          />
+          <NumberField
+            label="Min days to deadline"
+            value={minDaysToDeadline}
+            onChange={setMinDaysToDeadline}
+            placeholder="14"
+          />
+        </FieldGroup>
+      </Fieldset>
 
-      <div className="flex gap-2 pt-3 border-t border-bone/10">
+      <div className="flex flex-wrap gap-3 border-t border-border pt-6">
         <button
           type="submit"
           disabled={busy || !name.trim()}
-          className="text-xs font-mono uppercase tracking-wider px-4 py-2 border border-rust text-rust hover:bg-rust hover:text-bone transition focus:outline-none focus:ring-1 focus:ring-rust disabled:opacity-40 disabled:cursor-not-allowed"
+          className="btn-primary"
         >
-          {busy ? "saving…" : mode === "create" ? "create filter" : "save changes"}
+          {busy ? "Saving…" : mode === "create" ? "Create profile" : "Save changes"}
         </button>
         <button
           type="button"
           onClick={onCancel}
           disabled={busy}
-          className="text-xs font-mono uppercase tracking-wider px-4 py-2 border border-bone/30 text-bone/70 hover:border-bone hover:text-bone transition focus:outline-none focus:ring-1 focus:ring-rust disabled:opacity-40"
+          className="btn-secondary"
         >
-          cancel
+          Cancel
         </button>
       </div>
     </form>
   );
 }
 
-function ListField({
-  label,
-  placeholder,
-  value,
-  onChange,
+function Fieldset({
+  legend,
+  children,
 }: {
-  label: string;
-  placeholder: string;
-  value: string;
-  onChange: (v: string) => void;
+  legend: string;
+  children: React.ReactNode;
 }) {
   return (
-    <label className="block space-y-1">
-      <span className="text-[10px] font-mono uppercase tracking-wider text-bone/40">
+    <fieldset className="space-y-4">
+      <legend
+        className="text-mint-pale"
+        style={{
+          fontSize: "11px",
+          fontWeight: 500,
+          letterSpacing: "0.14em",
+          textTransform: "uppercase",
+          marginBottom: "12px",
+        }}
+      >
+        {legend}
+      </legend>
+      {children}
+    </fieldset>
+  );
+}
+
+function FieldGroup({
+  cols = 1,
+  children,
+}: {
+  cols?: 1 | 2 | 3;
+  children: React.ReactNode;
+}) {
+  const grid =
+    cols === 1
+      ? "grid grid-cols-1 gap-5"
+      : cols === 2
+        ? "grid grid-cols-1 gap-5 md:grid-cols-2"
+        : "grid grid-cols-1 gap-5 md:grid-cols-3";
+  return <div className={grid}>{children}</div>;
+}
+
+function Field({
+  label,
+  required,
+  value,
+  onChange,
+  placeholder,
+  mono,
+  help,
+}: {
+  label: string;
+  required?: boolean;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  mono?: boolean;
+  help?: string;
+}) {
+  return (
+    <label className="block">
+      <FieldLabel>
         {label}
-      </span>
+        {required && <span className="text-mint"> *</span>}
+      </FieldLabel>
       <input
         type="text"
+        required={required}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
-        className="w-full bg-ink border border-bone/20 px-3 py-2 text-sm font-mono text-bone placeholder:text-bone/30 focus:outline-none focus:border-rust"
+        className={`mt-2 w-full rounded-md border border-border-strong bg-bg-elevated px-3.5 py-2.5 text-text placeholder:text-text-dim transition-colors focus:border-mint focus:outline-none ${mono ? "font-mono text-[13px]" : "text-[14px]"}`}
       />
-      <span className="text-[10px] font-mono text-bone/30">comma-separated</span>
+      {help && (
+        <span
+          className="mt-2 block text-text-dim"
+          style={{
+            fontSize: "11px",
+            letterSpacing: "0.04em",
+          }}
+        >
+          {help}
+        </span>
+      )}
     </label>
   );
 }
+
+function NumberField({
+  label,
+  value,
+  onChange,
+  placeholder,
+  prefix,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  prefix?: string;
+}) {
+  return (
+    <label className="block">
+      <FieldLabel>{label}</FieldLabel>
+      <div className="mt-2 relative">
+        {prefix && (
+          <span
+            className="absolute inset-y-0 left-3.5 flex items-center text-text-muted"
+            style={{ fontSize: "14px" }}
+            aria-hidden="true"
+          >
+            {prefix}
+          </span>
+        )}
+        <input
+          type="number"
+          inputMode="decimal"
+          min="0"
+          step="any"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={placeholder}
+          className={`w-full rounded-md border border-border-strong bg-bg-elevated py-2.5 ${prefix ? "pl-9" : "pl-3.5"} pr-3.5 font-mono text-[13px] text-text placeholder:text-text-dim transition-colors focus:border-mint focus:outline-none`}
+        />
+      </div>
+    </label>
+  );
+}
+
+function FieldLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <span
+      className="block text-text-dim"
+      style={{
+        fontSize: "11px",
+        fontWeight: 500,
+        letterSpacing: "0.12em",
+        textTransform: "uppercase",
+      }}
+    >
+      {children}
+    </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Form helpers
+// ---------------------------------------------------------------------------
 
 function joinList(values: string[] | null | undefined): string {
   return values?.join(", ") ?? "";

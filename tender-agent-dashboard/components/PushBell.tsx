@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+
 import {
   getVapidPublicKey,
   isSubscribed,
@@ -20,8 +21,6 @@ export default function PushBell() {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  // On mount: check browser support, fetch the VAPID key from the API (single
-  // source of truth — no env var on the client), then check existing subscription.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -49,65 +48,72 @@ export default function PushBell() {
     };
   }, []);
 
-  const onSubscribe = async () => {
-    if (state.kind !== "off") return;
-    setBusy(true);
-    setErr(null);
-    try {
-      await subscribePush(state.vapidKey);
-      setState({ kind: "on", vapidKey: state.vapidKey });
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : "Failed");
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const onUnsubscribe = async () => {
-    if (state.kind !== "on") return;
-    setBusy(true);
-    setErr(null);
-    try {
-      await unsubscribePush();
-      setState({ kind: "off", vapidKey: state.vapidKey });
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : "Failed");
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  // Render nothing while loading, while push isn't supported, and when the
-  // backend reports push isn't configured. The bell is purely additive UI.
+  // Hide the bell while loading or when push isn't available — it's additive UI.
   if (state.kind === "loading" || state.kind === "unsupported" || state.kind === "unconfigured") {
     return null;
   }
 
+  const subscribed = state.kind === "on";
+
+  const toggle = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      if (state.kind === "on") {
+        await unsubscribePush();
+        setState({ kind: "off", vapidKey: state.vapidKey });
+      } else {
+        await subscribePush(state.vapidKey);
+        setState({ kind: "on", vapidKey: state.vapidKey });
+      }
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
-    <div className="flex items-center gap-3">
-      {state.kind === "on" ? (
-        <button
-          type="button"
-          onClick={onUnsubscribe}
-          disabled={busy}
-          aria-label="Disable push alerts"
-          className="text-xs font-mono uppercase tracking-wider px-3 py-1.5 border border-sage text-sage hover:bg-sage/10 transition disabled:opacity-50 focus:outline-none focus:ring-1 focus:ring-sage"
+    <div className="relative">
+      <button
+        type="button"
+        onClick={toggle}
+        disabled={busy}
+        aria-label={subscribed ? "Disable push alerts" : "Enable push alerts"}
+        aria-pressed={subscribed}
+        title={subscribed ? "Push alerts on — click to disable" : "Enable push alerts"}
+        className="relative flex h-10 w-10 items-center justify-center rounded-lg border border-border bg-bg-elevated text-text-muted transition-colors hover:border-border-strong hover:text-text disabled:opacity-50"
+      >
+        <svg
+          width="18"
+          height="18"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.8"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
         >
-          {busy ? "…" : "◉ alerts on"}
-        </button>
-      ) : (
-        <button
-          type="button"
-          onClick={onSubscribe}
-          disabled={busy}
-          aria-label="Enable push alerts"
-          className="text-xs font-mono uppercase tracking-wider px-3 py-1.5 border border-bone/30 hover:border-rust hover:text-rust transition disabled:opacity-50 focus:outline-none focus:ring-1 focus:ring-rust"
-        >
-          {busy ? "…" : "→ enable alerts"}
-        </button>
-      )}
+          <path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" />
+          <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" />
+        </svg>
+        {subscribed && (
+          <span
+            aria-hidden="true"
+            className="absolute right-[10px] top-[9px] h-2 w-2 rounded-full bg-mint"
+            style={{
+              boxShadow: "0 0 0 2px #07111a",
+              animation: "pulse 2.4s ease-in-out infinite",
+            }}
+          />
+        )}
+      </button>
       {err && (
-        <span role="alert" className="text-xs text-oxblood">
+        <span
+          role="alert"
+          className="absolute right-0 top-12 whitespace-nowrap rounded-md border border-danger/40 bg-bg-elevated-strong px-2 py-1 text-xs text-danger"
+        >
           {err}
         </span>
       )}

@@ -1,89 +1,114 @@
 // ============================================================================
 // Design tokens — single source of truth for the dashboard's visual language.
+// Elevated Genera theme — dark canvas, mint accent, Fraunces display.
 // ============================================================================
 //
-// **To restyle the dashboard to match a parent site, edit this file.**
-// Everything else flows from these tokens:
+// Mirrors C:\Code\PublicTender\docs\mockups\genera-tenders-mockup-v2.html.
+// Editing this file restyles the dashboard. The complete swap surface:
 //
-//   - tailwind.config.ts imports `colors` + `fontFamilies` + `spacing` +
-//     `radii` + `breakpoints` and feeds them into the Tailwind theme. All
-//     `bg-*` / `text-*` / `border-*` / `font-*` utilities resolve through
-//     here.
-//   - app/globals.css applies the same colours via `@apply` and the Tailwind
-//     `theme()` function — no hex literals for brand colours.
-//   - app/layout.tsx imports `brand.themeColor` for the PWA viewport meta tag.
-//
-// Two places intentionally NOT driven by this file because they're static
-// JSON / CSS-import contexts (they can't `import` from TypeScript):
-//
-//   1. public/manifest.json — `theme_color` and `background_color`. Edit
-//      manually to match `brand.themeColor` below.
-//   2. app/globals.css `@import url(...)` of Google Fonts. Edit `fontImportUrl`
-//      below AND the matching `@import` line in globals.css.
-//
-// The list above is the COMPLETE swap surface. Anything else changing under
-// the same palette is a bug.
+//   - tailwind.config.ts imports `colors` / `fontFamilies` / `radii` /
+//     `breakpoints` and threads them into Tailwind's theme.
+//   - app/globals.css references the same tokens via `theme()`.
+//   - app/layout.tsx imports `brand.themeColor` for the viewport meta tag.
+//   - public/manifest.json mirrors `brand.themeColor` + `brand.backgroundColor`
+//     as static JSON (edit manually when this file changes).
+//   - app/globals.css's Google Fonts `@import` mirrors `fontImportUrl`.
 
 // ----------------------------------------------------------------------------
 // Colours
 // ----------------------------------------------------------------------------
 
 export const colors = {
-  // Page background ("ink" because dark editorial press).
-  ink: {
-    DEFAULT: "#0E1116",
-    soft: "#1B1F26",
+  // Page background — the deep navy canvas.
+  bg: {
+    DEFAULT: "#07111a",
+    elevated: "rgba(17, 23, 32, 0.78)",
+    "elevated-strong": "rgba(17, 23, 32, 0.92)",
+    "elevated-priority": "rgba(28, 22, 16, 0.7)",
   },
-  // Default foreground.
-  bone: "#F5F1E8",
-  // Destructive / error.
-  oxblood: "#7A1F1F",
-  // Reserve for future positive-state surfaces (not currently used).
-  moss: "#3F4D2C",
-  // Positive / "on" state (push bell when subscribed, status badges).
-  sage: "#A6B596",
-  // Primary accent / call-to-action.
-  rust: "#B5471A",
+  // Primary accent — the mint green that says "genera".
+  mint: {
+    DEFAULT: "#39d86f",
+    pale: "#9ff2b2",
+  },
+  // Decorative blue light-trail tokens (used by AtmosphereBackground only).
+  "blue-trace": {
+    DEFAULT: "rgba(110, 180, 255, 0.5)",
+    bright: "rgba(160, 210, 255, 0.9)",
+  },
+  // Foreground scale — white at three alphas.
+  text: {
+    DEFAULT: "rgba(255, 255, 255, 0.94)",
+    muted: "rgba(255, 255, 255, 0.62)",
+    dim: "rgba(255, 255, 255, 0.42)",
+  },
+  // Borders — white at two alphas.
+  border: {
+    DEFAULT: "rgba(255, 255, 255, 0.08)",
+    strong: "rgba(255, 255, 255, 0.16)",
+  },
+  // Semantic.
+  amber: "#f5a623",
+  // Legacy state tokens kept so existing pre-redesign references compile;
+  // every component below is restyled, but these are convenient semantic
+  // labels for the few places error/danger needs a name.
+  danger: "#f87171",
+  success: "#39d86f",
 } as const;
 
 // ----------------------------------------------------------------------------
 // Fonts
 // ----------------------------------------------------------------------------
-//
-// First entry of each stack is the "designer" font (Google Fonts); the rest
-// are sensible fallbacks for when the network drops the request.
 
 export const fontFamilies = {
   display: ["Fraunces", "Georgia", "serif"],
-  body: ["Inter", "system-ui", "sans-serif"],
-  mono: ["JetBrains Mono", "ui-monospace", "monospace"],
+  body: ["Inter", "-apple-system", "system-ui", "sans-serif"],
+  mono: ["JetBrains Mono", "SF Mono", "Consolas", "ui-monospace", "monospace"],
 } as const;
 
-// Google Fonts URL imported by app/globals.css. CSS @import can't reference
-// TypeScript — when the font set changes, edit BOTH this string and the
-// @import line in globals.css. They're documented together at the top of
-// globals.css.
+// Mirror of the Google Fonts URL imported by app/globals.css. CSS @import
+// can't reference TypeScript — edit BOTH when the font set changes.
 export const fontImportUrl =
-  "https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,700;9..144,900&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap";
+  "https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,500;9..144,600&family=Inter:wght@400;450;500;600&family=JetBrains+Mono:wght@400;500&display=swap";
 
 // ----------------------------------------------------------------------------
 // Spacing, radii, breakpoints
 // ----------------------------------------------------------------------------
-//
-// All three currently use Tailwind's defaults — nothing custom yet. The slots
-// are reserved so a palette swap can introduce its own scale without hunting
-// for the right hook.
 
 export const spacing = {
-  // e.g. "page-gutter": "5rem",
+  // Use Tailwind defaults; bespoke "page-gutter" extracted from the mockup.
+  "page-gutter": "48px",
+  "page-gutter-md": "24px",
 } as const;
 
 export const radii = {
-  // e.g. "card": "0.25rem",
+  xs: "3px",
+  sm: "5px",
+  md: "8px",
+  lg: "12px",
+  xl: "18px",
+  "2xl": "24px",
+  pill: "100px",
 } as const;
 
 export const breakpoints = {
-  // e.g. xl: "1280px",
+  sm: "380px",
+  md: "760px",
+  lg: "1100px",
+  xl: "1440px",
+  "2xl": "1920px",
+} as const;
+
+// ----------------------------------------------------------------------------
+// Animation tokens (CSS keyframes themselves live in app/globals.css).
+// ----------------------------------------------------------------------------
+
+export const animations = {
+  pulse: "pulse 2.4s ease-in-out infinite",
+  "trail-flow": "trail-flow 14s ease-in-out infinite",
+  "trail-flow-2": "trail-flow-2 18s ease-in-out infinite 3s",
+  "trail-dot": "trail-dot 14s ease-in-out infinite",
+  shimmer: "shimmer 1.6s linear infinite",
 } as const;
 
 // ----------------------------------------------------------------------------
@@ -91,11 +116,13 @@ export const breakpoints = {
 // ----------------------------------------------------------------------------
 
 export const brand = {
-  // Viewport theme-colour (app/layout.tsx) + PWA theme/background colour
-  // (public/manifest.json). The manifest copy is hardcoded; edit manually
-  // when this changes.
-  themeColor: colors.ink.DEFAULT,
-  backgroundColor: colors.ink.DEFAULT,
+  themeColor: colors.bg.DEFAULT,
+  backgroundColor: colors.bg.DEFAULT,
+  wordmark: {
+    name: "genera",
+    slash: "/",
+    product: "tenders",
+  },
 } as const;
 
 // Type re-exports for callers that want strict palette typing.

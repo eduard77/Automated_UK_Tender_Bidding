@@ -1,0 +1,1517 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Genera Tenders — Live UK construction signal</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,500;9..144,600&family=Inter:wght@400;450;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --bg: #07111a;
+  --bg-elevated: rgba(17, 23, 32, 0.78);
+  --bg-elevated-strong: rgba(17, 23, 32, 0.92);
+  --mint: #39d86f;
+  --mint-pale: #9ff2b2;
+  --blue-trace: rgba(110, 180, 255, 0.5);
+  --blue-trace-bright: rgba(160, 210, 255, 0.9);
+  --text: rgba(255, 255, 255, 0.94);
+  --text-muted: rgba(255, 255, 255, 0.62);
+  --text-dim: rgba(255, 255, 255, 0.42);
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --amber: #f5a623;
+  --display: 'Fraunces', 'Times New Roman', serif;
+  --sans: 'Inter', -apple-system, system-ui, sans-serif;
+  --mono: 'JetBrains Mono', 'SF Mono', Consolas, monospace;
+}
+
+html, body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 16px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  letter-spacing: -0.01em;
+  overflow-x: hidden;
+}
+
+body {
+  background-image:
+    radial-gradient(ellipse 1200px 800px at 0% 0%, rgba(57, 216, 111, 0.06), transparent 60%),
+    radial-gradient(ellipse 800px 600px at 100% 100%, rgba(57, 216, 111, 0.03), transparent 60%),
+    radial-gradient(circle at center, rgba(255, 255, 255, 0.018) 1px, transparent 1px);
+  background-size: 100% 100%, 100% 100%, 32px 32px;
+  background-attachment: fixed;
+  min-height: 100vh;
+  position: relative;
+}
+
+/* === BLUEPRINT BACKGROUND LAYER === */
+.blueprint-bg {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.55;
+  mix-blend-mode: screen;
+}
+
+.blueprint-bg svg {
+  position: absolute;
+  stroke: rgba(160, 200, 255, 0.18);
+  stroke-width: 1;
+  fill: none;
+}
+
+/* Top-left wireframe building */
+.bp-1 { top: 8%; left: 3%; width: 180px; }
+/* Top-middle equation */
+.bp-2 { top: 12%; left: 38%; width: 260px; opacity: 0.5; }
+/* Top-right wireframe */
+.bp-3 { top: 6%; right: 4%; width: 200px; }
+/* Mid-left circular gear */
+.bp-4 { top: 45%; left: 2%; width: 130px; opacity: 0.4; }
+/* Mid-right city skyline wireframe */
+.bp-5 { top: 38%; right: 3%; width: 240px; opacity: 0.35; }
+/* Bottom-middle chart */
+.bp-6 { bottom: 12%; left: 25%; width: 280px; opacity: 0.3; }
+/* Bottom-right graph */
+.bp-7 { bottom: 8%; right: 6%; width: 220px; opacity: 0.4; }
+/* Lower-left equation */
+.bp-8 { bottom: 28%; left: 8%; width: 200px; opacity: 0.45; }
+
+.blueprint-bg text {
+  font-family: 'Courier New', monospace;
+  font-size: 11px;
+  fill: rgba(160, 200, 255, 0.22);
+}
+
+/* === BLUE LIGHT TRAIL === */
+.light-trail {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+  overflow: hidden;
+}
+
+.light-trail svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.trail-path {
+  stroke: var(--blue-trace);
+  stroke-width: 1.5;
+  fill: none;
+  stroke-dasharray: 0 2200;
+  stroke-dashoffset: 0;
+  filter: drop-shadow(0 0 4px rgba(110, 180, 255, 0.7))
+          drop-shadow(0 0 12px rgba(110, 180, 255, 0.3));
+  animation: trail-flow 14s ease-in-out infinite;
+}
+
+@keyframes trail-flow {
+  0% {
+    stroke-dasharray: 0 2200;
+    stroke-dashoffset: 0;
+    opacity: 0;
+  }
+  10% {
+    opacity: 1;
+  }
+  50% {
+    stroke-dasharray: 320 2200;
+    stroke-dashoffset: -1600;
+    opacity: 1;
+  }
+  85% {
+    opacity: 1;
+  }
+  100% {
+    stroke-dasharray: 0 2200;
+    stroke-dashoffset: -2200;
+    opacity: 0;
+  }
+}
+
+.trail-dot {
+  fill: var(--blue-trace-bright);
+  filter: drop-shadow(0 0 6px rgba(160, 210, 255, 0.9))
+          drop-shadow(0 0 14px rgba(110, 180, 255, 0.5));
+  animation: trail-dot 14s ease-in-out infinite;
+}
+
+@keyframes trail-dot {
+  0% { offset-distance: 0%; opacity: 0; r: 2; }
+  10% { opacity: 1; r: 3; }
+  50% { offset-distance: 50%; opacity: 1; r: 3.5; }
+  85% { opacity: 0.7; r: 2.5; }
+  100% { offset-distance: 100%; opacity: 0; r: 2; }
+}
+
+/* Second trail offset */
+.trail-path-2 {
+  stroke: rgba(110, 180, 255, 0.35);
+  stroke-width: 1;
+  fill: none;
+  stroke-dasharray: 0 2400;
+  filter: drop-shadow(0 0 3px rgba(110, 180, 255, 0.5));
+  animation: trail-flow-2 18s ease-in-out infinite;
+  animation-delay: 3s;
+}
+
+@keyframes trail-flow-2 {
+  0% { stroke-dasharray: 0 2400; stroke-dashoffset: 0; opacity: 0; }
+  15% { opacity: 0.8; }
+  50% { stroke-dasharray: 280 2400; stroke-dashoffset: -1800; opacity: 0.8; }
+  85% { opacity: 0.6; }
+  100% { stroke-dasharray: 0 2400; stroke-dashoffset: -2400; opacity: 0; }
+}
+
+/* === LAYOUT WRAPPER === */
+.app-shell {
+  position: relative;
+  z-index: 2;
+}
+
+/* === TOP NAV === */
+nav.top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 22px 48px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(7, 17, 26, 0.7);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
+.wordmark {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  font-family: var(--display);
+  font-size: 22px;
+  font-weight: 400;
+  letter-spacing: -0.02em;
+}
+
+.wordmark .slash { color: var(--mint); font-weight: 300; margin: 0 2px; }
+.wordmark .prod { color: var(--text-muted); font-style: italic; }
+
+nav.top .links {
+  display: flex;
+  gap: 32px;
+}
+
+nav.top .links a {
+  color: var(--text-muted);
+  text-decoration: none;
+  font-size: 14px;
+  font-weight: 450;
+  letter-spacing: 0;
+  transition: color 0.15s;
+  padding: 8px 0;
+  border-bottom: 2px solid transparent;
+}
+
+nav.top .links a:hover { color: var(--text); }
+nav.top .links a.active {
+  color: var(--text);
+  border-bottom-color: var(--mint);
+}
+
+nav.top .right {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+}
+
+.notif-bell {
+  position: relative;
+  width: 40px; height: 40px;
+  border-radius: 12px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+.notif-bell:hover { border-color: var(--border-strong); }
+.notif-bell svg { width: 18px; height: 18px; color: var(--text-muted); }
+.notif-bell::after {
+  content: ''; position: absolute; top: 9px; right: 10px;
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--mint);
+  box-shadow: 0 0 0 2px var(--bg);
+  animation: pulse 2.4s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.profile {
+  width: 40px; height: 40px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #1a2a3a, #0f1820);
+  border: 1px solid var(--border-strong);
+  display: flex; align-items: center; justify-content: center;
+  font-family: var(--display);
+  font-size: 14px;
+  color: var(--mint-pale);
+  font-weight: 500;
+}
+
+/* === MAIN === */
+main {
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: 0 48px;
+  position: relative;
+  z-index: 3;
+}
+
+.header {
+  padding: 88px 0 56px;
+  border-bottom: 1px solid var(--border);
+}
+
+.kicker {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 14px 7px;
+  border: 1px solid rgba(159, 242, 178, 0.3);
+  border-radius: 100px;
+  background: rgba(57, 216, 111, 0.06);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--mint-pale);
+  margin-bottom: 28px;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+.kicker .dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--mint);
+  animation: pulse 2.4s ease-in-out infinite;
+}
+
+h1.headline {
+  font-family: var(--display);
+  font-size: clamp(48px, 6vw, 76px);
+  font-weight: 400;
+  letter-spacing: -0.035em;
+  line-height: 1.02;
+  max-width: 920px;
+  font-variation-settings: "opsz" 120;
+}
+
+h1.headline .accent {
+  color: var(--mint);
+  font-style: italic;
+  font-weight: 300;
+}
+
+.subhead {
+  margin-top: 28px;
+  font-size: 18px;
+  color: var(--text-muted);
+  max-width: 720px;
+  line-height: 1.55;
+}
+
+.stats-row {
+  display: flex;
+  gap: 56px;
+  margin-top: 48px;
+  flex-wrap: wrap;
+}
+
+.stat {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.stat .label {
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  font-weight: 500;
+}
+
+.stat .value {
+  font-family: var(--display);
+  font-size: 36px;
+  font-weight: 400;
+  letter-spacing: -0.02em;
+  color: var(--text);
+}
+
+.stat .value .unit {
+  font-size: 14px;
+  color: var(--text-muted);
+  font-family: var(--sans);
+  font-weight: 450;
+  margin-left: 6px;
+  letter-spacing: 0;
+}
+
+/* === FILTERS === */
+.filters {
+  padding: 24px 0 40px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  border-bottom: 1px solid var(--border);
+}
+
+.filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 14px 10px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: 100px;
+  font-size: 13px;
+  color: var(--text);
+  font-weight: 450;
+  cursor: pointer;
+  transition: all 0.15s;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+
+.filter-chip:hover {
+  border-color: rgba(159, 242, 178, 0.4);
+}
+
+.filter-chip.active {
+  background: rgba(57, 216, 111, 0.12);
+  border-color: rgba(57, 216, 111, 0.4);
+  color: var(--mint-pale);
+}
+
+.filter-chip .x {
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1;
+  border-left: 1px solid var(--border-strong);
+  padding-left: 8px;
+  margin-left: 2px;
+}
+
+.filter-chip .label {
+  color: var(--text-muted);
+  font-weight: 400;
+  margin-right: 2px;
+}
+
+.filter-chip.add {
+  background: transparent;
+  border-style: dashed;
+  color: var(--text-muted);
+}
+
+.filter-chip.add:hover {
+  color: var(--text);
+  border-color: var(--mint);
+}
+
+.filter-spacer { flex: 1; }
+
+.sort-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.sort-control select {
+  background: rgba(17, 23, 32, 0.5);
+  border: 1px solid var(--border-strong);
+  color: var(--text);
+  font-size: 13px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+/* === FEATURED HERO === */
+.featured-section {
+  padding: 56px 0 24px;
+}
+
+.section-eyebrow {
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--mint-pale);
+  margin-bottom: 24px;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.section-eyebrow::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+.featured-card {
+  background: rgba(17, 23, 32, 0.82);
+  border: 1px solid var(--border-strong);
+  border-radius: 24px;
+  padding: 48px 56px 44px;
+  position: relative;
+  overflow: hidden;
+  cursor: pointer;
+  transition: all 0.2s;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+.featured-card::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0; height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(57, 216, 111, 0.6), transparent);
+}
+
+.featured-card:hover {
+  border-color: rgba(159, 242, 178, 0.25);
+  background: rgba(17, 23, 32, 0.94);
+}
+
+.featured-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 36px;
+  gap: 24px;
+}
+
+.featured-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.source-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 9px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  color: var(--text);
+}
+
+.notice-type {
+  font-size: 12px;
+  color: var(--text-muted);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.featured-title {
+  font-family: var(--display);
+  font-size: clamp(34px, 4.4vw, 56px);
+  font-weight: 400;
+  letter-spacing: -0.025em;
+  line-height: 1.08;
+  margin-bottom: 22px;
+  color: var(--text);
+  font-variation-settings: "opsz" 96;
+  max-width: 1000px;
+}
+
+.featured-buyer {
+  font-size: 17px;
+  color: var(--text-muted);
+  margin-bottom: 36px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.featured-buyer .org {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.featured-buyer .sep {
+  color: var(--text-dim);
+}
+
+.featured-excerpt {
+  font-size: 17px;
+  line-height: 1.6;
+  color: var(--text-muted);
+  max-width: 880px;
+  margin-bottom: 44px;
+  letter-spacing: -0.005em;
+}
+
+.featured-bottom {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 32px;
+  padding-top: 32px;
+  border-top: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.featured-data {
+  display: flex;
+  gap: 56px;
+  flex-wrap: wrap;
+}
+
+.data-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.data-block .data-label {
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  font-weight: 500;
+}
+
+.data-block .data-value {
+  font-family: var(--display);
+  font-size: 32px;
+  font-weight: 400;
+  letter-spacing: -0.02em;
+  color: var(--text);
+  line-height: 1;
+}
+
+.data-block .data-value.mint {
+  color: var(--mint-pale);
+}
+
+.data-block .data-meta {
+  font-size: 13px;
+  color: var(--text-dim);
+  margin-top: 4px;
+}
+
+.cta-group {
+  display: flex;
+  gap: 12px;
+}
+
+.btn-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 26px;
+  background: var(--mint);
+  color: #07111a;
+  border: 1px solid var(--mint);
+  border-radius: 100px;
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: -0.005em;
+  cursor: pointer;
+  text-decoration: none;
+  transition: all 0.15s;
+}
+
+.btn-primary:hover {
+  background: var(--mint-pale);
+  border-color: var(--mint-pale);
+}
+
+.btn-primary .arrow {
+  display: inline-block;
+  transition: transform 0.15s;
+}
+
+.btn-primary:hover .arrow { transform: translateX(3px); }
+
+.btn-secondary {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 26px;
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: 100px;
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  text-decoration: none;
+  transition: all 0.15s;
+}
+
+.btn-secondary:hover {
+  border-color: var(--mint-pale);
+  color: var(--mint-pale);
+}
+
+/* === LIST === */
+.list-section {
+  padding: 56px 0 96px;
+}
+
+.list-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 20px;
+}
+
+.tender-card {
+  background: rgba(17, 23, 32, 0.82);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  padding: 28px 30px 26px;
+  cursor: pointer;
+  transition: all 0.18s;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+.tender-card:hover {
+  border-color: rgba(159, 242, 178, 0.3);
+  background: rgba(17, 23, 32, 0.95);
+  transform: translateY(-1px);
+}
+
+.tender-card.priority {
+  border-color: rgba(245, 166, 35, 0.25);
+  background: rgba(28, 22, 16, 0.7);
+}
+
+.tender-card.priority:hover {
+  border-color: rgba(245, 166, 35, 0.5);
+}
+
+.card-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 18px;
+  flex-wrap: wrap;
+}
+
+.card-source {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  padding: 3px 8px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.card-type {
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  font-weight: 500;
+}
+
+.card-urgent {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--amber);
+  font-weight: 500;
+}
+
+.card-urgent .dot {
+  width: 5px; height: 5px;
+  background: var(--amber);
+  border-radius: 50%;
+}
+
+.card-title {
+  font-family: var(--display);
+  font-size: 22px;
+  font-weight: 400;
+  letter-spacing: -0.018em;
+  line-height: 1.18;
+  margin-bottom: 12px;
+  color: var(--text);
+  font-variation-settings: "opsz" 60;
+}
+
+.card-buyer {
+  font-size: 14px;
+  color: var(--text-muted);
+  margin-bottom: 22px;
+  line-height: 1.4;
+}
+
+.card-buyer .org {
+  color: var(--text);
+  font-weight: 450;
+}
+
+.card-bottom {
+  margin-top: auto;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.card-value {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.card-value .v {
+  font-family: var(--display);
+  font-size: 22px;
+  font-weight: 400;
+  letter-spacing: -0.015em;
+  color: var(--mint-pale);
+  line-height: 1;
+}
+
+.card-value.no-value .v {
+  color: var(--text-dim);
+  font-style: italic;
+  font-size: 15px;
+}
+
+.card-value .l {
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-top: 6px;
+}
+
+.card-deadline {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+}
+
+.card-deadline .v {
+  font-family: var(--display);
+  font-size: 22px;
+  font-weight: 400;
+  color: var(--text);
+  letter-spacing: -0.01em;
+  line-height: 1;
+}
+
+.card-deadline.urgent .v {
+  color: var(--amber);
+}
+
+.card-deadline .l {
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-top: 6px;
+}
+
+.cpv-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 16px;
+}
+
+.cpv-tag {
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 3px 7px;
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 3px;
+  color: var(--text-muted);
+  letter-spacing: 0.02em;
+}
+
+/* === FOOTER === */
+footer {
+  border-top: 1px solid var(--border);
+  padding: 56px 48px 48px;
+  max-width: 1440px;
+  margin: 0 auto;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 24px;
+  flex-wrap: wrap;
+  position: relative;
+  z-index: 3;
+}
+
+footer .left {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+footer .brand {
+  font-family: var(--display);
+  font-size: 15px;
+  color: var(--text);
+}
+
+footer .tagline {
+  font-size: 13px;
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+footer .right {
+  display: flex;
+  gap: 28px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+footer .right a {
+  color: var(--text-muted);
+  text-decoration: none;
+  transition: color 0.15s;
+}
+
+footer .right a:hover { color: var(--text); }
+
+/* === RESPONSIVE === */
+@media (max-width: 1100px) {
+  .list-grid { grid-template-columns: 1fr; }
+  .featured-data { gap: 32px; }
+  .blueprint-bg .bp-3, .blueprint-bg .bp-5 { display: none; }
+}
+
+@media (max-width: 760px) {
+  main { padding: 0 24px; }
+  nav.top { padding: 18px 24px; }
+  .featured-card { padding: 32px 28px; }
+  .tender-card { padding: 24px; }
+  .header { padding: 56px 0 40px; }
+  .stats-row { gap: 32px; }
+  nav.top .links { display: none; }
+  .blueprint-bg { opacity: 0.3; }
+}
+</style>
+</head>
+<body>
+
+<!-- BLUEPRINT BACKGROUND LAYER -->
+<div class="blueprint-bg" aria-hidden="true">
+
+  <!-- Top-left wireframe building isometric -->
+  <svg class="bp-1" viewBox="0 0 200 160">
+    <path d="M30 70 L100 30 L170 70 L100 110 Z"/>
+    <path d="M30 70 L30 130 L100 170 L100 110"/>
+    <path d="M170 70 L170 130 L100 170"/>
+    <path d="M55 55 L125 95 M85 35 L155 75 M55 85 L55 145 M85 65 L85 125 M115 105 L115 165 M145 85 L145 145"/>
+    <text x="10" y="155" style="font-size:10px;">L1: 28.4m</text>
+    <text x="60" y="20" style="font-size:9px;">[ wireframe ]</text>
+  </svg>
+
+  <!-- Equation block -->
+  <svg class="bp-2" viewBox="0 0 280 80">
+    <text x="0" y="20" style="font-size:14px;">P(σ) = ∫ φ(x) dx — λ²</text>
+    <text x="0" y="42" style="font-size:11px;">Σ ⟨ψᵢ | H | ψⱼ⟩ = E·δᵢⱼ</text>
+    <text x="0" y="62" style="font-size:11px;">∂u/∂t + (u·∇)u = -∇p + ν∇²u</text>
+  </svg>
+
+  <!-- Top-right architectural elevation -->
+  <svg class="bp-3" viewBox="0 0 220 160">
+    <rect x="20" y="40" width="180" height="100"/>
+    <line x1="20" y1="40" x2="200" y2="40"/>
+    <line x1="40" y1="40" x2="40" y2="140"/>
+    <line x1="80" y1="40" x2="80" y2="140"/>
+    <line x1="120" y1="40" x2="120" y2="140"/>
+    <line x1="160" y1="40" x2="160" y2="140"/>
+    <line x1="20" y1="70" x2="200" y2="70"/>
+    <line x1="20" y1="100" x2="200" y2="100"/>
+    <line x1="20" y1="130" x2="200" y2="130"/>
+    <path d="M20 40 L110 15 L200 40"/>
+    <text x="0" y="155" style="font-size:9px;">elevation • south</text>
+  </svg>
+
+  <!-- Gear -->
+  <svg class="bp-4" viewBox="0 0 140 140">
+    <circle cx="70" cy="70" r="45"/>
+    <circle cx="70" cy="70" r="20"/>
+    <circle cx="70" cy="70" r="8"/>
+    <line x1="70" y1="10" x2="70" y2="30"/>
+    <line x1="70" y1="110" x2="70" y2="130"/>
+    <line x1="10" y1="70" x2="30" y2="70"/>
+    <line x1="110" y1="70" x2="130" y2="70"/>
+    <line x1="28" y1="28" x2="42" y2="42"/>
+    <line x1="98" y1="98" x2="112" y2="112"/>
+    <line x1="112" y1="28" x2="98" y2="42"/>
+    <line x1="42" y1="98" x2="28" y2="112"/>
+  </svg>
+
+  <!-- Skyline -->
+  <svg class="bp-5" viewBox="0 0 260 140">
+    <line x1="0" y1="130" x2="260" y2="130"/>
+    <rect x="10" y="80" width="20" height="50"/>
+    <rect x="35" y="50" width="25" height="80"/>
+    <rect x="65" y="20" width="30" height="110"/>
+    <rect x="100" y="60" width="20" height="70"/>
+    <rect x="125" y="35" width="35" height="95"/>
+    <rect x="165" y="70" width="22" height="60"/>
+    <rect x="192" y="45" width="28" height="85"/>
+    <rect x="225" y="85" width="25" height="45"/>
+    <text x="0" y="120" style="font-size:8px;">UK • skyline</text>
+  </svg>
+
+  <!-- Chart -->
+  <svg class="bp-6" viewBox="0 0 300 120">
+    <line x1="0" y1="100" x2="300" y2="100"/>
+    <line x1="0" y1="0" x2="0" y2="100"/>
+    <path d="M0 80 L40 65 L80 70 L120 45 L160 55 L200 30 L240 35 L280 15"/>
+    <circle cx="40" cy="65" r="2"/>
+    <circle cx="80" cy="70" r="2"/>
+    <circle cx="120" cy="45" r="2"/>
+    <circle cx="160" cy="55" r="2"/>
+    <circle cx="200" cy="30" r="2"/>
+    <circle cx="240" cy="35" r="2"/>
+    <text x="0" y="115" style="font-size:9px;">pipeline volume • 2026 ytd</text>
+  </svg>
+
+  <!-- Bar graph -->
+  <svg class="bp-7" viewBox="0 0 240 140">
+    <line x1="0" y1="120" x2="240" y2="120"/>
+    <rect x="10" y="80" width="20" height="40"/>
+    <rect x="40" y="60" width="20" height="60"/>
+    <rect x="70" y="40" width="20" height="80"/>
+    <rect x="100" y="50" width="20" height="70"/>
+    <rect x="130" y="25" width="20" height="95"/>
+    <rect x="160" y="35" width="20" height="85"/>
+    <rect x="190" y="15" width="20" height="105"/>
+    <text x="0" y="135" style="font-size:9px;">cpv 45 • monthly</text>
+  </svg>
+
+  <!-- Lower-left equation -->
+  <svg class="bp-8" viewBox="0 0 220 60">
+    <text x="0" y="18" style="font-size:12px;">w(t) = A·sin(ωt + φ)</text>
+    <text x="0" y="38" style="font-size:11px;">∇ × E = -∂B/∂t</text>
+    <text x="0" y="56" style="font-size:10px;">ROI = (V − C) / C × 100%</text>
+  </svg>
+
+</div>
+
+<!-- BLUE LIGHT TRAIL -->
+<div class="light-trail" aria-hidden="true">
+  <svg viewBox="0 0 1920 1080" preserveAspectRatio="xMidYMid slice">
+    <path id="trail-1" class="trail-path"
+      d="M -100 200 Q 400 100 700 400 T 1300 600 Q 1600 700 2020 500"
+      pathLength="2200" />
+    <path id="trail-2" class="trail-path-2"
+      d="M -100 700 Q 300 600 600 800 T 1100 750 Q 1500 700 2020 850"
+      pathLength="2400" />
+    <circle class="trail-dot" r="3" cx="0" cy="0"
+      style="offset-path: path('M -100 200 Q 400 100 700 400 T 1300 600 Q 1600 700 2020 500');" />
+  </svg>
+</div>
+
+<div class="app-shell">
+
+<nav class="top">
+  <div class="wordmark">
+    <span>genera</span><span class="slash">/</span><span class="prod">tenders</span>
+  </div>
+  <div class="links">
+    <a href="#" class="active">Today</a>
+    <a href="#">Tenders</a>
+    <a href="#">Filters</a>
+    <a href="#">Brief drafts</a>
+    <a href="#">Vault</a>
+    <a href="#">Audit</a>
+  </div>
+  <div class="right">
+    <div class="notif-bell" title="3 unread">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>
+    </div>
+    <div class="profile">ES</div>
+  </div>
+</nav>
+
+<main>
+
+  <section class="header">
+    <div class="kicker">
+      <span class="dot"></span>
+      Construction desk · live from 5 sources
+    </div>
+
+    <h1 class="headline">
+      Today's UK construction <span class="accent">signal.</span>
+    </h1>
+
+    <p class="subhead">
+      46 opportunities matched against your bid profile. Updated minutes ago from Find a Tender, Contracts Finder, and Public Contracts Scotland. The ones that close first are at the top.
+    </p>
+
+    <div class="stats-row">
+      <div class="stat">
+        <span class="label">Matched today</span>
+        <span class="value">46<span class="unit">tenders</span></span>
+      </div>
+      <div class="stat">
+        <span class="label">Pipeline value</span>
+        <span class="value">£6.4<span class="unit">billion</span></span>
+      </div>
+      <div class="stat">
+        <span class="label">Sources active</span>
+        <span class="value">3<span class="unit">of 5</span></span>
+      </div>
+      <div class="stat">
+        <span class="label">Last poll</span>
+        <span class="value">2<span class="unit">min ago</span></span>
+      </div>
+    </div>
+  </section>
+
+  <section class="filters">
+    <div class="filter-chip active">
+      <span class="label">Profile:</span>
+      <span>Construction — broad</span>
+      <span class="x">×</span>
+    </div>
+    <div class="filter-chip">
+      <span class="label">CPV:</span>
+      <span>45 — Construction</span>
+      <span class="x">×</span>
+    </div>
+    <div class="filter-chip">
+      <span class="label">Deadline:</span>
+      <span>≥ 7 days</span>
+      <span class="x">×</span>
+    </div>
+    <div class="filter-chip">
+      <span class="label">Region:</span>
+      <span>UK wide</span>
+      <span class="x">×</span>
+    </div>
+    <div class="filter-chip add">+ Add filter</div>
+    <div class="filter-spacer"></div>
+    <div class="sort-control">
+      <span>Sort</span>
+      <select>
+        <option>Deadline (soonest)</option>
+        <option>Value (highest)</option>
+        <option>Published (newest)</option>
+        <option>Match score</option>
+      </select>
+    </div>
+  </section>
+
+  <section class="featured-section">
+    <div class="section-eyebrow">Featured opportunity</div>
+
+    <article class="featured-card">
+      <div class="featured-top">
+        <div class="featured-meta">
+          <span class="source-pill">PCS</span>
+          <span class="notice-type">Framework agreement</span>
+        </div>
+        <div class="card-type" style="color: var(--mint-pale);">
+          ★ £4.0bn — largest in pipeline
+        </div>
+      </div>
+
+      <h2 class="featured-title">
+        SCAPE Scotland Construction Works and Services Framework.
+      </h2>
+
+      <div class="featured-buyer">
+        <span class="org">Scape Procure Scotland Ltd</span>
+        <span class="sep">·</span>
+        <span>Public sector framework</span>
+        <span class="sep">·</span>
+        <span>Scotland-wide</span>
+      </div>
+
+      <p class="featured-excerpt">
+        Multi-supplier framework for construction, development, housing works and services across Scotland. Three groups covering new build residential, retrofit and estate regeneration, demolition and remediation. Up to six bidders shortlisted per group. Four-year initial term with two-year extension option — six years total potential exposure.
+      </p>
+
+      <div class="featured-bottom">
+        <div class="featured-data">
+          <div class="data-block">
+            <span class="data-label">Total framework value</span>
+            <span class="data-value mint">£4,000,000,000</span>
+            <span class="data-meta">Six-year exposure across three groups</span>
+          </div>
+          <div class="data-block">
+            <span class="data-label">Closes</span>
+            <span class="data-value">49 days</span>
+            <span class="data-meta">3 July 2026 · 14:00 BST</span>
+          </div>
+        </div>
+        <div class="cta-group">
+          <a href="#" class="btn-secondary">Open original</a>
+          <a href="#" class="btn-primary">Read brief <span class="arrow">→</span></a>
+        </div>
+      </div>
+    </article>
+  </section>
+
+  <section class="list-section">
+    <div class="section-eyebrow">All matched opportunities · 46</div>
+
+    <div class="list-grid">
+
+      <article class="tender-card priority">
+        <div class="card-meta">
+          <span class="card-source">PCS</span>
+          <span class="card-type">Tender</span>
+          <span class="card-urgent"><span class="dot"></span>Closes in 10 days</span>
+        </div>
+        <h3 class="card-title">Red Tree Labs — laboratory, incubator and collaboration space</h3>
+        <div class="card-buyer"><span class="org">Clyde Gateway Developments Ltd</span> · Glasgow · 50,915 sq ft GIA over four floors</div>
+        <div class="cpv-row">
+          <span class="cpv-tag">45000000</span>
+          <span class="cpv-tag">45210000</span>
+        </div>
+        <div class="card-bottom">
+          <div class="card-value">
+            <span class="v">£16,500,000</span>
+            <span class="l">Estimated value</span>
+          </div>
+          <div class="card-deadline urgent">
+            <span class="v">25 May</span>
+            <span class="l">Closes 12:00</span>
+          </div>
+        </div>
+      </article>
+
+      <article class="tender-card">
+        <div class="card-meta">
+          <span class="card-source">PCS</span>
+          <span class="card-type">Framework</span>
+        </div>
+        <h3 class="card-title">Housing, Regeneration and Demolition (H3) Framework</h3>
+        <div class="card-buyer"><span class="org">LHC Procurement Group</span> · UK-wide · 4-year term, principal contractor scope</div>
+        <div class="cpv-row">
+          <span class="cpv-tag">45000000</span>
+          <span class="cpv-tag">45100000</span>
+          <span class="cpv-tag">45110000</span>
+          <span class="cpv-tag">+22</span>
+        </div>
+        <div class="card-bottom">
+          <div class="card-value">
+            <span class="v">£1,250,000,000</span>
+            <span class="l">Framework value</span>
+          </div>
+          <div class="card-deadline">
+            <span class="v">17 Jun</span>
+            <span class="l">Closes 12:00</span>
+          </div>
+        </div>
+      </article>
+
+      <article class="tender-card">
+        <div class="card-meta">
+          <span class="card-source">FTS</span>
+          <span class="card-type">Planning notice</span>
+        </div>
+        <h3 class="card-title">Milford Haven Schools Redevelopment</h3>
+        <div class="card-buyer"><span class="org">Pembrokeshire County Council</span> · New secondary and primary schools, single delivery partner</div>
+        <div class="cpv-row">
+          <span class="cpv-tag">45214210</span>
+          <span class="cpv-tag">45214220</span>
+        </div>
+        <div class="card-bottom">
+          <div class="card-value">
+            <span class="v">£200,000,000</span>
+            <span class="l">Estimated value</span>
+          </div>
+          <div class="card-deadline">
+            <span class="v">TBC</span>
+            <span class="l">Provisional</span>
+          </div>
+        </div>
+      </article>
+
+      <article class="tender-card">
+        <div class="card-meta">
+          <span class="card-source">PCS</span>
+          <span class="card-type">Tender</span>
+        </div>
+        <h3 class="card-title">UPVC window and door replacement — 900 housing stock properties</h3>
+        <div class="card-buyer"><span class="org">Moray Council</span> · Moray, Scotland · 3-year programme</div>
+        <div class="cpv-row">
+          <span class="cpv-tag">45421100</span>
+          <span class="cpv-tag">45421110</span>
+        </div>
+        <div class="card-bottom">
+          <div class="card-value">
+            <span class="v">£9,000,000</span>
+            <span class="l">Total value</span>
+          </div>
+          <div class="card-deadline">
+            <span class="v">19 Jun</span>
+            <span class="l">Closes 12:00</span>
+          </div>
+        </div>
+      </article>
+
+      <article class="tender-card">
+        <div class="card-meta">
+          <span class="card-source">FTS</span>
+          <span class="card-type">Tender</span>
+        </div>
+        <h3 class="card-title">Green Campus main contractor — workspace and training facilities</h3>
+        <div class="card-buyer"><span class="org">Thanet District Council</span> · Kent · NEC4 contract, 1,893 sqm GIA</div>
+        <div class="cpv-row">
+          <span class="cpv-tag">45000000</span>
+        </div>
+        <div class="card-bottom">
+          <div class="card-value">
+            <span class="v">£6,815,000</span>
+            <span class="l">Estimated value</span>
+          </div>
+          <div class="card-deadline">
+            <span class="v">22 Jun</span>
+            <span class="l">Closes 09:00</span>
+          </div>
+        </div>
+      </article>
+
+      <article class="tender-card">
+        <div class="card-meta">
+          <span class="card-source">PCS</span>
+          <span class="card-type">Tender</span>
+        </div>
+        <h3 class="card-title">Flexible Advanced Industrial Unit — design and build, Phase 2 i3 Business Park</h3>
+        <div class="card-buyer"><span class="org">North Ayrshire Council</span> · Ayrshire Growth Deal · regeneration scheme</div>
+        <div class="cpv-row">
+          <span class="cpv-tag">45000000</span>
+          <span class="cpv-tag">45210000</span>
+          <span class="cpv-tag">45211350</span>
+        </div>
+        <div class="card-bottom">
+          <div class="card-value">
+            <span class="v">£6,046,900</span>
+            <span class="l">Estimated value</span>
+          </div>
+          <div class="card-deadline">
+            <span class="v">1 Jul</span>
+            <span class="l">Closes 12:00</span>
+          </div>
+        </div>
+      </article>
+
+      <article class="tender-card priority">
+        <div class="card-meta">
+          <span class="card-source">PCS</span>
+          <span class="card-type">Tender</span>
+          <span class="card-urgent"><span class="dot"></span>Closes in 21 days</span>
+        </div>
+        <h3 class="card-title">Demolition of former Papdale Halls of Residence, Kirkwall</h3>
+        <div class="card-buyer"><span class="org">Orkney Islands Council</span> · 5 three-storey blocks · licensed asbestos removal</div>
+        <div class="cpv-row">
+          <span class="cpv-tag">45110000</span>
+          <span class="cpv-tag">45111000</span>
+          <span class="cpv-tag">45111100</span>
+        </div>
+        <div class="card-bottom">
+          <div class="card-value">
+            <span class="v">£3,000,000</span>
+            <span class="l">Estimated value</span>
+          </div>
+          <div class="card-deadline urgent">
+            <span class="v">5 Jun</span>
+            <span class="l">Closes 12:00</span>
+          </div>
+        </div>
+      </article>
+
+      <article class="tender-card">
+        <div class="card-meta">
+          <span class="card-source">CF</span>
+          <span class="card-type">Tender</span>
+        </div>
+        <h3 class="card-title">Passive fire protection remedial works and maintenance services</h3>
+        <div class="card-buyer"><span class="org">Loughborough College</span> · Loughborough · multi-site PFP works</div>
+        <div class="cpv-row">
+          <span class="cpv-tag">45343000</span>
+        </div>
+        <div class="card-bottom">
+          <div class="card-value">
+            <span class="v">£3,360,000</span>
+            <span class="l">Estimated value</span>
+          </div>
+          <div class="card-deadline">
+            <span class="v">11 Jun</span>
+            <span class="l">Closes 23:00</span>
+          </div>
+        </div>
+      </article>
+
+      <article class="tender-card">
+        <div class="card-meta">
+          <span class="card-source">PCS</span>
+          <span class="card-type">Tender</span>
+        </div>
+        <h3 class="card-title">Hillhead Subway Station improvement works</h3>
+        <div class="card-buyer"><span class="org">Strathclyde Partnership for Transport</span> · Glasgow · M&E renewal and finishes</div>
+        <div class="cpv-row">
+          <span class="cpv-tag">45000000</span>
+          <span class="cpv-tag">45200000</span>
+          <span class="cpv-tag">45213320</span>
+        </div>
+        <div class="card-bottom">
+          <div class="card-value">
+            <span class="v">£1,700,000</span>
+            <span class="l">Estimated value</span>
+          </div>
+          <div class="card-deadline">
+            <span class="v">28 May</span>
+            <span class="l">Closes 12:00</span>
+          </div>
+        </div>
+      </article>
+
+      <article class="tender-card">
+        <div class="card-meta">
+          <span class="card-source">FTS</span>
+          <span class="card-type">Planning</span>
+        </div>
+        <h3 class="card-title">Cath Lab refurbishment programme — main contractor, design and build RIBA 3-7</h3>
+        <div class="card-buyer"><span class="org">Guy's and St Thomas' NHS Foundation Trust</span> · London · provisional procurement</div>
+        <div class="cpv-row">
+          <span class="cpv-tag">45453100</span>
+        </div>
+        <div class="card-bottom">
+          <div class="card-value">
+            <span class="v">£15,000,000</span>
+            <span class="l">Provisional value</span>
+          </div>
+          <div class="card-deadline">
+            <span class="v">TBC</span>
+            <span class="l">Pre-market</span>
+          </div>
+        </div>
+      </article>
+
+      <article class="tender-card">
+        <div class="card-meta">
+          <span class="card-source">CF</span>
+          <span class="card-type">Tender</span>
+        </div>
+        <h3 class="card-title">SHGH water main — replacement and diversion at St Helier General Hospital</h3>
+        <div class="card-buyer"><span class="org">Epsom &amp; St Helier University Hospitals NHS Trust</span> · NHS construction · phased delivery</div>
+        <div class="cpv-row">
+          <span class="cpv-tag">45000000</span>
+        </div>
+        <div class="card-bottom">
+          <div class="card-value no-value">
+            <span class="v">Value not stated</span>
+            <span class="l">via MultiQuote</span>
+          </div>
+          <div class="card-deadline">
+            <span class="v">12 Jun</span>
+            <span class="l">Closes 12:00</span>
+          </div>
+        </div>
+      </article>
+
+      <article class="tender-card">
+        <div class="card-meta">
+          <span class="card-source">CF</span>
+          <span class="card-type">Tender</span>
+        </div>
+        <h3 class="card-title">Flat roofing works — small roofs, Colchester housing stock</h3>
+        <div class="card-buyer"><span class="org">Colchester Borough Homes</span> · Colchester · JCT Intermediate 2016, 18-week programme</div>
+        <div class="cpv-row">
+          <span class="cpv-tag">45261210</span>
+        </div>
+        <div class="card-bottom">
+          <div class="card-value">
+            <span class="v">£500,000</span>
+            <span class="l">Estimated value</span>
+          </div>
+          <div class="card-deadline urgent">
+            <span class="v">29 May</span>
+            <span class="l">Closes 12:00</span>
+          </div>
+        </div>
+      </article>
+
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="left">
+    <span class="brand">Genera<span style="color:var(--mint);">/</span>Tenders</span>
+    <span class="tagline">Part of Genera Systems · governance built into the build.</span>
+  </div>
+  <div class="right">
+    <a href="#">Methodology</a>
+    <a href="#">Sources</a>
+    <a href="#">Privacy</a>
+    <a href="#">Sign out</a>
+  </div>
+</footer>
+
+</div>
+
+</body>
+</html>
