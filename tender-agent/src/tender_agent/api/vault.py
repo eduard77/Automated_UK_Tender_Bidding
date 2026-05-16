@@ -212,7 +212,11 @@ def upload_document(
         sha256=blob.sha256,
         mime_type=file.content_type or "application/octet-stream",
         title=final_title,
-        claims={"doc_type": "insurance_certificate", "low_confidence_fields": [], "notes": [description]},
+        claims={
+            "doc_type": "insurance_certificate",
+            "low_confidence_fields": [],
+            "notes": [description],
+        },
         claims_confirmed=False,
     )
     db.add(version)
