@@ -15,7 +15,7 @@
 # becomes structured output the agent must produce. Every fail_if becomes a
 # validator that blocks submission until resolved.
 
-schema_version: "1.0"
+schema_version: "1.6"
 
 # =============================================================================
 # SHARED INPUTS — every response type gathers these first
@@ -176,74 +176,160 @@ methodology_delivery:
     inherits: shared_inputs
 
   response:
+    executive_summary:
+      prompt: >
+        One paragraph stating the delivery approach: total duration, number of
+        phases, headline resourcing, and 3-4 key milestone dates. Evaluators
+        running short on time can score from this paragraph alone.
+      max_words: 100
+      required: true
+
     headline:
       prompt: "In one sentence, what's the delivery approach and overall duration?"
       max_words: 30
       required: true
 
     project_plan:
-      prompt: "Milestones, decision gates, and durations?"
+      prompt: "Milestones with weeks/dates, decision gates with pass criteria, and critical path identification"
       required:
         milestones:
           type: list
           min_items: 4
-          item_fields: [name, week_from_start, deliverable, gate_criteria]
+          item_fields:
+            - name
+            - week_from_start      # weeks, not months
+            - deliverable
+            - gate_criteria        # specific pass criteria, not generic
+            - on_critical_path     # boolean
+            - float_weeks          # 0 if on critical path
         critical_path_summary:
           type: string
+          description: "Which milestones are on the critical path and why"
+        decision_gates:
+          type: list
+          min_items: 2
+          item_fields:
+            - gate_name
+            - timing               # week or month from start
+            - pass_criteria        # 2-3 specific conditions
+            - fail_consequence     # what happens if gate fails
 
     mobilisation:
-      prompt: "Week-by-week ramp for the first 4-6 weeks?"
+      prompt: >
+        Week-by-week mobilisation plan for weeks 1-4 minimum (extend to week 6
+        for complex contracts). Each week names activities, named outputs, and
+        named owners. This is where contracts go wrong; specificity here is the
+        single biggest 5/5 driver.
       required:
         mobilisation_weeks:
           type: list
           min_items: 4
           max_items: 6
-          item_fields: [week_number, activities, outputs]
+          item_fields:
+            - week_number
+            - activities           # named, specific
+            - outputs              # what's delivered by end of week
+            - owner                # named role
+            - dependencies         # what must be in place before this week
 
     resource_plan:
-      prompt: "FTE by role across the contract phases?"
+      prompt: >
+        FTE by role banded by contract phase. Show the resource curve over
+        time - ramp-up, steady state, ramp-down. Numbers must be specific
+        enough that the buyer can sanity-check against your pricing.
       required:
-        resources:
+        phases:
           type: list
-          min_items: 1
-          item_fields: [role, fte_count, phase_active, named_lead]
-
-    stakeholder_engagement:
-      prompt: "Who do you engage, when, and how?"
-      required:
-        engagement:
-          type: list
-          min_items: 3
-          item_fields: [stakeholder_group, frequency, format, owner]
+          min_items: 2
+          item_fields:
+            - phase_name
+            - month_range          # e.g. "Months 1-3"
+            - resources            # list of {role, fte_count, named_lead}
+        resource_curve_summary:
+          type: string
+          description: "One-line description of the FTE curve, e.g. 'ramps from 3.5 to 5.0 FTE over months 1-3, holds at 5.0 through months 4-18, draws down to 2.0 for exit transition months 19-24'"
+        total_effort_person_months:
+          type: number
 
     change_control:
-      prompt: "What named mechanism handles scope changes?"
+      prompt: >
+        Named mechanism for scope changes, with named roles, defined
+        timescales, and threshold-based approval routes.
       required:
-        mechanism_name:           # e.g. PRINCE2 Exception, ITIL Change Mgt
+        mechanism_name:            # named methodology, no "best practice"
           type: string
-        approval_route:
-          type: string
-        sla_for_decisions:
-          type: string
+        threshold_routes:
+          type: list
+          min_items: 2
+          item_fields:
+            - change_size          # e.g. "<5% contract value"
+            - approver
+            - decision_sla_days
+        documentation_required:
+          type: list[string]       # what gets produced per change
 
     reporting_cadence:
-      prompt: "Frequency, format, and attendees of progress reporting?"
+      prompt: >
+        Reporting cadence with frequency, format, attendees, and deliverable
+        per cadence. Cover weekly/monthly/quarterly/annual rhythms. The buyer
+        should be able to read this and immediately know what their calendar
+        looks like for the contract duration.
       required:
         cadences:
           type: list
-          min_items: 2
-          item_fields: [frequency, format, attendees, deliverable]
+          min_items: 3
+          item_fields:
+            - frequency            # weekly / monthly / quarterly / annual
+            - format               # email / meeting / dashboard / report
+            - duration_or_length   # e.g. "1-page", "2-hour meeting"
+            - attendees            # named roles, not "stakeholders"
+            - deliverable
+            - timing               # e.g. "by 12:00 Friday"
+
+    stakeholder_engagement:
+      prompt: >
+        Named stakeholder groups, named engagement mechanisms, named owners,
+        named cadences. Generic stakeholder language scores 3; specificity
+        scores 5.
+      required:
+        stakeholder_groups:
+          type: list
+          min_items: 3
+          item_fields:
+            - group_name           # specific, e.g. "Incumbent staff transferring under TUPE"
+            - mechanism            # specific, e.g. "weekly drop-in sessions"
+            - cadence
+            - owner                # named role
+            - first_engagement_week
+
+    exit_transition:
+      prompt: >
+        One paragraph on exit transition plan, even though contract hasn't
+        started. Most bidders skip this; including it signals delivery maturity.
+      required:
+        exit_window_months:        # typically 3-6 months
+          type: integer
+        handover_activities:
+          type: list[string]
+        knowledge_transfer_approach:
+          type: string
 
     evidence:
-      prompt: "Case studies of similar-scale mobilisations?"
+      prompt: "Case studies of similar-scale mobilisations with outcomes"
       required:
         case_studies:
           type: list
           min_items: 1
-          item_fields: [client_or_label, value_gbp, year, mobilisation_outcome, vault_id]
+          item_fields:
+            - client_or_label
+            - value_gbp
+            - year
+            - mobilisation_outcome    # was week 1 ready on time, did resource curve hold
+            - what_changed_vs_plan    # honest reflection scores higher than perfection
+            - vault_id
 
     risks:
-      prompt: "Delivery risks specific to this contract"
+      prompt: "Top 2-3 delivery risks SPECIFIC to this contract"
       required:
         risks:
           type: list
@@ -252,12 +338,12 @@ methodology_delivery:
           item_fields: [risk, mitigation, owner]
 
     added_value:
-      prompt: "What do you provide BEYOND the delivery spec?"
+      prompt: "What do you provide BEYOND the delivery spec, quantified?"
       required:
         items:
           type: list
           min_items: 1
-          item_fields: [description, quantification]
+          item_fields: [description, quantification, value_to_buyer]
 
     kpis:
       prompt: "Delivery KPIs you accept measurement against"
@@ -268,30 +354,52 @@ methodology_delivery:
           item_fields: [metric, target, measurement_method]
 
   evidence_minimums:
-    milestones_with_dates: 4
+    milestones_with_week_dates: 4
+    milestones_on_critical_path_identified: 1
+    decision_gates_with_pass_criteria: 2
     mobilisation_weeks_detailed: 4
-    named_resources_with_fte: 1
-    reporting_cadences: 2
+    resource_phases_with_fte: 2
+    reporting_cadences_with_attendees: 3
+    stakeholder_groups_named: 3
+    case_studies_with_mobilisation_outcome: 1
 
   scoring_check:
-    milestones_dated:
-      fail_if: 'milestones lack a week_from_start or month value'
-    resource_specifics:
-      fail_if: 'resource plan says "team" or "experts" without FTE counts'
-    reporting_specifics:
-      fail_if: 'cadence says "regular updates" or "as required" without frequency'
-    mobilisation_detail:
-      rule: mobilisation_weeks must include week-by-week activities for weeks 1-4 minimum
+    plan_granularity:
+      fail_if: 'milestones use months instead of weeks for the first 6 months'
+    critical_path_identified:
+      fail_if: 'no milestone is flagged as on the critical path'
+    decision_gates_specific:
+      fail_if: 'gate criteria say "satisfactory progress" or "buyer approval" without 2-3 specific conditions'
+    mobilisation_week_detail:
+      rule: weeks 1-4 minimum must list activities, outputs, owner, and dependencies
+    resource_specificity:
+      fail_if: 'resource plan says "team" or "experts" without FTE counts per phase'
+    resource_curve_described:
+      fail_if: 'no resource_curve_summary describing ramp-up, steady state, ramp-down'
+    reporting_specificity:
+      fail_if: 'cadence says "regular updates" or "as required" without explicit frequency + attendees'
+    reporting_cadence_coverage:
+      rule: cadences must cover at least 3 of weekly/monthly/quarterly/annual
     change_control_named:
-      fail_if: 'change control mechanism is "managed appropriately" without naming a process'
+      fail_if: 'change control described as "managed appropriately" without naming a mechanism, threshold-based routes, and decision SLAs'
+    stakeholder_specificity:
+      fail_if: 'stakeholder groups are generic ("stakeholders", "users", "staff") without specific named groups'
+    exit_transition_included:
+      fail_if: 'no exit transition plan section is present'
 
   failure_modes:
-    - "Project plan in months not weeks"
-    - 'Reporting described as "regular" without frequency'
+    - "Project plan in months not weeks for the first 6 months"
+    - "Milestones without on-critical-path identification"
+    - 'Decision gates with vague pass criteria ("satisfactory progress")'
+    - "No week-by-week mobilisation plan"
     - "Resourcing without FTE numbers"
-    - "No mobilisation detail"
-    - "Change control unnamed"
-    - "Stakeholder engagement generic (no named groups or owners)"
+    - 'No description of the FTE curve over time'
+    - 'Reporting described as "regular" without frequency'
+    - 'Reporting cadence missing attendees by named role'
+    - "Change control unnamed or no threshold routes"
+    - 'Stakeholder engagement generic ("we will engage stakeholders")'
+    - "No exit transition plan"
+    - "Mobilisation case study without honest reflection on what changed vs plan"
 
 # =============================================================================
 # 3.3 SOCIAL VALUE (PPN 002 / Social Value Model)
@@ -299,127 +407,281 @@ methodology_delivery:
 
 social_value:
   description: >
-    Mandatory minimum 10% weighting in central government tenders (PPN 002,
-    mandatory from 1 Oct 2025). Buyer specifies a Model Social Value Question
-    (MSVQ) against one of 8 Policy Outcomes under 5 Missions. Commitments
-    become contractual.
+    Mandatory minimum 10% weighting in central government and NHS tenders
+    (PPN 06/20 until 1 Oct 2025, PPN 002 after). Many councils run 15-30%.
+    Buyer signposts one (sometimes two) of the 8 Policy Outcomes under the
+    5 Missions and writes a Model Social Value Question (MSVQ) against it.
+    Commitments become LEGALLY BINDING CONTRACT TERMS on award. The drafting
+    agent's hard rule: no commitment in a draft unless the vault can prove
+    capability to deliver. This is a risk-management rule as much as a
+    scoring rule.
 
   inputs:
     inherits: shared_inputs
     additional:
+      applicable_ppn:
+        type: string
+        required: true
+        allowed: ["PPN 06/20", "PPN 002"]
+        description: "Which Procurement Policy Note applies (depends on contract start date relative to 1 Oct 2025)"
       selected_policy_outcome:
         type: string
         required: true
-        description: "Must be one of the 8 SVM outcomes the buyer signposted"
+        description: "The buyer's signposted Policy Outcome from the ITT (one of 8 under PPN 002)"
       msvq_text:
         type: string
         required: true
-        description: "The exact Model Social Value Question from the ITT"
+        description: "The verbatim Model Social Value Question from the ITT"
+      buyer_geography:
+        type: object
+        required: true
+        description: "Postcode districts, named towns, or regions that define the buyer's geographic footprint"
+        fields: [postcode_districts, towns, regions, country]
+      buyer_sv_strategy:
+        type: string
+        required: false
+        description: "Reference to the buyer's published social value strategy, if any"
 
   response:
-    headline:
-      prompt: "In one line, what is your headline social value commitment?"
-      max_words: 30
+    headline_commitment:
+      prompt: >
+        Open with a single bold-line SMART commitment - the one you most want
+        the evaluator to remember. Must contain number + unit + date + owner
+        all in one sentence so SMART criteria are scorable at a glance.
+      max_words: 40
       required: true
 
-    policy_outcome_alignment:
-      prompt: "Why is this Policy Outcome the right fit for this contract?"
+    theme_outcome_metric_chain:
+      prompt: >
+        Show the full hierarchy: Mission > Policy Outcome > Award Criterion >
+        SRM. Most bidders cite only the high-level theme. The full chain
+        proves PPN 002 fluency and immediately distinguishes from boilerplate.
       required:
-        outcome_name:
+        mission:
           type: string
-        rationale:
+          description: "Which of the Government's Five Missions this contract aligns to"
+        policy_outcome:
           type: string
-        buyer_priority_link:    # link to the buyer's SV strategy if published
+          description: "Matches buyer's signposted outcome verbatim"
+        award_criterion:
           type: string
+          description: "Specific award criterion under the policy outcome"
+        why_this_outcome_fits_this_contract:
+          type: string
+          description: "Why THIS outcome is the right fit for THIS contract and buyer"
+        buyer_priority_evidence:
+          type: string
+          description: "Quote/paraphrase from buyer's published SV strategy or NPPS reference"
 
     commitments:
-      prompt: "SMART commitments — Specific, Measurable, Achievable, Relevant, Time-bound"
+      prompt: >
+        3+ SMART commitments. Each commitment must have all four SMART parts
+        visible in a single description sentence so an evaluator can score
+        the SMART criteria without hunting. Each must map to a specific
+        Standard Reporting Metric and a named delivery partner.
       required:
         commitments:
           type: list
           min_items: 3
           item_fields:
-            - description           # "12 local apprenticeships starting within 6 months"
-            - quantity              # numeric value
-            - unit                  # apprenticeships / jobs / £ / tCO2 / etc.
-            - timebound             # specific milestone date
-            - delivery_partner      # named partner or in-house team
-            - srm_metric            # which Standard Reporting Metric this maps to
+            - id                       # unique reference, e.g. SV1
+            - description              # full SMART statement in one sentence
+            - quantity                 # numeric value
+            - unit                     # apprenticeships / jobs / hours / £ / tCO2 / etc.
+            - delivery_date            # specific milestone date or month
+            - delivery_owner           # named role accountable
+            - delivery_partner         # named external partner or in-house team
+            - srm_metric               # specific Standard Reporting Metric
+            - award_criterion_ref      # which award criterion this maps to
+            - vault_capability_id      # vault evidence that we CAN deliver this
+            - geographic_footprint     # postcodes/towns where delivery happens
 
     delivery_method:
-      prompt: "Who delivers each commitment, how, and when?"
+      prompt: >
+        For each commitment, how delivery happens. Must include named partners,
+        named programmes/mechanisms, and milestone-by-milestone delivery
+        timeline.
       required:
-        delivery:
+        delivery_plans:
           type: list
           min_items: 3
-          item_fields: [commitment_ref, who, how, when, evidence_of_capability]
+          item_fields:
+            - commitment_ref           # links to commitments.id
+            - delivery_mechanism       # specific programme/scheme name
+            - named_partners           # list of partner organisations
+            - milestones               # list of {date, milestone, owner}
+            - dependencies             # what must be in place before delivery starts
+
+    local_delivery_footprint:
+      prompt: >
+        Geographic map of where social value is delivered. Postcodes/towns/
+        regions specifically within the buyer's footprint. Generic "local"
+        language scores 3; named geography scores 5. For council contracts
+        especially, this is decisive.
+      required:
+        delivery_locations:
+          type: list
+          min_items: 1
+          item_fields:
+            - location_name            # named place
+            - postcode_districts
+            - within_buyer_footprint   # boolean
+            - delivery_activities      # what happens there
+            - local_partners           # named local organisations
+        % spend_within_footprint:
+          type: number
+          description: "Estimated % of contract spend recycled within buyer geography"
 
     measurement_and_reporting:
-      prompt: "How is delivery measured and reported to the buyer?"
+      prompt: >
+        How delivery is measured and reported to the buyer. Must cover SRM/TOM
+        framework used, reporting cadence, AND independent verification
+        (rare among competitors, heavily rewarded).
       required:
-        srm_or_tom_used:          # SRM (PPN 002) or TOM System
+        reporting_framework:           # SRM (PPN 002) or TOM System or both
           type: string
         reporting_frequency:
           type: string
           allowed: [monthly, quarterly, biannual, annual]
-        verification:             # internal / independent / third-party
+        reporting_format:              # dashboard / written report / both
           type: string
-        sv_lead_named:            # named person responsible
-          type: string
+        independent_verification:
+          required: true
+          fields:
+            offered:                   # boolean - is verification offered
+              type: boolean
+            verifier_name:             # named auditor / platform / framework
+              type: string
+            frequency:
+              type: string
+            sample_report_vault_id:
+              type: string             # evidence of prior verification
 
     track_record:
-      prompt: "Previous social value commitments delivered, with evidence"
+      prompt: >
+        Previous social value commitments delivered, with named clients,
+        commitment made vs outcome achieved, and honest reflection on
+        misses. Past tense beats future tense; honest reflection beats
+        perfect claims.
       required:
         previous_delivery:
           type: list
           min_items: 2
-          item_fields: [contract_or_client, commitment_made, outcome_achieved, year, evidence_doc_id]
+          item_fields:
+            - contract_or_client       # named or labelled
+            - year
+            - commitment_made          # what was promised, quantified
+            - outcome_achieved         # what was delivered, quantified
+            - delivery_ratio_pct       # actual/promised as %
+            - reasons_if_under         # honest reflection on misses, if any
+            - lessons_applied_here     # what we changed for this bid
+            - evidence_doc_id          # vault id
 
     stretch_commitment:
-      prompt: "Beyond-baseline commitment with a trigger condition"
+      prompt: >
+        Beyond-baseline commitment with a defined trigger condition. Signals
+        confidence in baseline + offers partnership upside. Trigger MUST be
+        specific - a defined event or threshold, not aspiration.
       required:
         commitment:
+          type: string                 # quantified beyond-baseline promise
+        baseline_commitment_ref:       # which baseline commitment this extends
           type: string
-        trigger_condition:        # what activates the stretch
+        trigger_condition:             # specific event/threshold that activates
+          type: string
+        delivery_timeline_if_triggered:
           type: string
 
     governance:
-      prompt: "Who owns SV delivery and how is it embedded in contract management?"
+      prompt: >
+        Named Social Value Lead with seniority, authority and budget.
+        Generic team-level ownership scores 3; named individual with board
+        access and delegated authority scores 5.
       required:
-        named_sv_lead:
-          type: string
-        review_cadence:
-          type: string
+        sv_lead:
+          required: true
+          fields:
+            name:
+              type: string
+            title:
+              type: string
+            reports_to:                # ideally MD/CEO/CFO, not Operations
+              type: string
+            budget_authority_gbp:      # delegated spend authority
+              type: number
+            cv_vault_id:
+              type: string
+        board_visibility:
+          fail_if: "no monthly or quarterly review at board level"
+          fields:
+            review_cadence:
+              type: string
+            review_attendees:          # which board members
+              type: string
         consequence_of_underdelivery:
-          type: string
+          prompt: >
+            Volunteering a specific consequence (fee reduction, reinvestment
+            requirement, etc.) is rare and heavily rewarded. State the
+            consequence and the threshold at which it applies.
+          required: true
 
   evidence_minimums:
-    smart_commitments: 3
-    quantified_commitments: 3
-    named_delivery_partners: 1
-    previous_delivery_evidence: 2
-    named_sv_lead: 1
+    smart_commitments_with_all_four_parts: 3
+    commitments_mapped_to_srm: 3
+    named_delivery_partners: 2
+    previous_delivery_with_outcomes: 2
+    geographic_locations_named: 1
+    named_sv_lead_with_budget: 1
+    independent_verification_offered: 1   # binary, but presence is the bar
 
   scoring_check:
-    smart_test:
-      fail_if: 'any commitment lacks number + unit + date'
-    aspirational_language:
-      fail_if: 'commitments use "support", "promote", "encourage" without measurable outputs'
-    track_record_specific:
-      fail_if: 'previous delivery without contract names or numbers'
+    smart_completeness:
+      fail_if: 'any commitment description lacks ALL of: number + unit + date + owner in the single sentence'
     policy_outcome_match:
-      rule: selected_policy_outcome matches buyer's signposted outcome
-    deliverability:
-      fail_if: 'commitments cannot be evidenced in the vault as previously delivered or capability proven'
+      fail_if: 'theme_outcome_metric_chain.policy_outcome does not match buyer.selected_policy_outcome verbatim'
+    full_chain_present:
+      fail_if: 'theme_outcome_metric_chain missing mission, policy_outcome, award_criterion, or srm_metric'
+    aspirational_language:
+      fail_if: 'commitment descriptions contain "support", "promote", "encourage", "explore", "consider" as primary verbs'
+    track_record_past_tense:
+      fail_if: 'previous_delivery uses present/future tense or lacks quantified outcomes'
+    track_record_honest:
+      rule: 'where delivery_ratio_pct < 100, reasons_if_under must be present (honest reflection scores higher than concealed misses)'
+    geographic_specificity:
+      fail_if: 'local_delivery_footprint uses "local" or "community" without named postcodes/towns within buyer footprint'
+    independent_verification_offered:
+      rule: 'independent_verification.offered must be true; addresses biggest evaluator concern'
+    sv_lead_authority:
+      fail_if: 'sv_lead.budget_authority_gbp is 0 or sv_lead.reports_to is Operations/Delivery level (must be MD/CEO/CFO level)'
+    stretch_trigger_specific:
+      fail_if: 'stretch_commitment.trigger_condition is aspirational rather than defined event/threshold'
+    consequence_volunteered:
+      rule: 'governance.consequence_of_underdelivery should specify a concrete consequence at a defined threshold'
+    deliverability_hard_block:
+      severity: blocking
+      fail_if: 'any commitment lacks vault_capability_id, OR vault_capability_id does not resolve to evidence of prior delivery or current proven capacity'
+      rationale: >
+        Hardest rule in the entire template. SV commitments become legally
+        binding contract terms. Overcommitting causes contract penalties,
+        framework exclusion, reputational damage. The agent must NEVER draft
+        an SV commitment without vault-proven capability to deliver.
 
   failure_modes:
     - 'Commitments use "we will support local communities" without numbers'
-    - 'Carbon reduction without baseline year'
-    - 'No named SV lead'
-    - "No previous delivery evidence"
-    - 'Generic claims that could apply to any contract'
-    - "Stretch commitment has no trigger"
+    - 'SMART parts split across paragraphs instead of in one sentence'
+    - "Carbon reduction commitment without baseline year and scope"
+    - "Bidder's pet sustainability programme when buyer asked about employment"
+    - "Policy outcome cited at theme level only, no SRM mapping"
+    - "Track record in future tense (capability claims not delivery evidence)"
+    - "100% delivery claimed on every previous contract (lacks credibility)"
+    - 'Geographic claims as "local" without named places'
+    - "No named SV Lead, or Lead reports to Operations not Executive"
+    - "No board-level visibility for SV delivery"
+    - "No independent verification offered"
+    - "Stretch commitment with aspirational trigger ('as appropriate')"
+    - "No consequence for underdelivery volunteered"
     - "Commitments exceed delivery capacity (will fail contract management)"
+    - "Commitments drafted without vault evidence of capability [BLOCKING]"
 
 # =============================================================================
 # 3.4 QUALITY MANAGEMENT
@@ -427,96 +689,296 @@ social_value:
 
 quality_management:
   description: >
-    How quality is built in, measured, and continuously improved across the
-    contract lifetime.
+    How quality is built in, measured, audited, and continuously improved
+    across the contract lifetime. Typical weighting 5-15% - lower than
+    technical capability or social value, which means the bar is low and
+    specificity beats competitors easily. The single most common failure
+    is "we are ISO 9001 certified" without certificate numbers, scopes, or
+    expiry dates. Cross-section consistency matters here: quality KPIs cited
+    here must match the same numbers cited in any other section.
 
   inputs:
     inherits: shared_inputs
+    additional:
+      buyer_sla_schedule_ref:
+        type: string
+        required: false
+        description: "Reference to the buyer's SLA schedule in the ITT (e.g. 'Schedule 2'). When present, quality KPIs must align to it."
 
   response:
+    executive_summary:
+      prompt: >
+        One paragraph (≤80 words) naming the certifications with numbers, the
+        CI methodology, and the headline quality outcome from the most
+        relevant comparable contract. The evaluator can score 5 from this
+        paragraph alone if tight. The rest of the response justifies the
+        headline score.
+      max_words: 80
+      required: true
+
     headline:
       prompt: "In one sentence, what quality framework underpins delivery?"
       max_words: 30
       required: true
 
     quality_framework:
-      prompt: "Named QMS certifications with numbers and expiry"
+      prompt: >
+        Named QMS certifications with full provenance - standard version,
+        certificate number, certification body, scope, expiry date. Sector-
+        specific standards layered alongside ISO 9001 (e.g. ISO 27001/Cyber
+        Essentials Plus for digital; CHAS/Constructionline for built
+        environment; ISO 45001 for operational H&S; ISO 14001 for
+        environmental). Generic "ISO certified" without numbers caps at 3.
       required:
         certifications:
           type: list
-          min_items: 1
-          item_fields: [standard, certificate_number, expiry_date, scope]
+          min_items: 2
+          item_fields:
+            - standard                 # e.g. ISO 9001:2015
+            - certificate_number       # full cert number
+            - certification_body       # e.g. BSI, UKAS, LRQA
+            - scope                    # what the cert actually covers
+            - expiry_date
+            - vault_pdf_id             # vault id for the cert PDF
+        appendix_reference:            # where in the bid the PDFs are attached
+          type: string
 
     quality_at_each_phase:
-      prompt: "How quality is built into each delivery phase, not bolted on"
+      prompt: >
+        Phase-by-phase breakdown of how quality is built in - not bolted on
+        at the end. Each phase must name the quality activity, the named gate
+        criteria to proceed, and the evidence produced. Cross-references the
+        decision gates from methodology_delivery (§3.2). "Comprehensive QMS
+        throughout" without phase detail scores 3.
       required:
         phases:
           type: list
           min_items: 3
-          item_fields: [phase_name, quality_activity, evidence_produced]
+          item_fields:
+            - phase_name
+            - quality_activities       # specific, named
+            - gate_criteria            # 2-3 conditions to proceed (same level of specificity as §3.2 decision gates)
+            - evidence_produced        # what artefacts get created
+            - named_owner              # role accountable for quality in this phase
 
     continuous_improvement:
-      prompt: "Named CI methodology and review cadence"
+      prompt: >
+        Named CI methodology with cycle cadence AND a recent worked example
+        from a real contract. The worked example is the key - it shifts CI
+        from claim to evidence. Generic "we continuously improve" scores 2.
       required:
-        methodology_name:         # PDCA, Six Sigma, Lean, Kaizen
+        methodology_name:              # PDCA, Six Sigma, Lean, Kaizen — any named framework
           type: string
-        review_cadence:
+        cycle_cadence:                 # e.g. "90-day cycle"
           type: string
-        recent_improvement_example:
+        ownership:                     # named role accountable
           type: string
+        recent_worked_example:
+          required: true
+          fields:
+            contract_or_label:
+              type: string
+            issue_identified:
+              type: string             # what went wrong, quantified
+            root_cause:
+              type: string             # how identified
+            action_taken:
+              type: string             # specific intervention
+            outcome:
+              type: string             # quantified result with timeframe
+            vault_evidence_id:
+              type: string
 
     customer_satisfaction:
-      prompt: "How customer satisfaction is measured and acted on"
+      prompt: >
+        Measurement methods with frequency, target scores, AND action
+        thresholds. The action threshold ("what happens when target is
+        missed") is what almost no competitor includes and is the maturity
+        tell. Multiple measurement methods (NPS + reviews + complaints, not
+        just one) score higher.
       required:
         measurement_methods:
           type: list
-          min_items: 2
-          item_fields: [method, frequency, target_score]
+          min_items: 3
+          item_fields:
+            - method                   # NPS, satisfaction survey, service review feedback, complaints volume
+            - frequency
+            - target_score             # specific number
+            - measurement_owner        # named role
+        action_threshold:
+          required: true
+          fields:
+            trigger_condition:         # specific - e.g. "any metric below threshold for 2 consecutive periods"
+              type: string
+            response_action:           # what happens - e.g. "30-day improvement plan, reviewed at Service Review"
+              type: string
+            escalation_route:
+              type: string
         complaint_handling_sla:
-          type: string
+          required: true
+          fields:
+            acknowledgement_sla:
+              type: string
+            resolution_sla:
+              type: string
+            escalation_levels:
+              type: list[string]
 
     audit_regime:
-      prompt: "Internal and external audit frequency and last result"
+      prompt: >
+        Internal and external audit programmes with cadence, last result
+        AND the action taken from findings. Including a finding and showing
+        resolution is counterintuitively stronger than claiming a perfect
+        audit history - buyers know perfect audits look suspicious.
       required:
-        internal_audit_frequency:
+        internal_audit:
+          required: true
+          fields:
+            frequency:
+              type: string
+            owner:                     # named Quality Manager
+              type: string
+            scope:
+              type: string
+            last_internal_audit_date:
+              type: date
+            findings_count:
+              type: integer
+            findings_resolved:
+              type: boolean
+        external_audit:
+          required: true
+          fields:
+            frequency:
+              type: string
+            certification_body:
+              type: string
+            last_external_audit:
+              fields:
+                date:
+                  type: date
+                outcome:               # specific - "Zero non-conformances, one observation"
+                  type: string
+                observations:          # if any, what and how resolved
+                  type: list
+                  item_fields: [observation, resolution_action, resolution_date, vault_evidence_id]
+                vault_report_id:
+                  type: string
+
+    contract_specific_kpis:
+      prompt: >
+        Quality KPIs aligned to the BUYER'S OWN SLA schedule (by schedule
+        number when available). Generic SLAs score 3; references to the
+        buyer's actual schedule numbers score 5. These numbers must match
+        any quality KPIs cited in other sections (cross-section consistency
+        check applies).
+      required:
+        kpis:
+          type: list
+          min_items: 3
+          item_fields:
+            - metric                   # what's measured
+            - target                   # specific number
+            - measurement_method
+            - buyer_schedule_reference # e.g. "Schedule 2, SLA 4.3" if buyer provides
+            - reporting_frequency
+
+    independent_quality_assurance:
+      prompt: >
+        For high-risk deliverables, offer third-party review at your cost
+        (architecture sign-off, security review, clinical safety case, etc.).
+        Most competitors don't offer this; it addresses the buyer's quietest
+        fear that internal quality might be optimistic. Optional but strongly
+        scored when present.
+      required: false
+      fields:
+        offered:
+          type: boolean
+        deliverables_covered:
+          type: list[string]
+        reviewer:                      # named third party
           type: string
-        external_audit_frequency:
+        review_cadence:
           type: string
-        last_external_audit_result:
-          type: string         # "Zero non-conformances at 2024 ISO audit"
 
     recent_quality_outcome:
-      prompt: "Recent quality outcome from a comparable contract"
+      prompt: >
+        Operational quality data from a comparable contract - actual numbers
+        delivered, not process description. The strongest quality answer ends
+        here. Must include 3+ quantified outcomes.
       required:
         client_or_label:
           type: string
-        outcome:
-          type: string         # specific, with numbers
+        contract_value_gbp:
+          type: number
+        contract_duration_months:
+          type: integer
+        outcomes:
+          type: list
+          min_items: 3
+          item_fields:
+            - metric                   # SLA achievement %, NPS, defect rate, etc.
+            - achieved_value           # actual number
+            - target_value             # what was targeted
+            - period                   # over what timeframe
+        commercial_consequence:        # optional but powerful - e.g. "zero contractual penalties"
+          type: string
         vault_evidence_id:
           type: string
 
   evidence_minimums:
-    cert_numbers: 1
-    qms_phases_detailed: 3
-    satisfaction_methods: 2
-    audit_results: 1
+    certifications_with_full_provenance: 2     # cert no + body + scope + expiry
+    sector_specific_standards: 1                # beyond ISO 9001
+    phases_with_gate_criteria: 3
+    ci_worked_example_quantified: 1
+    satisfaction_measurement_methods: 3
+    action_threshold_defined: 1                 # the maturity tell
+    external_audit_with_outcome: 1
+    quantified_outcomes_from_real_contract: 3
 
   scoring_check:
-    cert_specificity:
-      fail_if: '"ISO certified" appears without certificate number'
+    cert_provenance:
+      fail_if: '"ISO certified" or "ISO 9001" appears without certificate number, certification body, and expiry date'
+    cert_count:
+      fail_if: 'only one certification cited (sector-specific layering missing)'
+    cert_expiry:
+      severity: blocking
+      fail_if: 'any cited certificate has expiry_date in the past or within next 60 days'
+      rationale: 'Expired certs cited in a bid invite immediate disqualification'
     phase_specificity:
-      fail_if: 'quality described only at "delivery" not at each phase'
-    ci_methodology_named:
-      fail_if: 'continuous improvement described without naming the method'
-    satisfaction_quantified:
-      fail_if: 'no target score or threshold given for customer satisfaction'
+      fail_if: 'quality described as "throughout the contract" without per-phase breakdown with gate criteria'
+    ci_worked_example:
+      fail_if: 'continuous improvement section lacks a specific contract, issue (quantified), root cause, action, and outcome (quantified)'
+    satisfaction_action_threshold:
+      fail_if: 'no defined trigger condition + response action for satisfaction below target'
+    audit_honest_reflection:
+      rule: 'external audit section should include findings/observations and resolution if any; perfect audit history with no findings ever is less credible than honest reflection on resolved findings'
+    kpis_aligned_to_buyer:
+      rule: 'when buyer_sla_schedule_ref is provided, KPIs must reference it by schedule number'
+    cross_section_consistency:
+      severity: blocking
+      rule: 'any quality KPI cited here that also appears in §3.1 (technical_capability), §3.2 (methodology_delivery), or §3.6 (case_study) must use IDENTICAL numbers across sections'
+      rationale: 'Inconsistency between sections is one of the most common silent ways bids lose marks at moderation'
+    outcomes_quantified:
+      fail_if: 'recent_quality_outcome section lacks 3 quantified outcomes with achieved vs target values'
 
   failure_modes:
-    - '"ISO 9001 certified" without cert number'
-    - "Quality treated as end-of-phase check, not built in"
-    - "Continuous improvement described abstractly"
-    - "Customer satisfaction without measurable target"
-    - "Audit frequency without last result"
+    - '"ISO 9001 certified" without certificate number, body, scope, or expiry'
+    - "Only one certification cited (no sector-specific layering)"
+    - "Expired certificate cited [BLOCKING]"
+    - 'Quality described as "throughout the contract" without phase breakdown'
+    - "Phase quality without named gate criteria"
+    - "Continuous improvement claimed without named methodology"
+    - "CI methodology named without a recent worked example"
+    - "Worked example without quantified issue and outcome"
+    - "Customer satisfaction without target scores"
+    - "Customer satisfaction without action threshold for misses"
+    - "Single measurement method (NPS only, or surveys only)"
+    - 'Audit programme claimed without dates or last result'
+    - "Perfect audit history (suspicious; honest reflection scores higher)"
+    - "KPIs misaligned with buyer's SLA schedule when buyer provides one"
+    - "Quality KPIs inconsistent with same KPIs cited elsewhere in bid [BLOCKING]"
+    - "Recent quality outcome described qualitatively without numbers"
 
 # =============================================================================
 # 3.5 RISK AND CONTINGENCY
@@ -524,100 +986,301 @@ quality_management:
 
 risk_contingency:
   description: >
-    Risk register, mitigation strategies, escalation, and contingency plans.
-    Risks MUST be specific to this contract — generic risks score 3 not 5.
+    Risk register, mitigation strategies, contingency plans, escalation, and
+    review cadence. Typical weighting 5-10% in isolation, but it influences
+    scoring across other sections: evaluators discount strong claims elsewhere
+    when the risk section reads as generic. Risks MUST be specific to THIS
+    contract - generic risks (staff turnover, supply chain disruption, cyber
+    attack) score 3 regardless of how well mitigated. The cross-section
+    consistency rule is critical: every risk listed here must have a
+    corresponding entry in at least one other relevant section (technical,
+    methodology, social value, quality, or pricing).
 
   inputs:
     inherits: shared_inputs
+    additional:
+      contract_context:
+        type: object
+        required: true
+        description: "Specific contract operational context that shapes risk identification"
+        fields:
+          tupe_in_scope:               # transferring staff
+            type: boolean
+          incumbent_provider:          # name of current provider if known
+            type: string
+          mobilisation_window_weeks:
+            type: integer
+          known_constraints:           # year-end freezes, regulator approvals, etc.
+            type: list[string]
+          sites_or_geography:
+            type: list[string]
 
   response:
+    executive_summary:
+      prompt: >
+        One paragraph (≤100 words): how risks are managed, the 3 highest
+        exposure areas SPECIFIC to this contract, and the risk reserve %
+        included in the price. The buyer can score 5 from this paragraph
+        alone if it's tight.
+      max_words: 100
+      required: true
+
     headline:
-      prompt: "In one sentence, what is your risk approach and what are the top exposure areas?"
+      prompt: "In one sentence, your risk approach and the top 3 exposure areas"
       max_words: 30
       required: true
 
     methodology:
-      prompt: "How risks are identified, scored, and reviewed"
+      prompt: >
+        How risks are identified, scored (with rationale), and reviewed.
+        Identification must include named methods beyond "experience"
+        (site walk, incumbent engagement, lessons-learned database, scenario
+        workshop, etc.). Scoring scale must define what L/M/H actually mean
+        in concrete terms (£ thresholds, schedule days, regulatory exposure).
       required:
-        identification_method:    # workshops, lessons learned, scenario analysis
-          type: string
-        scoring_scale:            # how L and I are scored
-          type: string
-        review_cadence:
+        identification_methods:
+          type: list[string]
+          min_items: 2                 # multiple methods, not just "experience"
+        scoring_scale:
+          required: true
+          fields:
+            likelihood_definitions:    # what L, M, H mean - frequency or probability
+              type: object
+            impact_definitions:        # what L, M, H mean in £ / schedule days / etc.
+              type: object
+        review_cadence:                # how often
           type: string
 
     risk_register:
-      prompt: "Top 5-8 risks SPECIFIC to this contract, with L/M/H and mitigation"
+      prompt: >
+        Risk register as a TABLE (not narrative). Each risk must be contract-
+        specific, rooted in the operational context above. Every risk shows
+        inherent score, residual score (after mitigation), and target
+        residual (where you'll be with contingency in place) - this proves
+        mitigation has analytical weight, not just words.
       required:
         risks:
           type: list
           min_items: 5
           max_items: 8
           item_fields:
-            - risk                  # specific to this contract
-            - likelihood            # L / M / H
-            - impact                # L / M / H
-            - score                 # L*I rationale
-            - mitigation            # specific action
-            - owner                 # named role
-            - target_residual_score
+            - id                       # e.g. R1, R2, ...
+            - risk                     # specific to THIS contract, rooted in operational context
+            - category                 # e.g. transition, delivery, commercial, regulatory, people
+            - inherent_likelihood      # L/M/H with rationale
+            - inherent_impact          # L/M/H with rationale
+            - inherent_score           # combined inherent score
+            - rationale_for_scoring    # evidence-grounded rationale (cited frequencies, contract clauses)
+            - mitigation               # specific action: who, what, on what cadence
+            - residual_likelihood
+            - residual_impact
+            - residual_score           # after mitigation
+            - target_residual_score    # where you'll be once contingency in place
+            - owner                    # named role at right seniority for impact level
+            - contingency_ref          # which contingency plan activates if residual triggers
+            - last_seen_in_prior_contract  # vault reference if this risk has occurred before
+        risk_reserve_in_price:
+          required: true
+          fields:
+            value_gbp:
+              type: number
+            pct_of_contract_value:     # typically 3-7%
+              type: number
+            coverage_rationale:        # which risks the reserve covers
+              type: string
+
+    owner_seniority_matrix:
+      prompt: >
+        How risk ownership is tiered by impact. High-impact risks owned at
+        junior levels signals organisational dysfunction; low-impact at
+        executive levels signals poor delegation. Show the seniority match.
+      required:
+        tiers:
+          type: list
+          min_items: 3
+          item_fields:
+            - impact_band              # e.g. ">£100k or schedule-affecting"
+            - owner_role               # named seniority
+            - review_forum             # where reviewed
 
     top_three_narrative:
-      prompt: "Narrative around the 3 highest risks"
+      prompt: >
+        Detailed narrative for the 3 highest-scoring risks. For each, explain
+        why it matters in THIS contract context, what the mitigation actually
+        looks like operationally, what the contingency trigger is, and what
+        fallback resource makes the contingency credible (DR site, standby
+        labour, retained capacity, financial reserve, partnership).
       required:
         narratives:
           type: list
           min_items: 3
           max_items: 3
-          item_fields: [risk_ref, why_significant, mitigation_detail, contingency_trigger]
+          item_fields:
+            - risk_ref                 # links to risk_register.id
+            - why_significant_for_this_contract
+            - mitigation_operational_detail  # cadence, owner, escalation trigger
+            - contingency_trigger      # specific event/threshold that activates contingency
+            - fallback_resource        # the named resource that makes contingency credible
+            - costed_in_reserve        # boolean - is this in risk_reserve_in_price
 
     contingency_plans:
-      prompt: "Pre-defined plans triggered by specific events"
+      prompt: >
+        Distinct from mitigation. Each plan has a specific trigger event
+        (measurable), a sequenced response action with timings, a named
+        decision owner, and the named fallback resource. Generic "we have
+        contingency plans" scores 2.
       required:
         plans:
           type: list
-          min_items: 2
-          item_fields: [trigger_event, response_action, decision_owner, time_to_activate]
+          min_items: 3
+          item_fields:
+            - id                       # e.g. CP-A, CP-B
+            - covers_risks             # list of risk IDs
+            - trigger_event            # specific, measurable
+            - sequenced_response       # list of {action, owner, timing}
+            - decision_owner           # named role with authority
+            - time_to_activate_hours
+            - fallback_resource_named  # DR site, agency contract, partner, reserve
+            - last_tested_date         # quarterly DR test, etc.
+            - vault_evidence_id
 
     escalation_route:
-      prompt: "Who escalates to whom, with timescales"
+      prompt: >
+        Named escalation route by severity tier, with timescales. Internal
+        and buyer-facing routes both required. Generic "we will escalate"
+        scores 2.
       required:
         levels:
           type: list
           min_items: 3
-          item_fields: [level, role, timescale, decision_authority]
+          item_fields:
+            - severity_tier            # P1/P2/P3 or H/M/L
+            - internal_owner           # named role
+            - buyer_counterpart        # which buyer role gets notified
+            - timescale_to_notify_hours
+            - decision_authority
 
-    review_cadence:
-      prompt: "How often the risk register is reviewed and with whom"
+    joint_review_with_buyer:
+      prompt: >
+        Risk register reviewed jointly with the buyer turns risk management
+        into partnership rather than supplier defensiveness. Specify internal
+        review cadence AND buyer-facing review cadence AND a quarterly joint
+        review with both sides' senior leadership.
       required:
-        internal_review:
+        internal_review_cadence:
+          type: string                 # e.g. fortnightly
+        buyer_visibility_cadence:
+          type: string                 # e.g. monthly shared register
+        joint_senior_review:
+          required: true
+          fields:
+            cadence:                   # quarterly typically
+              type: string
+            our_attendees:
+              type: list[string]
+            buyer_attendees_expected:
+              type: list[string]
+        emerging_risk_escalation_route:
           type: string
-        client_review:
+
+    lessons_from_real_risk:
+      prompt: >
+        One named example of a risk that actually occurred on a prior
+        contract: identification, scoring, contingency triggered, outcome,
+        lesson applied to THIS bid. Proves the risk process is operational,
+        not theatrical.
+      required:
+        contract_or_label:
           type: string
+        risk_description:
+          type: string
+        was_anticipated:               # boolean - was this in the register or did it emerge
+          type: boolean
+        contingency_activated:
+          type: string
+        outcome:
+          type: string                 # quantified - schedule impact, cost impact, recovered yes/no
+        lesson_applied_here:
+          type: string                 # specific change made for THIS bid
+        vault_evidence_id:
+          type: string
+
+    risks_buyer_may_not_have_thought_of:
+      prompt: >
+        1-2 risks the buyer probably hasn't anticipated, with mitigation.
+        Optional but heavily rewarded - signals operational depth and that
+        you're protecting the buyer, not just yourself. Examples: undocumented
+        operational knowledge held by incumbent staff at risk under TUPE;
+        regulator approval timelines on configuration changes; data
+        sovereignty implications of subcontractor selection.
+      required: false
+      fields:
+        unanticipated_risks:
+          type: list
+          min_items: 1
+          max_items: 2
+          item_fields: [risk, why_buyer_may_have_missed, mitigation, why_we_have_thought_of_this]
 
   evidence_minimums:
     contract_specific_risks: 5
-    named_owners: 5
-    contingency_plans: 2
+    risks_with_inherent_residual_target_scores: 5
+    named_owners_at_right_seniority: 5
+    contingency_plans_with_named_fallback: 3
+    contingency_plans_with_test_dates: 1   # DR test, etc.
     escalation_levels: 3
+    risk_reserve_disclosed: 1
+    real_risk_lesson_example: 1
 
   scoring_check:
-    risks_specific:
-      fail_if: 'any risk could be copy-pasted to a different contract without modification'
-    owners_named:
-      fail_if: 'risk owner is "project team" rather than a named role'
+    risks_contract_specific:
+      severity: blocking
+      fail_if: 'any risk could be copy-pasted to a different contract without modification (e.g. "staff turnover", "supply chain disruption", "cyber attack" without contract-specific context)'
+      rationale: 'Generic risk register is the most common cause of risk section scoring 3, and it depresses scoring on other sections through compounded scepticism'
+    scoring_rationale_present:
+      fail_if: 'L/M/H scores lack rationale grounded in evidence (cited frequencies, contract clauses, prior occurrence data)'
+    inherent_residual_target_present:
+      fail_if: 'risks show only one score (not three: inherent, residual, target_residual)'
+    owner_seniority_appropriate:
+      fail_if: 'high-impact risks (>£100k or schedule-affecting) owned by junior roles (team lead, coordinator)'
+      OR_fail_if: 'low-impact risks owned by executive roles (Director level)'
     mitigations_specific:
-      fail_if: 'mitigation says "monitor closely" or "manage carefully" without a defined action'
-    contingencies_have_triggers:
-      fail_if: 'contingency plan lacks a specific trigger event'
+      fail_if: 'mitigation contains "monitor closely", "manage carefully", "ensure", "review regularly" without defined action, owner, cadence, escalation trigger'
+    contingency_distinct_from_mitigation:
+      fail_if: 'contingency_plans field repeats mitigation text instead of defining response to a triggered event'
+    contingency_has_fallback_resource:
+      fail_if: 'contingency plan lacks a named fallback resource (DR site, agency contract, partner, financial reserve)'
+    contingency_triggers_specific:
+      fail_if: 'contingency trigger is aspirational ("if things go wrong") rather than measurable event/threshold'
+    risk_reserve_disclosed:
+      fail_if: 'risk_reserve_in_price.value_gbp is 0 or pct_of_contract_value is 0 (no risk reserve in commercial offer)'
+    risk_reserve_reasonable:
+      rule: 'risk_reserve_in_price.pct_of_contract_value typically 3-7%; outside this range requires rationale'
+    lessons_from_real_risk:
+      fail_if: 'lessons_from_real_risk section is omitted or generic'
+    cross_section_consistency:
+      severity: blocking
+      rule: 'every risk in risk_register must have a corresponding entry in at least one of: §3.1 risks, §3.2 risks, §3.3 (SV underdelivery), §3.4 (quality risk), §3.7 (pricing assumption)'
+      rationale: 'A risk acknowledged here but invisible in other sections signals the risk process is theatrical, not operational'
+    joint_review_offered:
+      fail_if: 'no quarterly joint review with buyer senior leadership offered'
 
   failure_modes:
-    - 'Generic risks ("staff turnover", "supply chain disruption")'
-    - "No L/M/H scoring rationale"
-    - 'Owners listed as "team" or "management"'
-    - '"Monitor and manage" as mitigation'
-    - "Contingency plans without triggers"
-    - "Escalation without timescales"
+    - 'Generic risks: "staff turnover", "supply chain disruption", "cyber attack" without contract context [BLOCKING]'
+    - "L/M/H labels without scoring rationale"
+    - "Only one score per risk (no inherent/residual/target progression)"
+    - 'Owners listed as "project team" or "management"'
+    - "High-impact risks owned by junior roles, or low-impact by executive"
+    - '"Monitor and manage" / "ensure" / "review regularly" as mitigation'
+    - "Contingency text duplicates mitigation text (not actually a contingency)"
+    - "Contingency plans without named fallback resource (DR site, standby labour, partner)"
+    - "Contingency triggers aspirational, not measurable"
+    - "No risk reserve disclosed in commercial offer"
+    - "Risk reserve outside 3-7% typical band without rationale"
+    - "No example of a risk that actually occurred and what was learned"
+    - "Risk register as narrative not table (buyer has to construct it mentally)"
+    - "No joint review with buyer offered (supplier-defensive framing)"
+    - "Risks listed here but invisible in technical/methodology/SV/quality/pricing sections [BLOCKING]"
+    - "Risks the buyer might not have thought of are absent (no upside differentiation)"
 
 # =============================================================================
 # 3.6 CASE STUDIES
@@ -625,8 +1288,16 @@ risk_contingency:
 
 case_study:
   description: >
-    Used both standalone and embedded in other responses. A case study scores
-    by relevance match to the current tender on six axes.
+    Used both standalone and embedded in other responses. A case study does
+    two jobs simultaneously: it is EVIDENCE (proving capability) and a
+    DESIGNED OBJECT (signalling professionalism). Most bidders treat them as
+    evidence only and lose marks on appearance; a stunning case study can
+    move a marginal bid from second to first. A case study scores by
+    relevance match to the current tender on SIX axes (not the standard
+    three), by quantified outcomes with before/after/validation, by named
+    testimonials with referee contact, and by visual quality that doesn't
+    fight the content. See `case_study_generation` below for the pipeline
+    that produces visually-strong case studies from rough inputs.
 
   inputs:
     inherits: shared_inputs
@@ -635,19 +1306,63 @@ case_study:
         type: list[string]
         required: true
         description: "Which of THIS tender's criteria the case study foregrounds"
+      tender_value_gbp:
+        type: number
+        required: true
+        description: "Used for value-proximity match (±50%)"
+      tender_sector:
+        type: string
+        required: true
+      tender_geography:
+        type: list[string]
+        required: true
+      output_length_variant:
+        type: string
+        required: true
+        allowed: [one_pager, two_pager, four_pager, sector_variant]
+        description: "Determines layout template and content depth"
 
   response:
+    headline_outcome_lead:
+      prompt: >
+        Display-type opening before any preamble. The first thing the
+        evaluator sees is the headline outcome, not "About the Client".
+        Magazine editorial structure: 2-3 short statements with the most
+        compelling quantified outcomes. Example: "57% reduction in handling
+        time. £340k annual saving. Validated independently."
+      required:
+        statements:
+          type: list
+          min_items: 2
+          max_items: 3
+          item_fields: [text, supporting_number, display_treatment]
+
     client_identification:
-      prompt: "Named client or anonymised label?"
+      prompt: "Named client or anonymised label, with consent status"
       required:
         client_name_or_label:
           type: string
         anonymised:
           type: boolean
+        consent_status:                # checked against tenant's client consent register
+          type: object
+          fields:
+            use_named_allowed:
+              type: boolean
+            use_logo_allowed:
+              type: boolean
+            use_staff_photos_allowed:
+              type: boolean
+            consent_record_id:
+              type: string
         sector:
           type: string
+        sector_adjacency:              # for cross-sector matches
+          type: list[string]
         location:
           type: string
+        geography:
+          type: list[string]           # postcodes/towns/regions
 
     contract_facts:
       prompt: "Hard facts about the contract"
@@ -663,84 +1378,448 @@ case_study:
         services_delivered:
           type: list[string]
           min_items: 1
+        complexity_indicators:         # what made it hard
+          type: list[string]
+        technology_methodology_stack:
+          type: list[string]
 
     challenge:
-      prompt: "What problem was the client facing?"
+      prompt: "What problem was the client facing? Specific and contextual."
       required:
         challenge_description:
           type: string
         why_difficult:
           type: string
+        what_made_status_quo_unacceptable:    # the trigger that led to procurement
+          type: string
 
     approach:
-      prompt: "How did you tackle it?"
+      prompt: "How did you tackle it? Named methodology, named team roles."
       required:
         approach_description:
           type: string
-        methodology_used:
+        methodology_used:              # named, no "best practice"
           type: string
+        named_team_roles:
+          type: list[string]
+        critical_decisions:            # 2-3 key calls made during delivery
+          type: list[string]
 
     outcomes:
-      prompt: "Measurable outcomes with numbers"
+      prompt: >
+        Quantified outcomes with the full chain: baseline (before), result
+        (after), percentage delta, financial value, validation source,
+        timing. Outcomes without baselines are unfalsifiable; baselines
+        without validation are claims; the full chain is evidence.
       required:
         outcomes:
           type: list
-          min_items: 2
-          item_fields: [metric, before_value, after_value, % change]
+          min_items: 3
+          item_fields:
+            - metric                   # what was measured
+            - before_value             # baseline number
+            - after_value              # outcome number
+            - delta_pct                # % change
+            - financial_value_gbp      # £ impact where measurable
+            - validation_source        # named auditor, KPI dashboard, client sign-off
+            - timing                   # when measured, e.g. "Month 18"
+            - display_as_infographic   # boolean - should this become visual element
 
     testimonial:
-      prompt: "Client quote with named referee"
+      prompt: >
+        Named testimonial with full attribution and a specific compliment
+        that proves the referee actually read or saw the work. Anonymous
+        praise scores 1; "A pleasure to work with" scores 2; specific
+        attributable feedback with referee available scores 5.
       required:
         quote:
-          type: string
+          type: string                 # contains a specific operational compliment
         attribution_name:
           type: string
         attribution_role:
           type: string
+        attribution_organisation:
+          type: string
+        date_of_quote:
+          type: date
         referee_contactable:
           type: boolean
-
-    visual:
-      prompt: "Photo or diagram if the template allows"
-      required:
-        asset_id:
-          type: string         # reference to vault asset
-        caption:
+        referee_consent_record_id:
           type: string
+        pull_quote_treatment:          # how it gets displayed
+          required: true
+          fields:
+            display_size:              # large, medium - for visual hierarchy
+              type: string
+            position_in_layout:        # hero, mid-narrative, sidebar
+              type: string
+
+    visual_assets:
+      prompt: >
+        One strong hero is better than three mediocre photos. Each asset has
+        quality scoring from the vault and is selected against template needs
+        (hero/thumbnail/detail). Photos with people require consent check.
+        Where photos are weak, fall back to brand-consistent illustration or
+        infographic.
+      required:
+        hero_asset:
+          required: true
+          fields:
+            asset_id:
+              type: string             # vault reference
+            asset_type:                # photo, illustration, infographic
+              type: string
+            quality_score:             # 0-5 from Claude vision
+              type: number
+            aspect_ratio:
+              type: string
+            caption:
+              type: string
+            consent_status:            # for any people in shot
+              type: object
+            colour_treatment_applied:  # which brand LUT
+              type: string
+        supporting_assets:
+          type: list
+          max_items: 4                 # editorial discipline - few strong assets, not many weak
+          item_fields: [asset_id, asset_type, quality_score, caption, position_in_layout]
+        infographics:
+          type: list
+          item_fields:
+            - source_outcome_ref       # which outcome this visualises
+            - visual_type              # circle stat, before/after bar, timeline, comparison
+            - position_in_layout
 
     relevance_mapping:
-      prompt: "Why this case study fits THIS tender"
+      prompt: >
+        Explicit mapping at end of the case study showing how each tender
+        criterion is demonstrated by a specific case study element. Don't
+        make the evaluator construct this mentally - spell out the link.
       required:
         mappings:
           type: list
           min_items: 1
-          item_fields: [tender_criterion, case_study_element, similarity_strength]
+          item_fields:
+            - tender_criterion         # verbatim from THIS tender
+            - case_study_element       # which part of case study demonstrates it
+            - similarity_strength      # strong, moderate, indicative
+            - why_it_demonstrates      # one-line rationale
+
+    six_axis_match_record:
+      prompt: >
+        Auto-calculated record of how this case study matches the current
+        tender on the six relevance axes. Used by the agent to pick the
+        highest-relevance case study from the vault.
+      required:
+        sector_match:                  # exact, adjacent, none
+          type: string
+        value_proximity_pct:           # how close to tender value
+          type: number
+        complexity_match:              # high, medium, low
+          type: string
+        geography_match:               # same region, adjacent, none
+          type: string
+        technology_methodology_match:  # exact, partial, none
+          type: string
+        recency_years:                 # years since end_date
+          type: number
+        overall_relevance_score:       # composite 0-5
+          type: number
 
   evidence_minimums:
-    quantified_outcomes: 2
-    testimonials: 1
+    quantified_outcomes_with_full_chain: 3   # before+after+delta+£+validation+timing
+    testimonials_with_named_referee: 1
     relevance_mappings: 1
-    photos_or_diagrams: 1   # if template allows
+    hero_asset_with_quality_score: 1
+    six_axis_match_score: 1
 
   scoring_check:
-    sector_match:
-      rule: sector matches or is adjacent to tender sector
+    six_axis_match:
+      severity: blocking
+      rule: >
+        overall_relevance_score must be >= 3.0. If lower, this case study is
+        the wrong one for this tender - pick a better one from the vault or
+        flag that no suitable case study exists.
     value_proximity:
-      rule: contract value within ±50% of tender value
+      fail_if: 'tender value vs case study value differs by more than 50% without explicit justification'
+      rationale: '£50M case study for £500k tender scores worse than competent £500k case study'
     recency:
-      rule: end_date within 3 years of tender response date
-    outcomes_quantified:
-      fail_if: 'outcomes lack numeric values'
-    testimonial_attributed:
-      fail_if: 'quote without named attribution'
+      fail_if: 'case study end_date older than 3 years without justification'
+    outcomes_full_chain:
+      fail_if: 'any outcome lacks before_value, after_value, OR validation_source'
+    testimonial_attribution:
+      fail_if: 'quote lacks named individual, role, organisation, or contactable referee'
+    testimonial_specificity:
+      fail_if: 'quote is generic praise ("pleasure to work with", "highly recommend") without specific operational detail'
+    hero_quality:
+      fail_if: 'hero_asset.quality_score < 4 (one strong hero beats three mediocre)'
+    consent_compliance:
+      severity: blocking
+      fail_if: 'client_name_or_label is named when consent_status.use_named_allowed is false'
+      OR_fail_if: 'staff visible in any asset when consent_status.use_staff_photos_allowed is false'
+      OR_fail_if: 'logo used when consent_status.use_logo_allowed is false'
+      rationale: 'Using client names or imagery without consent creates legal and reputational exposure'
+    visual_language_consistency:
+      severity: blocking_at_bid_level
+      rule: >
+        All case studies in the same bid must use the same brand foundation
+        (typography, palette, photo treatment, infographic style). Inconsistent
+        case study layouts within one bid signal grab-bag curation and depress
+        scoring on all of them.
+    relevance_mapping_present:
+      fail_if: 'no explicit mapping from case study elements to THIS tender criteria'
+    length_fit:
+      fail_if: 'case study exceeds the word/page limit set by buyer, OR uses a length variant inconsistent with output_length_variant input'
 
   failure_modes:
-    - "Generic outcomes (improved efficiency, increased satisfaction)"
-    - "Anonymous testimonial"
-    - "Sector mismatch"
-    - "Value mismatch (£50M case study for a £500k tender)"
+    - "Anonymous testimonial or generic praise"
+    - "Client named without consent on file [BLOCKING]"
+    - "Staff visible in photos without consent [BLOCKING]"
+    - "Sector mismatch (cleaning case study for IT tender)"
+    - "Value mismatch >50% in either direction"
     - "Older than 3 years without justification"
-    - "No mapping to current tender criteria"
+    - "Outcomes without before/after baseline"
+    - "Outcomes without validation source"
+    - 'Generic outcomes ("improved efficiency", "increased satisfaction")'
+    - "Hero image quality score <4"
+    - "Three mediocre photos instead of one strong hero"
+    - "No infographic for headline numbers (everything in prose)"
+    - "No pull quote treatment for testimonial"
+    - "Case studies in same bid using inconsistent visual language [BLOCKING AT BID LEVEL]"
+    - "No relevance mapping to tender criteria"
+    - "Six-axis match score <3.0 (wrong case study for this tender)"
+    - "Length doesn't fit buyer's stated limit"
+
+# =============================================================================
+# CASE STUDY GENERATION PIPELINE
+# =============================================================================
+# This is not a response template; it specifies how case_study content gets
+# produced from raw inputs (photos, notes, voice memos, supporting docs).
+# Phase 5 build target. Depends on tenant-specific brand foundation existing
+# in the vault.
+
+case_study_generation:
+  description: >
+    Pipeline that converts rough inputs (photos, notes, voice memos,
+    supporting docs) into a finished, visually-strong case study without
+    requiring per-case art direction. Output is publication-quality. Every
+    output is tenant-isolated (see cross_cutting_rules.visual_identity_isolation).
+
+  pipeline_stages:
+
+    stage_1_input_collection:
+      description: "Single ingest endpoint accepting all source material per project"
+      accepts:
+        - photos                        # any quality, any quantity
+        - notes                         # text or voice memo transcripts
+        - supporting_docs               # completion certificates, client emails, KPI screenshots, invoices proving value
+        - client_brief_if_any           # what the client said the project was about
+      outputs:
+        project_workspace_id:
+          description: "Vault folder grouping all inputs and outputs for this project"
+
+    stage_2_structured_extraction:
+      description: "Claude vision + text extracts metadata from all inputs"
+      processes:
+        photo_metadata_extraction:
+          per_photo:
+            - subject_identification
+            - composition_quality_score  # 0-5
+            - aspect_ratio
+            - lighting_quality
+            - faces_detected             # count + bounding boxes
+            - sensitive_content_flags    # vehicle plates, security info, visible documents
+            - suitability_score:
+                hero_use: 0-5
+                thumbnail_use: 0-5
+                detail_use: 0-5
+        text_extraction:
+          fields_to_populate:
+            - client
+            - sector
+            - dates
+            - value
+            - services_delivered
+            - challenges
+            - solutions
+            - outcomes
+            - team
+            - location
+            - technology_methodology_stack
+        gap_identification:
+          description: "Identify which case_study fields are unpopulated after extraction"
+          output: list_of_missing_fields
+
+    stage_3_targeted_followup:
+      description: "Agent asks 3-8 questions max to fill remaining gaps"
+      rules:
+        max_questions: 8
+        priority_order: ["outcomes_quantification", "client_consent_status", "validation_source", "testimonial_attribution"]
+        format: structured_questionnaire     # answered in dashboard UI
+      hard_rule:
+        no_invention: >
+          If a field cannot be populated from inputs or follow-up answers, it
+          remains null and the case study is flagged as incomplete. Never
+          invent facts to fill gaps.
+
+    stage_4_photo_curation:
+      description: "Quality filter, crop, treatment, redaction"
+      operations:
+        quality_filter:
+          rule: "auto-reject photos with composition_quality_score < 2"
+        auto_crop:
+          method: "subject-aware crop to template aspect ratios (16:9 hero, 1:1 thumbnail, 3:2 detail)"
+          rule: "never crop faces to decapitate"
+        colour_treatment:
+          method: "apply tenant brand LUT to all selected photos for cohesion"
+          source: "vault: tenant brand foundation -> photo_treatment_lut"
+        privacy_redaction:
+          triggers:
+            - faces_without_consent
+            - vehicle_plates
+            - visible_security_information
+            - identifiable_personal_data
+          action: "blur with user confirmation, OR remove from selection"
+        fallback_when_photos_weak:
+          rule: >
+            If no photo scores >= 4 for hero use, generate brand-consistent
+            illustration or data visualisation instead of forcing a bad photo
+            in. Editorial rule: one strong hero is better than three mediocre.
+
+    stage_5_narrative_drafting:
+      description: "Claude drafts case study text in tenant tone of voice"
+      tone_of_voice_source:
+        primary: "vault: tenant_tone_profile (learned from 5+ approved past case studies)"
+        fallback: "professional services default until tenant_tone_profile has enough training data"
+      narrative_structure:
+        - headline_outcome_lead          # display type, magazine-style
+        - challenge
+        - approach
+        - solution
+        - outcome
+        - metrics
+      length_fitting:
+        variants_produced:
+          - one_pager: "~250 words"
+          - two_pager: "~600 words"
+          - four_pager: "~1500 words"
+        rule: "each variant tuned for its length, not truncated"
+
+    stage_6_layout_generation:
+      description: "Generative engine produces unique layout within brand-locked rules"
+      approach: "Option 2 - generative variation within brand foundation"
+      brand_foundation_inputs:
+        source: "vault: tenant brand foundation (typography pair, palette, grid rules, photo treatment LUT, infographic style)"
+        tenant_locked: true              # see cross_cutting_rules.visual_identity_isolation
+      generative_variation:
+        variables_per_case_study:
+          - hero_composition             # crop, position, treatment
+          - pull_quote_position          # where in layout
+          - infographic_type             # circle stat / before-after bar / timeline / comparison
+          - accent_placement             # colour accent positions
+          - white_space_distribution
+        invariant_per_tenant:
+          - typography_pair
+          - palette
+          - grid_logic
+          - photo_treatment_lut
+          - infographic_visual_language
+      fingerprint:
+        description: >
+          Every layout generates a layout_fingerprint hash of its variation
+          decisions. Before commit, fingerprint is checked against the
+          platform-wide layout_fingerprint table. If collision: perturb
+          generation parameters and retry until unique.
+        uniqueness_scope: platform_wide
+      output_formats:
+        primary: pdf                      # via Typst with tenant template
+        editable: docx                    # parallel deliverable for bid team edits
+
+    stage_7_review_loop:
+      description: "Human review in dashboard before approval"
+      reviewable_elements:
+        - photo_selection                 # swap any selected photo
+        - copy_edit                       # edit narrative
+        - caption_edit
+        - infographic_data                # adjust numbers if extraction was off
+        - layout_variation_reroll         # regenerate layout with new variation
+      approval_action:
+        commits_to_vault: true
+        produces:
+          - master_record                 # project facts and claims, tenant-isolated
+          - latest_version                # template + photos + narrative for this output
+
+    stage_8_per_tender_adaptation:
+      description: "Re-version master case study for a specific tender"
+      triggered_by: "tender requirements extractor matches a case study to a tender"
+      operations:
+        relevance_assessment:
+          method: "six_axis_match_record calculation against tender"
+          rule: "if overall_relevance_score < 3.0, do not use this case study"
+        narrative_re_versioning:
+          rule: "shift narrative emphasis to foreground THIS tender's criteria"
+          example: >
+            For a social-value-weighted tender, foreground local employment,
+            apprenticeships, supply chain spend. For a technical-weighted
+            tender, foreground methodology, innovation, risk management.
+        length_fitting:
+          rule: "produce variant matching buyer's stated word/page limit"
+        anonymisation:
+          triggered_when: "client_consent.use_named_allowed is false for this tender's domain"
+          action: "produce redacted version while preserving original in vault"
+      output:
+        bid_specific_version:
+          links_to: master_record
+          preserves: master_record_unchanged
+          stored_against: bid_id + tender_id
+
+  consent_gates:
+    description: "Hard checks before any case study leaves the system"
+    checks:
+      client_consent:
+        register: "vault: tenant client_consent_register"
+        per_client_flags:
+          - use_named_allowed
+          - use_anonymised_allowed
+          - use_logo_allowed
+          - use_staff_photos_allowed
+        enforcement: "agent must check before generating client-naming output"
+      photo_consent:
+        per_photo_or_shoot:
+          - consent_on_file
+          - consent_expiry_date
+          - usage_scope_allowed
+        enforcement: "agent must check before including any photo with identifiable people"
+
+  vault_dependencies:
+    description: "What must exist in the vault for this pipeline to produce 5/5 output"
+    required_per_tenant:
+      brand_foundation:
+        - logo (multiple formats and sizes)
+        - colour_palette (hex/RGB/CMYK)
+        - typography_pair (display and body, web and print)
+        - photo_treatment_lut
+        - infographic_visual_language
+        - tone_of_voice_profile (built from 5-10 approved past case studies, fallback to default until then)
+      template_base:
+        - one_pager_typst_template
+        - two_pager_typst_template
+        - four_pager_typst_template
+        - sector_variant_templates (as needed)
+      client_consent_register: per_client_consent_flags
+      photo_consent_records: per_photo_or_shoot
+      case_study_master_records: project_facts_and_claims
+    populated_when: "Phase 5 tenant onboarding; case study generation cannot run for a tenant until brand_foundation is complete"
+
+  failure_modes:
+    - "Tenant brand foundation incomplete at point of generation [BLOCKING]"
+    - "Layout fingerprint collision with another tenant (should never happen given generation engine, but if it does, retry until unique) [BLOCKING]"
+    - "Client used without consent on file [BLOCKING]"
+    - "Photo with identifiable person used without consent [BLOCKING]"
+    - "Photo composition_quality_score < 2 used as hero"
+    - "Narrative drafted with invented facts to fill input gaps [BLOCKING]"
+    - "Length variant truncated rather than re-tuned"
+    - "Case study used for tender with six_axis_match overall_relevance_score < 3.0"
 
 # =============================================================================
 # 3.7 PRICING SCHEDULE
@@ -748,9 +1827,17 @@ case_study:
 
 pricing_schedule:
   description: >
-    Quality scores are absolute; price scores are usually relative. Pricing
-    structure protects margin while maximising score against the buyer's
-    chosen method (relative scoring or VfM ratio).
+    Pricing carries 30-60% of total bid score and is the most misunderstood
+    section. Unlike quality answers (judgement-based), price scoring depends
+    on your number versus competitors and the buyer's method - which means
+    score-modelling is possible BEFORE submission. The 5/5 bidder identifies
+    the buyer's method first, then optimises accordingly. The 3/5 bidder
+    "prices competitively" which produces the wrong shape of bid for the
+    actual method. Critical dependency: BidPricingHistory in the vault feeds
+    score-modelling; after 20-30 bids the agent has real data on price points
+    that win and lose by sector/buyer/value. Cross-section reconciliation
+    matters: every commitment in §3.1-§3.6 must have a cost element here or
+    explicit overhead absorption.
 
   inputs:
     inherits: shared_inputs
@@ -759,102 +1846,481 @@ pricing_schedule:
         type: string
         required: true
         allowed: [relative, vfm_ratio, lowest_compliant, fixed_with_quality]
-      pricing_template:
-        type: string         # path to buyer's Excel template
+        description: "Identified from ITT before any pricing work begins"
+      pricing_template_path:
+        type: string
         required: true
+        description: "Path to buyer's Excel template"
       price_weighting_pct:
         type: number
         required: true
+      contract_duration_years:
+        type: integer
+        required: true
+      contract_value_estimate_gbp:
+        type: number
+        required: true
+        description: "Buyer's published estimate or contract value cap"
+      volume_tiers_allowed:
+        type: boolean
+        required: true
+      indexation_terms_required:
+        type: boolean
+        required: true
+      buyer_sla_or_schedule_refs:
+        type: list[string]
+        description: "Schedule numbers in ITT that pricing must align to"
+      historical_buyer_method_pattern:
+        type: string
+        required: false
+        description: "If this buyer is in BidPricingHistory, the method they've used in past bids"
 
   response:
+    commercial_summary:
+      prompt: >
+        One paragraph at the head of the pricing narrative: total contract
+        value, breakdown by year, the pricing method understood, reference
+        to the assumptions register, and the confidence statement ("price
+        held subject to documented assumptions"). Evaluator can score 5
+        from this paragraph alone if tight.
+      max_words: 120
+      required: true
+
+    pricing_method_acknowledgement:
+      prompt: >
+        Explicit confirmation of the buyer's pricing method as identified
+        from the ITT, with the strategy applied. Shows the bidder has read
+        the method correctly and optimised for it.
+      required:
+        method_identified:               # from inputs
+          type: string
+        weighting_pct:
+          type: number
+        strategy_applied:
+          type: string                   # e.g. "VfM ratio: targeting quality 85%, price position mid-premium"
+        rationale_from_history:
+          type: string
+          description: "If BidPricingHistory shows this buyer's past method, reference it"
+
     pricing_breakdown:
-      prompt: "Complete pricing schedule per the buyer's template"
+      prompt: >
+        Complete pricing schedule matching the buyer's template exactly.
+        Every line in the buyer's template filled, row order preserved,
+        no merged cells changed, totals matching formulas. Bidders who
+        improve on the buyer's structure usually score worse.
       required:
         line_items:
           type: list
           min_items: 1
-          item_fields: [description, unit, qty, unit_price, total, is_scoreable]
+          item_fields:
+            - description
+            - unit                       # e.g. £/m²/month
+            - qty
+            - unit_price
+            - total
+            - is_scoreable               # boolean - does this line affect the score
+            - scoring_weight_pct         # if scoreable, what weight
+            - cost_category              # labour, materials, overhead, margin - for transparency
         sum_total:
           type: number
+        template_compliance_check:
+          required: true
+          fields:
+            all_buyer_rows_filled:
+              type: boolean
+            row_order_preserved:
+              type: boolean
+            no_structural_modifications:
+              type: boolean
+            named_ranges_intact:
+              type: boolean
 
     assumptions:
-      prompt: "Every assumption underpinning the price, in writing"
+      prompt: >
+        Document EVERY input that affects the price. 15-30 numbered
+        assumptions is the bar; 3-5 is the failure mode. Buyers know
+        bidders with few assumptions are concealing risk that will appear
+        in change orders. Comprehensive assumptions WIN bids by signalling
+        commercial maturity.
       required:
         assumptions:
           type: list
-          min_items: 3
-          item_fields: [assumption, impact_if_invalid]
+          min_items: 15                  # firm minimum
+          item_fields:
+            - id                         # A1, A2, ...
+            - category                   # volume, productivity, inflation, hours, mobilisation, equipment, geography, third-party, payment, FX, etc.
+            - assumption                 # specific, quantified
+            - impact_if_invalid          # what changes in the price
+            - vault_source_id            # vault reference for standard assumptions
 
     exclusions:
-      prompt: "What is NOT included, explicitly"
+      prompt: >
+        What is NOT included, explicitly itemised in its own list (not
+        buried in narrative). Hidden exclusions cause post-award disputes.
       required:
         exclusions:
           type: list
-          item_fields: [exclusion, rationale]
+          min_items: 3
+          item_fields: [exclusion, rationale, would_be_priced_at_if_required]
 
     scoreable_optimisation:
-      prompt: "How pricing is sharpened on heavily-weighted scoreable items"
+      prompt: >
+        For each scoreable line item, the strategy applied. Sharpening
+        scoreable lines while protecting margin on the rest is the 5/5
+        commercial move - invisible to the buyer, transformative for
+        score and profit.
       required:
         strategy_per_scoreable_item:
           type: list
           min_items: 1
-          item_fields: [item_ref, weighting, our_strategy]
+          item_fields:
+            - item_ref                   # links to pricing_breakdown.line_items
+            - weighting_pct
+            - market_baseline_price      # what we know the market sits at, from BidPricingHistory if available
+            - our_price
+            - our_strategy               # sharp / aligned / premium with rationale
+            - margin_protection_elsewhere # how the margin is held on non-scoreable lines
+
+    score_modelling:
+      prompt: >
+        Modelled bid score before submission, using buyer's method and
+        weighting. Requires competitor price assumption from
+        BidPricingHistory or market intelligence. Most competitors don't
+        do this; 30 minutes work moves bids materially. If no historical
+        data available, mark as "unmodelled - first bid in this segment".
+      required:
+        modelled_price_score:
+          type: number
+          description: "Score we expect to receive on price under buyer's method"
+        competitor_price_assumption:
+          required: true
+          fields:
+            source:                      # bid_history, market_intelligence, unmodelled
+              type: string
+            assumed_competitor_low_gbp:  # for relative scoring
+              type: number
+            assumed_competitor_median_gbp:
+              type: number
+            confidence:                  # high, medium, low
+              type: string
+        modelled_combined_score:
+          type: number
+          description: "modelled_price_score + projected quality_score"
+        sensitivity_analysis:
+          type: list
+          item_fields: [price_adjustment_pct, projected_score_change]
+
+    volume_tiers:
+      prompt: >
+        Where the schedule permits tiered pricing, aggressive tiering at
+        higher volumes signals commercial confidence and rewards the buyer
+        for scale. Bidders without tiered pricing leave score on the table
+        when the schedule allows it.
+      condition: "inputs.volume_tiers_allowed == true"
+      required:
+        tiers:
+          type: list
+          min_items: 2
+          item_fields:
+            - volume_band                # e.g. "up to £500k pa"
+            - unit_price
+            - discount_vs_base_pct       # how much sharper than the base tier
+            - rationale
+
+    indexation_and_year_on_year:
+      prompt: >
+        For multi-year contracts, year-on-year price commitments addressing
+        inflation. Flat across all years is unsustainable; full CPI
+        indexation gives away too much. The 5/5 move is structured:
+        "Year 1 flat, Years 2-3 CPI capped at X%, Years 4-5 reviewed at
+        gainshare" or similar.
+      condition: "inputs.contract_duration_years > 1"
+      required:
+        year_by_year_basis:
+          type: list
+          min_items: 2
+          item_fields: [year, basis, cap_or_floor, review_trigger]
+        index_reference:                 # CPI, RPI, sector-specific
+          type: string
 
     abnormal_low_protection:
-      prompt: "Defence against abnormally-low-bid rejection"
+      prompt: >
+        Defence against rejection under PCR 2015 abnormally-low-bid
+        provisions. Threshold typically triggers around 30% below
+        average bid or independent cost estimate. The 3/5 bidder optimises
+        for lowest price and gets disqualified.
       required:
-        sustainability_evidence:    # show pricing is deliverable
-          type: string
-        living_wage_compliance:     # if labour-heavy
+        sustainability_evidence:
+          required: true
+          fields:
+            cost_breakdown_offered:      # offer to provide breakdown if buyer requests
+              type: boolean
+            cost_category_summary:       # top-3 line items by value, category-level breakdown
+              type: list
+              item_fields: [line_item_ref, labour_pct, materials_pct, overhead_pct, margin_pct]
+        living_wage_compliance:          # if labour involved
           type: boolean
-        margin_disclosed:           # optional, used when buyer scrutinises
+        named_subcontractor_confirmation:
+          type: list[string]
+        sample_response_to_aln_challenge:
+          type: string
+          description: "Pre-drafted response if buyer challenges price as abnormally low"
+
+    cost_transparency:
+      prompt: >
+        Volunteering cost breakdown on top-3 line items by value addresses
+        the buyer's biggest unspoken concern that pricing is opaque. Not
+        margin disclosure - input transparency at category level.
+        Heavily rewarded by procurement-mature buyers.
+      required:
+        top_line_items_with_breakdown:
+          type: list
+          min_items: 3
+          item_fields:
+            - line_item_ref
+            - total_value
+            - labour_pct
+            - materials_pct
+            - overhead_pct
+            - margin_pct                 # category, not exact figure
+            - notes
+
+    open_book_elements:
+      prompt: >
+        For long contracts, offering open-book pricing on pass-through
+        components (materials, subcontractor charges, regulator fees)
+        signals trust and protects against runaway costs. Frame as "fixed
+        margin, transparent input" not "we don't know what it'll cost".
+        Optional but rare and scored well when offered.
+      required: false
+      fields:
+        components_offered_open_book:
+          type: list[string]
+        margin_basis:                    # e.g. "fixed at X% over evidenced input cost"
+          type: string
+        audit_rights_offered:
           type: boolean
 
     payment_terms:
-      prompt: "Proposed payment terms"
+      prompt: "Proposed payment terms with optional early payment discount"
       required:
         terms:
-          type: string                # e.g. "Monthly in arrears, NET 30"
+          type: string                   # e.g. "Monthly in arrears, NET 30"
         early_payment_discount:
-          type: string                # optional
+          type: string                   # optional
+        milestone_payment_structure:
+          type: string                   # if applicable
+
+    cross_section_pricing_reconciliation:
+      prompt: >
+        For every commitment made in §3.1-§3.6, confirm where it is priced
+        (which line item) or that it is absorbed in overhead. Hidden costs
+        that surface post-award are the most common cause of contract
+        disputes and supplier financial distress.
+      required:
+        reconciliation_table:
+          type: list
+          min_items: 1
+          item_fields:
+            - source_section              # §3.1, §3.2, etc.
+            - commitment_or_resource      # what was committed
+            - priced_in_line_item         # which line in pricing_breakdown, OR "overhead absorbed"
+            - cost_visible                # boolean - is this a costed line or absorbed
 
     vfm_ratio_consideration:
-      prompt: "If buyer uses VfM ratio, our quality-to-price positioning"
-      condition: "buyer_pricing_method == 'vfm_ratio'"
+      prompt: >
+        If buyer uses VfM ratio, our quality-to-price positioning. A 3%
+        price increase is worth taking if it buys 5% quality increase.
+        Completely different optimisation from relative scoring.
+      condition: "inputs.buyer_pricing_method == 'vfm_ratio'"
       required:
         target_quality_score_pct:
           type: number
-        price_position:               # premium / mid / sharp
+        price_position:                  # sharp / mid / premium
+          type: string
+        vfm_ratio_projected:             # quality_score / price - the actual scored ratio
+          type: number
+        rationale:
           type: string
 
   evidence_minimums:
-    documented_assumptions: 3
+    documented_assumptions: 15           # raised from 3
+    exclusions_itemised: 3
     scoreable_items_strategised: 1
-    line_items_complete: "matches buyer template"
+    cross_section_reconciliation_entries: 1
+    cost_transparency_top_line_items: 3
+    template_compliance_confirmed: 1
 
   scoring_check:
-    assumptions_complete:
-      fail_if: 'price quoted without documented assumptions'
+    method_acknowledged:
+      severity: blocking
+      fail_if: 'buyer pricing method not identified or wrong method assumed'
+      rationale: 'Pricing to the wrong method produces the wrong shape of bid'
+    assumptions_minimum:
+      severity: blocking
+      fail_if: 'fewer than 15 documented assumptions'
+      rationale: 'Few assumptions signal concealed risk; buyers reject bids on this basis'
     template_compliance:
-      rule: every line in buyer's pricing template is filled
+      severity: blocking
+      fail_if: 'buyer template structure modified, rows added, or named ranges changed'
+      rationale: 'Non-compliance with buyer template is grounds for bid rejection'
     abnormal_low_check:
-      fail_if: 'total price < 70% of independently calculated cost baseline (manual review required)'
+      severity: blocking
+      fail_if: 'total price < 70% of internal cost baseline AND no abnormally-low protection content present'
+      rationale: 'Sharp pricing without defence is disqualification risk'
+    score_modelling_present:
+      fail_if: 'no score_modelling section, OR confidence rated as "unmodelled" without justification from BidPricingHistory check'
+    volume_tiers_when_allowed:
+      fail_if: 'inputs.volume_tiers_allowed is true AND no volume_tiers offered'
+    indexation_for_multiyear:
+      fail_if: 'inputs.contract_duration_years > 1 AND no year_by_year_basis specified'
     exclusions_explicit:
-      fail_if: 'scope exclusions left implicit'
+      fail_if: 'scope exclusions buried in narrative rather than itemised'
+    cross_section_pricing_complete:
+      severity: blocking
+      rule: 'every commitment in §3.1-§3.6 must appear in cross_section_pricing_reconciliation as either a costed line OR explicitly absorbed in overhead'
+      rationale: 'Unpriced commitments are the leading cause of post-award contract disputes'
+    cost_transparency_offered:
+      fail_if: 'no category-level breakdown for top-3 line items'
+    historical_method_consistency:
+      rule: 'if historical_buyer_method_pattern available, current method should match unless rationale for change is documented'
 
   failure_modes:
-    - "Assumptions left undocumented (caveats lost in evaluation)"
-    - "Pricing template incomplete"
-    - "Lowest-cost strategy on buyer using VfM ratio"
-    - "No abnormal-low defence"
-    - "Exclusions hidden in narrative rather than itemised"
+    - "Buyer pricing method not identified [BLOCKING]"
+    - "Pricing optimised for wrong method (lowest cost on VfM ratio buyer)"
+    - "Fewer than 15 documented assumptions [BLOCKING]"
+    - "Buyer template structure modified [BLOCKING]"
+    - "Sharp price without abnormally-low protection content [BLOCKING]"
+    - "No score modelling done"
+    - "Volume tiers omitted when schedule allows"
+    - "Flat pricing across multi-year contract"
+    - "Full CPI indexation giving away inflation upside"
+    - "Exclusions hidden in narrative"
+    - "No cost transparency on largest line items"
+    - "No cross-section pricing reconciliation [BLOCKING]"
+    - "Commitments in quality sections not priced or absorbed [BLOCKING]"
     - "Payment terms missing or unfavourable"
+    - "VfM ratio buyer; bidder optimised for lowest price"
 
 # =============================================================================
 # CROSS-CUTTING RULES
 # =============================================================================
 
 cross_cutting_rules:
+
+  vault_feedback_dependencies:
+    description: >
+      The drafting agent reads two feedback streams from the vault on every
+      bid it touches. These streams turn the vault from a static evidence
+      library into a learning system: the more bids that flow through, the
+      more accurate the drafting becomes. This is a system-level
+      requirement, not optional. Tenant-locked - one tenant's feedback
+      never feeds another tenant's drafting.
+    streams:
+      bid_pricing_history:
+        purpose: >
+          Score-modelling. Every bid that produces an outcome enriches the
+          model of price points that win and lose. After 20-30 bids the
+          agent can suggest a price-to-win range; after 50+ it predicts
+          competitor pricing distributions with useful accuracy.
+        consumed_by:
+          pricing_schedule_template: "score_modelling.competitor_price_assumption"
+          pricing_schedule_template: "score_modelling.modelled_combined_score"
+          pricing_schedule_template: "scoreable_optimisation.market_baseline_price"
+          pricing_schedule_template: "pricing_method_acknowledgement.rationale_from_history"
+        agent_responsibilities:
+          - "Query BidPricingHistory for comparable past bids before drafting pricing"
+          - "Surface to user: 'we bid £X on similar work; won/lost; winner price £Y; we delivered for £Z'"
+          - "If no historical data available, mark score_modelling.confidence as 'unmodelled' with rationale"
+      bid_feedback_record:
+        purpose: >
+          Calibration signal for the entire template system. Tells whether
+          templates are producing 5s or just look like they should. Stops
+          the same mistake recurring across bids.
+        consumed_by:
+          all_quality_templates: "drafting prompts include past feedback on similar questions"
+          all_quality_templates: "validation pass flags responses that repeat past low-scoring patterns"
+        agent_responsibilities:
+          - "Query BidFeedbackRecord for past feedback on similar questions (same template_id, same buyer or sector)"
+          - "Surface to user: 'On [past tender], this question scored X/Y. Feedback: [specific gap]. We addressed it by [specific change]'"
+          - "Flag any draft that repeats a known low-scoring pattern from past feedback"
+    ingestion_workflow:
+      result_tracking_workflow:
+        triggered_at: "bid submission"
+        initial_status: "awaiting_outcome"
+        status_transitions:
+          - awaiting_outcome
+          - won
+          - lost
+          - withdrew
+          - no_decision
+        on_outcome_recorded: "prompt user to request and upload debrief"
+        on_debrief_uploaded: "Claude extracts structured BidFeedbackRecord; user confirms before vault commit"
+      delivery_cost_reconciliation:
+        triggered_at: "contract close OR annually for multi-year contracts"
+        initiated_by: "human (depends on finance data outside platform)"
+        records: "actual delivered cost vs bid cost per line item, fed back to BidPricingHistory"
+    hard_rule:
+      no_cross_tenant_leakage: >
+        Both streams are tenant-locked. Tenant A's pricing history never
+        informs Tenant B's drafting, even when the agent is operating in
+        the same database. Enforced at query level via mandatory tenant_id
+        filter and audited per query.
+
+  visual_identity_isolation:
+    description: >
+      Top-level architectural principle for the design subsystem. A tenant's
+      brand foundation and any generated layouts derived from it are owned
+      by that tenant and never reused for any other tenant. This ensures
+      that two competing bidders using the platform produce visually
+      distinct outputs even on the same tender, and that no two case
+      studies anywhere in the platform share a layout fingerprint.
+    enforcement:
+      brand_foundation_tenant_locked:
+        rule: >
+          Every brand asset (logo, palette, typography, photo treatment LUT,
+          infographic style, tone of voice profile) is stored against
+          tenant_id with strict isolation. No system-wide defaults that
+          could leak between tenants.
+      generative_engine_seeds_from_tenant_only:
+        rule: >
+          The variation rules read brand foundation values from the tenant
+          record. Two tenants running the engine on the same day with
+          similar inputs produce different outputs because the foundations
+          differ.
+      layout_fingerprint_uniqueness:
+        rule: >
+          Every generated case study layout produces a fingerprint hash of
+          its composition decisions (hero position, pull-quote placement,
+          infographic type, accent rules, etc.). Before any layout is
+          committed, the fingerprint is checked against the platform-wide
+          layout_fingerprint table. On collision, generation parameters
+          are perturbed and retried until uniqueness is achieved.
+        scope: platform_wide
+      audit_per_output:
+        rule: >
+          Every generated output records tenant_id, brand_foundation_version,
+          layout_fingerprint, and generation parameters in the audit log.
+          This enables verification that isolation has been maintained and
+          provides defence against any IP or visual-similarity claims.
+    data_model_requirements:
+      tables_requiring_tenant_id:
+        - brand_foundation
+        - brand_assets
+        - photo_treatment_luts
+        - typography_profiles
+        - tone_of_voice_profiles
+        - case_study_master_records
+        - generated_layouts
+        - client_consent_register
+        - photo_consent_records
+      platform_wide_uniqueness_constraints:
+        - layout_fingerprint (UNIQUE across all tenants)
+    onboarding_dependency:
+      rule: >
+        Case study generation cannot run for a tenant until that tenant's
+        brand foundation is complete. Brand foundation setup is a Phase 5
+        onboarding step gating access to the case study generator.
 
   language_rules:
     mirror_buyer_vocabulary:
