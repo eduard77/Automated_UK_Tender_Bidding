@@ -486,6 +486,183 @@ const CURRENCY_SYMBOL: Record<string, string> = {
   USD: "$",
 };
 
+// ---------------------------------------------------------------------------
+// Portal registry types + helpers
+// ---------------------------------------------------------------------------
+
+export type LoginType =
+  | "none"
+  | "email_only"
+  | "username_password"
+  | "2fa"
+  | "oauth"
+  | "unknown";
+
+export type AdapterStatus =
+  | "not_started"
+  | "stub"
+  | "read_only"
+  | "full"
+  | "deprecated";
+
+export type Priority = "critical" | "high" | "medium" | "low";
+
+export type ExtractedFrom =
+  | "description"
+  | "additional_information"
+  | "documents"
+  | "contact"
+  | "parties";
+
+export type SightingType =
+  | "tender_link"
+  | "document_link"
+  | "contact_email"
+  | "reference_text";
+
+export interface Portal {
+  id: number;
+  domain: string;
+  display_name: string;
+  url_patterns: string[];
+  login_type: LoginType;
+  adapter_status: AdapterStatus;
+  adapter_module: string | null;
+  priority: Priority;
+  tender_count: number;
+  first_seen_at: string;
+  last_seen_at: string;
+  classification_data: Record<string, unknown> | null;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PortalSighting {
+  id: number;
+  portal_id: number | null;
+  tender_id: number;
+  url: string;
+  extracted_from: ExtractedFrom;
+  sighting_type: SightingType;
+  extracted_at: string;
+  tender_title: string | null;
+}
+
+export interface PortalDetail extends Portal {
+  recent_sightings: PortalSighting[];
+}
+
+export interface ListPortalsParams {
+  adapter_status?: AdapterStatus | "";
+  priority?: Priority | "";
+  search?: string;
+  has_login_type?: LoginType | "";
+  sort?: "tender_count" | "last_seen" | "first_seen" | "priority" | "";
+  limit?: number;
+  offset?: number;
+}
+
+export interface PortalUpdate {
+  display_name?: string;
+  login_type?: LoginType;
+  priority?: Priority;
+  adapter_status?: AdapterStatus;
+  adapter_module?: string | null;
+  notes?: string | null;
+}
+
+export interface BlocklistEntry {
+  id: number;
+  domain: string;
+  reason: string | null;
+  added_at: string;
+  added_by: string;
+}
+
+export function portalsPath(params: ListPortalsParams = {}): string {
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined || v === null || v === "") continue;
+    q.set(k, String(v));
+  }
+  const qs = q.toString();
+  return `/portals${qs ? `?${qs}` : ""}`;
+}
+
+export const listPortals = (params: ListPortalsParams = {}) =>
+  request<Portal[]>(portalsPath(params));
+
+export const getPortal = (id: number) => request<PortalDetail>(`/portals/${id}`);
+
+export const updatePortal = (id: number, body: PortalUpdate) =>
+  request<Portal>(`/portals/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+
+export const deprecatePortal = (id: number) =>
+  request<Portal>(`/portals/${id}`, { method: "DELETE" });
+
+export const reclassifyPortal = (id: number) =>
+  request<{ portal_id: number; status: string; queued: boolean }>(
+    `/portals/${id}/classify`,
+    { method: "POST" },
+  );
+
+export const listSightings = (portalId: number, offset = 0, limit = 50) =>
+  request<PortalSighting[]>(
+    `/portals/${portalId}/sightings?offset=${offset}&limit=${limit}`,
+  );
+
+export const listBlocklist = () =>
+  request<BlocklistEntry[]>("/portal-blocklist");
+
+export const addBlocklistDomain = (body: { domain: string; reason?: string }) =>
+  request<BlocklistEntry>("/portal-blocklist", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
+export const removeBlocklistDomain = (id: number) =>
+  request<void>(`/portal-blocklist/${id}`, { method: "DELETE" });
+
+const ADAPTER_STATUS_LABELS: Record<AdapterStatus, string> = {
+  not_started: "Not started",
+  stub: "Stub",
+  read_only: "Read-only",
+  full: "Full",
+  deprecated: "Deprecated",
+};
+
+export function adapterStatusLabel(s: AdapterStatus): string {
+  return ADAPTER_STATUS_LABELS[s] ?? s;
+}
+
+const LOGIN_TYPE_LABELS: Record<LoginType, string> = {
+  none: "None",
+  email_only: "Email only",
+  username_password: "Username + password",
+  "2fa": "Two-factor",
+  oauth: "OAuth",
+  unknown: "Unknown",
+};
+
+export function loginTypeLabel(s: LoginType): string {
+  return LOGIN_TYPE_LABELS[s] ?? s;
+}
+
+const PRIORITY_LABELS: Record<Priority, string> = {
+  critical: "Critical",
+  high: "High",
+  medium: "Medium",
+  low: "Low",
+};
+
+export function priorityLabel(p: Priority): string {
+  return PRIORITY_LABELS[p] ?? p;
+}
+
 export function formatValue(
   amount: string | number | null,
   currency: string | null,

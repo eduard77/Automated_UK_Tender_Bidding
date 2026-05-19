@@ -12,6 +12,7 @@ const NAV_LINKS: NavLink[] = [
   { href: "/", label: "Today", matches: (p) => p === "/" || p.startsWith("/tenders") },
   { href: "/filters", label: "Filters" },
   { href: "/vault", label: "Vault", matches: (p) => p.startsWith("/vault") },
+  { href: "/portals", label: "Portals", matches: (p) => p.startsWith("/portals") },
   // Placeholders for routes that will exist later — keep the nav identical to
   // the v2 mockup but make them inert so users can see the surface area.
   { href: "/tenders", label: "Tenders", matches: (p) => p.startsWith("/tenders") && p !== "/" },
