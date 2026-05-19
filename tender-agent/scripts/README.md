@@ -48,6 +48,28 @@ Each version is backed by a small `.txt` blob under
 storage layout mirrors what S3 will use in prod, so `storage_key` reads the
 same under either backend.
 
+## `backfill_portal_discovery.py`
+
+Walks every existing tender through the portal-discovery pipeline. Creates
+`Portal` rows for previously-unseen external domains, inserts
+`PortalUrlSighting` rows for every URL / email surfaced from descriptions,
+documents, and `additionalInformation`, and queues Claude classification for
+each new portal. Safe to re-run: identical sightings are skipped.
+
+```bash
+docker compose exec -T --user root app /opt/venv/bin/python \
+    /app/scripts/backfill_portal_discovery.py
+
+# Skip classification (no Claude calls) — useful when ANTHROPIC_API_KEY
+# is unset or you just want raw discovery against a fresh DB.
+docker compose exec -T --user root app /opt/venv/bin/python \
+    /app/scripts/backfill_portal_discovery.py --no-classify
+```
+
+Safety: refuses to run when `TENDER_AGENT_ENV=production`. Batched with
+LIMIT/OFFSET (200 tenders per batch by default) — no server-side cursors,
+deliberately, after the cursor-state bug from the previous prompt run.
+
 ## `validate_extractor.py`
 
 Runs the requirements extractor against real tenders and produces a markdown

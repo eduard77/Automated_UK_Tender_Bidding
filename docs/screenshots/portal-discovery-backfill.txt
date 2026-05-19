@@ -1,0 +1,41 @@
+Backfilling portal discovery against 2438 tenders (batch_size=200, classify=no)
+
+Processed 200/2438 tenders, found 306 portals so far
+Processed 400/2438 tenders, found 531 portals so far
+Processed 600/2438 tenders, found 732 portals so far
+Processed 800/2438 tenders, found 852 portals so far
+Processed 1000/2438 tenders, found 1028 portals so far
+Processed 1200/2438 tenders, found 1209 portals so far
+Processed 1400/2438 tenders, found 1442 portals so far
+Processed 1600/2438 tenders, found 1473 portals so far
+Processed 1800/2438 tenders, found 1500 portals so far
+Processed 2000/2438 tenders, found 1518 portals so far
+Processed 2200/2438 tenders, found 1544 portals so far
+Processed 2400/2438 tenders, found 1563 portals so far
+Processed 2438/2438 tenders, found 1571 portals so far
+
+Done. tenders_processed=2438, new_portals=1571, new_sightings=3887, classifications_queued=0, elapsed=17.4s
+
+Top 20 portals by tender_count:
+  rank  tenders  domain                                            display_name
+  ----------------------------------------------------------------------------------------------------
+     1      206  nhs.net                                           nhs.net
+     2       65  multiquote.com                                    multiquote.com
+     3       65  suppliers.multiquote.com                          suppliers.multiquote.com
+     4       65  buckscc.gov.uk                                    buckscc.gov.uk
+     5       63  justice.gov.uk                                    justice.gov.uk
+     6       49  tfl.gov.uk                                        tfl.gov.uk
+     7       35  haringey.gov.uk                                   haringey.gov.uk
+     8       33  mod.gov.uk                                        mod.gov.uk
+     9       33  delta-esourcing.com                               delta-esourcing.com
+    10       32  westsussex.gov.uk                                 westsussex.gov.uk
+    11       30  eastsussex.gov.uk                                 eastsussex.gov.uk
+    12       29  suffolk.gov.uk                                    suffolk.gov.uk
+    13       28  derbyshire.gov.uk                                 derbyshire.gov.uk
+    14       25  leicester.gov.uk                                  leicester.gov.uk
+    15       23  procontract.due-north.com                         procontract.due-north.com
+    16       22  wales.nhs.uk                                      wales.nhs.uk
+    17       22  defra.gov.uk                                      defra.gov.uk
+    18       20  lincolnshire.gov.uk                               lincolnshire.gov.uk
+    19       18  uksbs.co.uk                                       uksbs.co.uk
+    20       18  nationalhighways.co.uk                            nationalhighways.co.uk
