@@ -16,6 +16,8 @@ from tender_agent.schemas import NormalisedTender
 from tender_agent.services import filter_engine, push
 from tender_agent.services.deduplicator import find_duplicate
 from tender_agent.services.document_downloader import download_documents_for_tender
+from tender_agent.services.portal_classifier import schedule_classification
+from tender_agent.services.portal_discovery import process_tender_for_portals
 from tender_agent.services.requirements_extractor import extract_requirements
 
 logger = structlog.get_logger(__name__)
@@ -150,8 +152,17 @@ async def poll_source(db: Session, source: Source) -> PollRun:
                 elif action == "updated":
                     updated_count += 1
                     matched_profile_ids = _record_filter_matches(db, tender)
+                # Best-effort portal discovery; never blocks the tender upsert.
+                queued_portal_ids: list[int] = []
+                try:
+                    result = process_tender_for_portals(tender, db)
+                    queued_portal_ids = result.portal_ids_queued
+                except Exception:  # noqa: BLE001
+                    logger.warning("portal_discovery.failed", tender_id=tender.id)
                 # commit per record so a later failure doesn't lose progress
                 db.commit()
+                for portal_id in queued_portal_ids:
+                    schedule_classification(portal_id)
                 # Enrich matched tenders with documents + requirements, then dispatch
                 # push notifications for the newly created matches. Push is
                 # best-effort; failures are logged in services/push and never
