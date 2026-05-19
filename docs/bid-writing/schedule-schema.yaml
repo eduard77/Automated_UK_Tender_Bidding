@@ -1,0 +1,396 @@
+# Schedule Schema
+#
+# Canonical structured format for any contract delivery schedule in the system.
+# One source of truth, three consumers:
+#
+#   1. methodology_delivery template (§3.2) — populates project_plan, mobilisation,
+#      decision_gates, resource_plan, critical_path_summary
+#   2. Web Gantt editor — interactive editing in the dashboard
+#   3. Typst PDF render — bid-ready output, brand-consistent with the rest of the
+#      bid document
+#
+# No external import/export. No .mpp / XER / P6 / Asta / CSV interop. The schedule
+# lives in the platform.
+#
+# Tenant-locked: every schedule carries tenant_id (see cross_cutting_rules in
+# templates.yaml). Brand foundation drives visual styling in both editor and PDF.
+
+schema_version: "1.0"
+
+# =============================================================================
+# Root schedule object
+# =============================================================================
+
+schedule:
+  id:
+    type: uuid
+    description: "Stable schedule ID, survives edits"
+  tenant_id:
+    type: uuid
+    required: true
+    description: "Tenant ownership; enforced at DB level via RLS"
+  bid_id:
+    type: uuid
+    required: true
+    description: "Bid this schedule belongs to during bidding"
+  project_id:
+    type: uuid
+    required: false
+    description: "Populated when bid is won and schedule transitions to live delivery"
+  state:
+    type: enum
+    allowed: [draft, agent_generated, user_edited, baselined, live, closed]
+    description: >
+      draft           - empty or partial, being built
+      agent_generated - agent has populated from methodology inputs; no human edits
+      user_edited     - user has modified; not yet baselined
+      baselined       - locked snapshot taken; current state can drift from baseline
+      live            - bid was won; schedule is now the delivery plan
+      closed          - contract complete; schedule retained for reconciliation
+  schema_version:
+    type: string
+    description: "Schedule schema version this object conforms to"
+  created_at:
+    type: datetime
+  updated_at:
+    type: datetime
+  created_by_user_id:
+    type: uuid
+
+# =============================================================================
+# Contract context
+# =============================================================================
+
+  contract_context:
+    contract_duration_months:
+      type: integer
+      required: true
+    contract_start_date:
+      type: date
+      description: "Planned contract start; week 1 is the week containing this date"
+    contract_end_date:
+      type: date
+    contract_value_gbp:
+      type: number
+    granularity:
+      type: enum
+      allowed: [day, week, month]
+      default: week
+      description: "Display granularity for the Gantt visual"
+    working_days_per_week:
+      type: integer
+      default: 5
+    holidays:
+      type: list[date]
+      description: "Public holidays and known non-working days affecting scheduling"
+
+# =============================================================================
+# Workstreams (parallel lanes in the Gantt)
+# =============================================================================
+
+  workstreams:
+    type: list
+    min_items: 1
+    description: >
+      Parallel workstreams shown as separate lanes in the Gantt. Typical
+      workstreams: technical_delivery, operations, social_value, commercial,
+      governance. Each tenant can define their own taxonomy.
+    item_fields:
+      - id                              # stable, e.g. WS1
+      - name                            # display name
+      - sort_order                      # display order in the Gantt
+      - colour_accent_ref               # ref into tenant brand foundation palette
+      - owner_role                      # named role accountable
+      - description
+
+# =============================================================================
+# Phases (groupings of tasks within a workstream)
+# =============================================================================
+
+  phases:
+    type: list
+    min_items: 1
+    item_fields:
+      - id                              # stable, e.g. P1
+      - workstream_id                   # which workstream this phase sits in
+      - name                            # e.g. "Mobilisation", "Steady-state operation"
+      - start_week                      # week from contract start
+      - end_week
+      - colour_treatment                # ref into tenant brand foundation
+      - description
+
+# =============================================================================
+# Tasks (the work units shown as bars in the Gantt)
+# =============================================================================
+
+  tasks:
+    type: list
+    min_items: 1
+    item_fields:
+      - id                              # stable, survives edits; e.g. T-0001
+      - phase_id                        # which phase this task belongs to
+      - workstream_id                   # which workstream
+      - name                            # display name
+      - description                     # longer detail
+      - start_week                      # week from contract start (or absolute date if granularity=day)
+      - start_date                      # absolute date if granularity=day
+      - duration_weeks                  # number of weeks (or days)
+      - duration_days
+      - end_week
+      - end_date
+      - on_critical_path                # boolean, calculated
+      - float_weeks                     # 0 if on critical path, otherwise positive
+      - completion_pct                  # 0-100, for live-state schedules
+      - is_milestone                    # boolean - point-in-time event with zero duration
+      - is_summary                      # boolean - rolls up children, not directly schedulable
+      - parent_task_id                  # for hierarchical WBS (summary tasks have children)
+      - sort_order                      # within parent
+      - resources:
+          type: list
+          item_fields:
+            - resource_id               # links to resources block below
+            - allocation_pct            # 0-100, what % of their time on this task
+            - role_on_task              # e.g. "lead", "support", "reviewer"
+      - vault_citations:
+          type: list[uuid]
+          description: >
+            VaultDocumentVersion IDs supporting any commitments embedded in this
+            task (e.g. methodology, capability, prior delivery). Cited by the
+            methodology_delivery template.
+      - notes
+      - locked                          # boolean - prevents drag-edit in the editor
+
+# =============================================================================
+# Milestones (special tasks with zero duration, often gate decisions)
+# =============================================================================
+
+  milestones:
+    type: list
+    description: >
+      Milestones can also exist as tasks with is_milestone=true. This list is the
+      same data flattened for easy reference by the methodology_delivery template
+      and for highlight in the Gantt visual.
+    item_fields:
+      - id                              # links to corresponding task.id
+      - name
+      - week                            # week from contract start
+      - date                            # absolute date
+      - milestone_type:
+          allowed: [delivery, decision_gate, contractual, regulatory, external]
+      - on_critical_path
+      - gate_criteria:                  # for decision gates - the conditions to pass
+          type: list[string]
+      - fail_consequence                # what happens if gate fails
+      - owner_role                      # named role accountable
+      - linked_methodology_template_ref # e.g. "methodology_delivery.decision_gates[2]"
+
+# =============================================================================
+# Dependencies (links between tasks)
+# =============================================================================
+
+  dependencies:
+    type: list
+    item_fields:
+      - id                              # stable
+      - predecessor_task_id
+      - successor_task_id
+      - type:
+          allowed: [finish_to_start, start_to_start, finish_to_finish, start_to_finish]
+          default: finish_to_start
+      - lag_weeks                       # positive = delay, negative = lead time
+      - lag_days
+      - is_critical                     # boolean - is this link on the critical path
+
+# =============================================================================
+# Resources (who delivers the work)
+# =============================================================================
+
+  resources:
+    type: list
+    item_fields:
+      - id                              # stable, e.g. R1
+      - role                            # e.g. "Programme Manager"
+      - named_individual                # optional - "Sarah Smith, CEng MIET"
+      - fte_capacity                    # 1.0 = full-time
+      - cost_per_day_gbp                # for cost reconciliation
+      - phase_active_ids                # which phases this resource works in
+      - vault_cv_id                     # optional vault link to named CV
+
+  resource_curve:
+    type: list
+    description: >
+      Calculated total FTE per workstream per week. Drives the resource_plan
+      slot in methodology_delivery and the resource histogram below the Gantt
+      in the editor.
+    item_fields:
+      - week
+      - workstream_id
+      - total_fte                       # sum of (resource.fte * task.allocation_pct) for active tasks
+
+# =============================================================================
+# Critical path (calculated)
+# =============================================================================
+
+  critical_path:
+    task_ids:
+      type: list[uuid]
+      description: "Tasks on the critical path, in sequence"
+    total_duration_weeks:
+      type: integer
+    float_summary:
+      type: string
+      description: "One-line summary of float across non-critical tasks"
+
+# =============================================================================
+# Baseline (snapshot for drift tracking)
+# =============================================================================
+
+  baseline:
+    description: >
+      A baseline is a snapshot of the schedule at a point in time. The agent
+      generates the initial schedule as baseline_0. The user can baseline
+      again before bid submission (baseline_submitted), and again when the
+      contract starts (baseline_live). Drift is calculated current vs baseline.
+    type: list
+    item_fields:
+      - id
+      - name                            # e.g. "agent_generated", "bid_submitted", "contract_start"
+      - snapshot_at                     # datetime
+      - snapshot_by_user_id
+      - schedule_snapshot               # full schedule object frozen at this point
+
+# =============================================================================
+# Display configuration (drives editor and PDF render)
+# =============================================================================
+
+  display:
+    brand_foundation_id:
+      type: uuid
+      description: "Reference to tenant brand foundation; drives colours and typography"
+    layout_variant:
+      type: enum
+      allowed: [standard, compact, detailed]
+      default: standard
+    show_resource_histogram:
+      type: boolean
+      default: true
+    show_critical_path_highlight:
+      type: boolean
+      default: true
+    show_baseline_overlay:
+      type: boolean
+      default: false
+      description: "Show baseline bars behind current bars to visualise drift"
+    pdf_page_size:
+      type: enum
+      allowed: [a3_landscape, a4_landscape, a4_portrait]
+      default: a3_landscape
+    title_block:
+      contract_name:
+        type: string
+      buyer_name:
+        type: string
+      bid_reference:
+        type: string
+      schedule_version:
+        type: string
+      generated_at:
+        type: datetime
+
+# =============================================================================
+# Edit history (audit log for the schedule)
+# =============================================================================
+
+  edit_history:
+    type: list
+    description: >
+      Every user edit to the schedule. Source of truth for who changed what
+      when. Replayable - given the agent-generated state and the edit history,
+      the current state can be reconstructed.
+    item_fields:
+      - id
+      - edited_at                       # datetime
+      - edited_by_user_id
+      - operation:
+          allowed:
+            - task_added
+            - task_moved
+            - task_resized
+            - task_deleted
+            - dependency_added
+            - dependency_changed
+            - dependency_deleted
+            - resource_assigned
+            - resource_unassigned
+            - milestone_added
+            - milestone_deleted
+            - phase_added
+            - phase_changed
+            - workstream_added
+            - baseline_taken
+            - field_edited
+      - target_object_type              # task, dependency, resource, etc.
+      - target_object_id
+      - previous_state                  # JSON snapshot of the object before change
+      - new_state                       # JSON snapshot after change
+      - rationale                       # optional user note
+
+# =============================================================================
+# Validation rules
+# =============================================================================
+
+validation:
+
+  schedule_integrity:
+    no_orphan_tasks:
+      rule: "every task.phase_id and task.workstream_id must resolve to an existing phase/workstream"
+    no_dangling_dependencies:
+      rule: "every dependency.predecessor_task_id and successor_task_id must resolve to existing tasks"
+    no_circular_dependencies:
+      rule: "task dependency graph must be acyclic"
+    no_negative_durations:
+      rule: "task.end_week >= task.start_week; milestones have duration=0"
+    contract_window_compliance:
+      rule: "all tasks within contract_context.contract_start_date and contract_end_date"
+    critical_path_recalculated:
+      rule: "critical_path is recalculated on every edit operation"
+
+  methodology_template_alignment:
+    description: >
+      The schedule must produce data that satisfies the methodology_delivery
+      template's evidence_minimums. The editor and agent both enforce these.
+    rules:
+      milestones_with_week_dates:
+        rule: "schedule.milestones must contain at least 4 entries with week values"
+      milestones_on_critical_path_identified:
+        rule: "at least 1 milestone must have on_critical_path=true"
+      decision_gates_with_pass_criteria:
+        rule: "milestones with milestone_type=decision_gate must populate gate_criteria"
+      mobilisation_weeks_detailed:
+        rule: "first phase must contain tasks with at least 4 weeks of detail"
+      resource_phases_with_fte:
+        rule: "resources block must contain at least 2 phase assignments with fte_capacity > 0"
+
+  brand_foundation_required:
+    severity: blocking
+    rule: "display.brand_foundation_id must resolve to a complete tenant brand foundation before PDF render"
+    rationale: "Cannot produce bid-ready PDF without tenant visual identity"
+
+# =============================================================================
+# Cross-references to templates.yaml
+# =============================================================================
+
+# This schedule schema feeds the following methodology_delivery template slots
+# (see templates.yaml v1.6 §3.2):
+#
+# - project_plan.milestones        <- schedule.milestones
+# - project_plan.decision_gates    <- schedule.milestones where milestone_type=decision_gate
+# - project_plan.critical_path_summary <- schedule.critical_path
+# - mobilisation.mobilisation_weeks <- tasks in first phase, weeks 1-4 (or 1-6)
+# - resource_plan.phases           <- schedule.phases + schedule.resources
+# - resource_plan.resource_curve_summary <- one-line derived from schedule.resource_curve
+# - exit_transition                <- last phase, named "Exit" or similar
+#
+# The drafting agent populates the methodology_delivery template by querying
+# the schedule object, not by re-inventing milestones in prose. One source,
+# multiple views, no duplication.
