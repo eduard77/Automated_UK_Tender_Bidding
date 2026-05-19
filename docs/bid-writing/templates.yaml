@@ -1,0 +1,896 @@
+# Bid Response Templates
+#
+# Structured specification for writing UK public-sector tender responses that
+# consistently score 5/5 on the standard 0-5 evaluation scale.
+#
+# Each template has 5 parts:
+#   1. inputs           — what to gather BEFORE writing
+#   2. response         — the slots that make up the answer, each with a prompt
+#                         and required sub-fields
+#   3. evidence_minimums — quantified bar; below these the response cannot 5
+#   4. scoring_check    — fail conditions from the qualitative drivers analysis
+#   5. failure_modes    — common ways responses lose marks; final filter
+#
+# The drafting agent uses this as a JSON Schema source. Every required field
+# becomes structured output the agent must produce. Every fail_if becomes a
+# validator that blocks submission until resolved.
+
+schema_version: "1.0"
+
+# =============================================================================
+# SHARED INPUTS — every response type gathers these first
+# =============================================================================
+
+shared_inputs:
+  question_text:           # verbatim from ITT
+    type: string
+    required: true
+  question_weight_pct:     # % of quality score
+    type: number
+    required: true
+  word_limit:
+    type: integer
+    required: true
+  evaluation_criteria:     # verbatim from ITT or appendix
+    type: string
+    required: true
+  buyer_context:
+    strategy_docs:         # list of named buyer documents reviewed
+      type: list[string]
+      min_items: 1
+    operational_context:   # the buyer's specific situation
+      type: string
+    priorities:            # NPPS, sector plan, councillor priorities
+      type: list[string]
+
+# =============================================================================
+# 3.1 TECHNICAL CAPABILITY
+# =============================================================================
+
+technical_capability:
+  description: >
+    Used when the question asks how you will technically deliver the service or
+    product. Typically the highest-weighted single quality question (20-40%).
+
+  inputs:
+    inherits: shared_inputs
+
+  response:
+    headline:
+      prompt: "In one sentence, what will you do and what's the outcome?"
+      max_words: 30
+      required: true
+
+    methodology:
+      prompt: "Named phases, standards, and decision gates?"
+      required:
+        methodology_name:       # PRINCE2, ITIL, Agile, custom — must be named
+          type: string
+        phases:
+          type: list
+          min_items: 3
+          item_fields: [name, deliverable, duration]
+        standards:
+          type: list
+          item_fields: [name, certificate_number, expiry_date]
+          min_items: 1
+        quality_gates:
+          type: list[string]
+          min_items: 2
+
+    buyer_fit:
+      prompt: "Why does THIS approach fit THIS buyer?"
+      required:
+        strategy_reference:     # paraphrased reference to a named buyer doc
+          type: string
+        specific_adaptation:    # what we change for them
+          type: string
+
+    evidence:
+      prompt: "Which 1-2 case studies match best?"
+      required:
+        case_studies:
+          type: list
+          min_items: 1
+          max_items: 2
+          item_fields: [client_or_label, value_gbp, year, outcome_metric, vault_id]
+
+    team:
+      prompt: "Who specifically delivers this?"
+      required:
+        named_people:
+          type: list
+          min_items: 2
+          item_fields: [name, role, qualification, years_experience, similar_project]
+
+    risks:
+      prompt: "Top 2-3 risks SPECIFIC to this contract"
+      required:
+        risks:
+          type: list
+          min_items: 2
+          max_items: 3
+          item_fields: [risk, mitigation, owner]
+
+    added_value:
+      prompt: "What do you provide BEYOND the spec, quantified?"
+      required:
+        prefix_label: "Beyond specification:"
+        items:
+          type: list
+          min_items: 1
+          item_fields: [description, quantification, value_to_buyer]
+
+    kpis:
+      prompt: "Numeric KPIs you accept measurement against"
+      required:
+        kpis:
+          type: list
+          min_items: 3
+          item_fields: [metric, target, measurement_method]
+
+  evidence_minimums:
+    named_clients: 1
+    certificate_numbers: 1
+    named_people: 2
+    numeric_kpis: 3
+    buyer_doc_references: 1
+    quantified_added_value: 1
+
+  scoring_check:
+    methodology_named:
+      fail_if: 'response contains "best practice" or "industry standard" without naming a specific methodology'
+    evidence_density:
+      rule: claim_to_evidence_ratio >= 0.7
+      definition: every "we have" / "we will" claim has a corresponding named, datable proof point
+    case_study_relevance:
+      rules:
+        - sector_match: true
+        - value_within_pct: 50
+        - recency_years_max: 3
+    named_people:
+      fail_if: 'response contains "experienced team" or "qualified engineers" with no named individuals'
+    contract_specific:
+      fail_if: 'risks listed could be copy-pasted to any bid without modification'
+
+  failure_modes:
+    - "Opens with company introduction instead of direct answer"
+    - 'Uses "best practice" without naming the practice'
+    - "Experience claims without client / value / date"
+    - "Generic risks (staff turnover, supply chain disruption)"
+    - "Added value not explicitly flagged or quantified"
+    - "No numeric KPIs"
+    - "No reference to buyer's specific strategy"
+    - "Exceeds word limit"
+
+# =============================================================================
+# 3.2 METHODOLOGY / DELIVERY PLAN
+# =============================================================================
+
+methodology_delivery:
+  description: >
+    Used when the question asks how the work will be organised and delivered
+    over time. Focus on milestones, mobilisation, resourcing, and reporting.
+
+  inputs:
+    inherits: shared_inputs
+
+  response:
+    headline:
+      prompt: "In one sentence, what's the delivery approach and overall duration?"
+      max_words: 30
+      required: true
+
+    project_plan:
+      prompt: "Milestones, decision gates, and durations?"
+      required:
+        milestones:
+          type: list
+          min_items: 4
+          item_fields: [name, week_from_start, deliverable, gate_criteria]
+        critical_path_summary:
+          type: string
+
+    mobilisation:
+      prompt: "Week-by-week ramp for the first 4-6 weeks?"
+      required:
+        mobilisation_weeks:
+          type: list
+          min_items: 4
+          max_items: 6
+          item_fields: [week_number, activities, outputs]
+
+    resource_plan:
+      prompt: "FTE by role across the contract phases?"
+      required:
+        resources:
+          type: list
+          min_items: 1
+          item_fields: [role, fte_count, phase_active, named_lead]
+
+    stakeholder_engagement:
+      prompt: "Who do you engage, when, and how?"
+      required:
+        engagement:
+          type: list
+          min_items: 3
+          item_fields: [stakeholder_group, frequency, format, owner]
+
+    change_control:
+      prompt: "What named mechanism handles scope changes?"
+      required:
+        mechanism_name:           # e.g. PRINCE2 Exception, ITIL Change Mgt
+          type: string
+        approval_route:
+          type: string
+        sla_for_decisions:
+          type: string
+
+    reporting_cadence:
+      prompt: "Frequency, format, and attendees of progress reporting?"
+      required:
+        cadences:
+          type: list
+          min_items: 2
+          item_fields: [frequency, format, attendees, deliverable]
+
+    evidence:
+      prompt: "Case studies of similar-scale mobilisations?"
+      required:
+        case_studies:
+          type: list
+          min_items: 1
+          item_fields: [client_or_label, value_gbp, year, mobilisation_outcome, vault_id]
+
+    risks:
+      prompt: "Delivery risks specific to this contract"
+      required:
+        risks:
+          type: list
+          min_items: 2
+          max_items: 3
+          item_fields: [risk, mitigation, owner]
+
+    added_value:
+      prompt: "What do you provide BEYOND the delivery spec?"
+      required:
+        items:
+          type: list
+          min_items: 1
+          item_fields: [description, quantification]
+
+    kpis:
+      prompt: "Delivery KPIs you accept measurement against"
+      required:
+        kpis:
+          type: list
+          min_items: 3
+          item_fields: [metric, target, measurement_method]
+
+  evidence_minimums:
+    milestones_with_dates: 4
+    mobilisation_weeks_detailed: 4
+    named_resources_with_fte: 1
+    reporting_cadences: 2
+
+  scoring_check:
+    milestones_dated:
+      fail_if: 'milestones lack a week_from_start or month value'
+    resource_specifics:
+      fail_if: 'resource plan says "team" or "experts" without FTE counts'
+    reporting_specifics:
+      fail_if: 'cadence says "regular updates" or "as required" without frequency'
+    mobilisation_detail:
+      rule: mobilisation_weeks must include week-by-week activities for weeks 1-4 minimum
+    change_control_named:
+      fail_if: 'change control mechanism is "managed appropriately" without naming a process'
+
+  failure_modes:
+    - "Project plan in months not weeks"
+    - 'Reporting described as "regular" without frequency'
+    - "Resourcing without FTE numbers"
+    - "No mobilisation detail"
+    - "Change control unnamed"
+    - "Stakeholder engagement generic (no named groups or owners)"
+
+# =============================================================================
+# 3.3 SOCIAL VALUE (PPN 002 / Social Value Model)
+# =============================================================================
+
+social_value:
+  description: >
+    Mandatory minimum 10% weighting in central government tenders (PPN 002,
+    mandatory from 1 Oct 2025). Buyer specifies a Model Social Value Question
+    (MSVQ) against one of 8 Policy Outcomes under 5 Missions. Commitments
+    become contractual.
+
+  inputs:
+    inherits: shared_inputs
+    additional:
+      selected_policy_outcome:
+        type: string
+        required: true
+        description: "Must be one of the 8 SVM outcomes the buyer signposted"
+      msvq_text:
+        type: string
+        required: true
+        description: "The exact Model Social Value Question from the ITT"
+
+  response:
+    headline:
+      prompt: "In one line, what is your headline social value commitment?"
+      max_words: 30
+      required: true
+
+    policy_outcome_alignment:
+      prompt: "Why is this Policy Outcome the right fit for this contract?"
+      required:
+        outcome_name:
+          type: string
+        rationale:
+          type: string
+        buyer_priority_link:    # link to the buyer's SV strategy if published
+          type: string
+
+    commitments:
+      prompt: "SMART commitments — Specific, Measurable, Achievable, Relevant, Time-bound"
+      required:
+        commitments:
+          type: list
+          min_items: 3
+          item_fields:
+            - description           # "12 local apprenticeships starting within 6 months"
+            - quantity              # numeric value
+            - unit                  # apprenticeships / jobs / £ / tCO2 / etc.
+            - timebound             # specific milestone date
+            - delivery_partner      # named partner or in-house team
+            - srm_metric            # which Standard Reporting Metric this maps to
+
+    delivery_method:
+      prompt: "Who delivers each commitment, how, and when?"
+      required:
+        delivery:
+          type: list
+          min_items: 3
+          item_fields: [commitment_ref, who, how, when, evidence_of_capability]
+
+    measurement_and_reporting:
+      prompt: "How is delivery measured and reported to the buyer?"
+      required:
+        srm_or_tom_used:          # SRM (PPN 002) or TOM System
+          type: string
+        reporting_frequency:
+          type: string
+          allowed: [monthly, quarterly, biannual, annual]
+        verification:             # internal / independent / third-party
+          type: string
+        sv_lead_named:            # named person responsible
+          type: string
+
+    track_record:
+      prompt: "Previous social value commitments delivered, with evidence"
+      required:
+        previous_delivery:
+          type: list
+          min_items: 2
+          item_fields: [contract_or_client, commitment_made, outcome_achieved, year, evidence_doc_id]
+
+    stretch_commitment:
+      prompt: "Beyond-baseline commitment with a trigger condition"
+      required:
+        commitment:
+          type: string
+        trigger_condition:        # what activates the stretch
+          type: string
+
+    governance:
+      prompt: "Who owns SV delivery and how is it embedded in contract management?"
+      required:
+        named_sv_lead:
+          type: string
+        review_cadence:
+          type: string
+        consequence_of_underdelivery:
+          type: string
+
+  evidence_minimums:
+    smart_commitments: 3
+    quantified_commitments: 3
+    named_delivery_partners: 1
+    previous_delivery_evidence: 2
+    named_sv_lead: 1
+
+  scoring_check:
+    smart_test:
+      fail_if: 'any commitment lacks number + unit + date'
+    aspirational_language:
+      fail_if: 'commitments use "support", "promote", "encourage" without measurable outputs'
+    track_record_specific:
+      fail_if: 'previous delivery without contract names or numbers'
+    policy_outcome_match:
+      rule: selected_policy_outcome matches buyer's signposted outcome
+    deliverability:
+      fail_if: 'commitments cannot be evidenced in the vault as previously delivered or capability proven'
+
+  failure_modes:
+    - 'Commitments use "we will support local communities" without numbers'
+    - 'Carbon reduction without baseline year'
+    - 'No named SV lead'
+    - "No previous delivery evidence"
+    - 'Generic claims that could apply to any contract'
+    - "Stretch commitment has no trigger"
+    - "Commitments exceed delivery capacity (will fail contract management)"
+
+# =============================================================================
+# 3.4 QUALITY MANAGEMENT
+# =============================================================================
+
+quality_management:
+  description: >
+    How quality is built in, measured, and continuously improved across the
+    contract lifetime.
+
+  inputs:
+    inherits: shared_inputs
+
+  response:
+    headline:
+      prompt: "In one sentence, what quality framework underpins delivery?"
+      max_words: 30
+      required: true
+
+    quality_framework:
+      prompt: "Named QMS certifications with numbers and expiry"
+      required:
+        certifications:
+          type: list
+          min_items: 1
+          item_fields: [standard, certificate_number, expiry_date, scope]
+
+    quality_at_each_phase:
+      prompt: "How quality is built into each delivery phase, not bolted on"
+      required:
+        phases:
+          type: list
+          min_items: 3
+          item_fields: [phase_name, quality_activity, evidence_produced]
+
+    continuous_improvement:
+      prompt: "Named CI methodology and review cadence"
+      required:
+        methodology_name:         # PDCA, Six Sigma, Lean, Kaizen
+          type: string
+        review_cadence:
+          type: string
+        recent_improvement_example:
+          type: string
+
+    customer_satisfaction:
+      prompt: "How customer satisfaction is measured and acted on"
+      required:
+        measurement_methods:
+          type: list
+          min_items: 2
+          item_fields: [method, frequency, target_score]
+        complaint_handling_sla:
+          type: string
+
+    audit_regime:
+      prompt: "Internal and external audit frequency and last result"
+      required:
+        internal_audit_frequency:
+          type: string
+        external_audit_frequency:
+          type: string
+        last_external_audit_result:
+          type: string         # "Zero non-conformances at 2024 ISO audit"
+
+    recent_quality_outcome:
+      prompt: "Recent quality outcome from a comparable contract"
+      required:
+        client_or_label:
+          type: string
+        outcome:
+          type: string         # specific, with numbers
+        vault_evidence_id:
+          type: string
+
+  evidence_minimums:
+    cert_numbers: 1
+    qms_phases_detailed: 3
+    satisfaction_methods: 2
+    audit_results: 1
+
+  scoring_check:
+    cert_specificity:
+      fail_if: '"ISO certified" appears without certificate number'
+    phase_specificity:
+      fail_if: 'quality described only at "delivery" not at each phase'
+    ci_methodology_named:
+      fail_if: 'continuous improvement described without naming the method'
+    satisfaction_quantified:
+      fail_if: 'no target score or threshold given for customer satisfaction'
+
+  failure_modes:
+    - '"ISO 9001 certified" without cert number'
+    - "Quality treated as end-of-phase check, not built in"
+    - "Continuous improvement described abstractly"
+    - "Customer satisfaction without measurable target"
+    - "Audit frequency without last result"
+
+# =============================================================================
+# 3.5 RISK AND CONTINGENCY
+# =============================================================================
+
+risk_contingency:
+  description: >
+    Risk register, mitigation strategies, escalation, and contingency plans.
+    Risks MUST be specific to this contract — generic risks score 3 not 5.
+
+  inputs:
+    inherits: shared_inputs
+
+  response:
+    headline:
+      prompt: "In one sentence, what is your risk approach and what are the top exposure areas?"
+      max_words: 30
+      required: true
+
+    methodology:
+      prompt: "How risks are identified, scored, and reviewed"
+      required:
+        identification_method:    # workshops, lessons learned, scenario analysis
+          type: string
+        scoring_scale:            # how L and I are scored
+          type: string
+        review_cadence:
+          type: string
+
+    risk_register:
+      prompt: "Top 5-8 risks SPECIFIC to this contract, with L/M/H and mitigation"
+      required:
+        risks:
+          type: list
+          min_items: 5
+          max_items: 8
+          item_fields:
+            - risk                  # specific to this contract
+            - likelihood            # L / M / H
+            - impact                # L / M / H
+            - score                 # L*I rationale
+            - mitigation            # specific action
+            - owner                 # named role
+            - target_residual_score
+
+    top_three_narrative:
+      prompt: "Narrative around the 3 highest risks"
+      required:
+        narratives:
+          type: list
+          min_items: 3
+          max_items: 3
+          item_fields: [risk_ref, why_significant, mitigation_detail, contingency_trigger]
+
+    contingency_plans:
+      prompt: "Pre-defined plans triggered by specific events"
+      required:
+        plans:
+          type: list
+          min_items: 2
+          item_fields: [trigger_event, response_action, decision_owner, time_to_activate]
+
+    escalation_route:
+      prompt: "Who escalates to whom, with timescales"
+      required:
+        levels:
+          type: list
+          min_items: 3
+          item_fields: [level, role, timescale, decision_authority]
+
+    review_cadence:
+      prompt: "How often the risk register is reviewed and with whom"
+      required:
+        internal_review:
+          type: string
+        client_review:
+          type: string
+
+  evidence_minimums:
+    contract_specific_risks: 5
+    named_owners: 5
+    contingency_plans: 2
+    escalation_levels: 3
+
+  scoring_check:
+    risks_specific:
+      fail_if: 'any risk could be copy-pasted to a different contract without modification'
+    owners_named:
+      fail_if: 'risk owner is "project team" rather than a named role'
+    mitigations_specific:
+      fail_if: 'mitigation says "monitor closely" or "manage carefully" without a defined action'
+    contingencies_have_triggers:
+      fail_if: 'contingency plan lacks a specific trigger event'
+
+  failure_modes:
+    - 'Generic risks ("staff turnover", "supply chain disruption")'
+    - "No L/M/H scoring rationale"
+    - 'Owners listed as "team" or "management"'
+    - '"Monitor and manage" as mitigation'
+    - "Contingency plans without triggers"
+    - "Escalation without timescales"
+
+# =============================================================================
+# 3.6 CASE STUDIES
+# =============================================================================
+
+case_study:
+  description: >
+    Used both standalone and embedded in other responses. A case study scores
+    by relevance match to the current tender on six axes.
+
+  inputs:
+    inherits: shared_inputs
+    additional:
+      tender_criteria_to_emphasise:
+        type: list[string]
+        required: true
+        description: "Which of THIS tender's criteria the case study foregrounds"
+
+  response:
+    client_identification:
+      prompt: "Named client or anonymised label?"
+      required:
+        client_name_or_label:
+          type: string
+        anonymised:
+          type: boolean
+        sector:
+          type: string
+        location:
+          type: string
+
+    contract_facts:
+      prompt: "Hard facts about the contract"
+      required:
+        value_gbp:
+          type: number
+        duration_months:
+          type: integer
+        start_date:
+          type: date
+        end_date:
+          type: date
+        services_delivered:
+          type: list[string]
+          min_items: 1
+
+    challenge:
+      prompt: "What problem was the client facing?"
+      required:
+        challenge_description:
+          type: string
+        why_difficult:
+          type: string
+
+    approach:
+      prompt: "How did you tackle it?"
+      required:
+        approach_description:
+          type: string
+        methodology_used:
+          type: string
+
+    outcomes:
+      prompt: "Measurable outcomes with numbers"
+      required:
+        outcomes:
+          type: list
+          min_items: 2
+          item_fields: [metric, before_value, after_value, % change]
+
+    testimonial:
+      prompt: "Client quote with named referee"
+      required:
+        quote:
+          type: string
+        attribution_name:
+          type: string
+        attribution_role:
+          type: string
+        referee_contactable:
+          type: boolean
+
+    visual:
+      prompt: "Photo or diagram if the template allows"
+      required:
+        asset_id:
+          type: string         # reference to vault asset
+        caption:
+          type: string
+
+    relevance_mapping:
+      prompt: "Why this case study fits THIS tender"
+      required:
+        mappings:
+          type: list
+          min_items: 1
+          item_fields: [tender_criterion, case_study_element, similarity_strength]
+
+  evidence_minimums:
+    quantified_outcomes: 2
+    testimonials: 1
+    relevance_mappings: 1
+    photos_or_diagrams: 1   # if template allows
+
+  scoring_check:
+    sector_match:
+      rule: sector matches or is adjacent to tender sector
+    value_proximity:
+      rule: contract value within ±50% of tender value
+    recency:
+      rule: end_date within 3 years of tender response date
+    outcomes_quantified:
+      fail_if: 'outcomes lack numeric values'
+    testimonial_attributed:
+      fail_if: 'quote without named attribution'
+
+  failure_modes:
+    - "Generic outcomes (improved efficiency, increased satisfaction)"
+    - "Anonymous testimonial"
+    - "Sector mismatch"
+    - "Value mismatch (£50M case study for a £500k tender)"
+    - "Older than 3 years without justification"
+    - "No mapping to current tender criteria"
+
+# =============================================================================
+# 3.7 PRICING SCHEDULE
+# =============================================================================
+
+pricing_schedule:
+  description: >
+    Quality scores are absolute; price scores are usually relative. Pricing
+    structure protects margin while maximising score against the buyer's
+    chosen method (relative scoring or VfM ratio).
+
+  inputs:
+    inherits: shared_inputs
+    additional:
+      buyer_pricing_method:
+        type: string
+        required: true
+        allowed: [relative, vfm_ratio, lowest_compliant, fixed_with_quality]
+      pricing_template:
+        type: string         # path to buyer's Excel template
+        required: true
+      price_weighting_pct:
+        type: number
+        required: true
+
+  response:
+    pricing_breakdown:
+      prompt: "Complete pricing schedule per the buyer's template"
+      required:
+        line_items:
+          type: list
+          min_items: 1
+          item_fields: [description, unit, qty, unit_price, total, is_scoreable]
+        sum_total:
+          type: number
+
+    assumptions:
+      prompt: "Every assumption underpinning the price, in writing"
+      required:
+        assumptions:
+          type: list
+          min_items: 3
+          item_fields: [assumption, impact_if_invalid]
+
+    exclusions:
+      prompt: "What is NOT included, explicitly"
+      required:
+        exclusions:
+          type: list
+          item_fields: [exclusion, rationale]
+
+    scoreable_optimisation:
+      prompt: "How pricing is sharpened on heavily-weighted scoreable items"
+      required:
+        strategy_per_scoreable_item:
+          type: list
+          min_items: 1
+          item_fields: [item_ref, weighting, our_strategy]
+
+    abnormal_low_protection:
+      prompt: "Defence against abnormally-low-bid rejection"
+      required:
+        sustainability_evidence:    # show pricing is deliverable
+          type: string
+        living_wage_compliance:     # if labour-heavy
+          type: boolean
+        margin_disclosed:           # optional, used when buyer scrutinises
+          type: boolean
+
+    payment_terms:
+      prompt: "Proposed payment terms"
+      required:
+        terms:
+          type: string                # e.g. "Monthly in arrears, NET 30"
+        early_payment_discount:
+          type: string                # optional
+
+    vfm_ratio_consideration:
+      prompt: "If buyer uses VfM ratio, our quality-to-price positioning"
+      condition: "buyer_pricing_method == 'vfm_ratio'"
+      required:
+        target_quality_score_pct:
+          type: number
+        price_position:               # premium / mid / sharp
+          type: string
+
+  evidence_minimums:
+    documented_assumptions: 3
+    scoreable_items_strategised: 1
+    line_items_complete: "matches buyer template"
+
+  scoring_check:
+    assumptions_complete:
+      fail_if: 'price quoted without documented assumptions'
+    template_compliance:
+      rule: every line in buyer's pricing template is filled
+    abnormal_low_check:
+      fail_if: 'total price < 70% of independently calculated cost baseline (manual review required)'
+    exclusions_explicit:
+      fail_if: 'scope exclusions left implicit'
+
+  failure_modes:
+    - "Assumptions left undocumented (caveats lost in evaluation)"
+    - "Pricing template incomplete"
+    - "Lowest-cost strategy on buyer using VfM ratio"
+    - "No abnormal-low defence"
+    - "Exclusions hidden in narrative rather than itemised"
+    - "Payment terms missing or unfavourable"
+
+# =============================================================================
+# CROSS-CUTTING RULES
+# =============================================================================
+
+cross_cutting_rules:
+
+  language_rules:
+    mirror_buyer_vocabulary:
+      description: "Use the buyer's exact terms (e.g. 'service users' not 'customers')"
+    no_filler:
+      banned_openings:
+        - "It is worth noting that"
+        - "We are pleased to confirm that"
+        - "It goes without saying that"
+        - "As you would expect"
+    active_voice_commitments:
+      preferred: "We will deploy"
+      avoided: "Deployment will be undertaken"
+    every_will_has_a_have:
+      rule: 'every "we will" claim must be backed by a corresponding "we have" elsewhere in the bid'
+
+  pre_submission_checklist:
+    content:
+      - direct_answer_in_first_two_lines
+      - named_specific_evidence_per_claim
+      - at_least_one_numeric_kpi
+      - mirrors_buyer_language
+      - references_buyer_strategy
+      - added_value_explicitly_flagged
+    compliance:
+      - within_word_limit
+      - buyer_template_used_if_mandated
+      - mandatory_documents_attached_and_in_date
+      - commitments_deliverable
+    quality:
+      - no_uncited_claim
+      - no_generic_boilerplate
+      - active_voice
+      - spell_and_grammar_checked
+      - cross_references_valid
+    final:
+      - independent_internal_review
+      - red_team_review
+      - sections_sum_to_maximum_possible_score
