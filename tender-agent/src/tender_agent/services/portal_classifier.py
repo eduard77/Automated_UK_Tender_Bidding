@@ -18,9 +18,9 @@ import json
 import queue
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from collections.abc import Callable
 from typing import Any
 
 import httpx
