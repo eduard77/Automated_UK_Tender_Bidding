@@ -19,7 +19,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -401,4 +401,97 @@ class VaultDocumentVersion(Base):
     document: Mapped[VaultDocument] = relationship(
         back_populates="versions", foreign_keys=[document_id]
     )
+
+
+class Portal(Base):
+    """A procurement portal we've discovered — typically a buyer-hosted or
+    aggregator-hosted site that publishes ITT documents and gates them behind
+    login / registration.
+
+    Created lazily the first time a URL from this domain appears in any
+    ingested tender. Classification is performed asynchronously by Claude;
+    until then the row is a placeholder with sensible defaults.
+    """
+
+    __tablename__ = "portals"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    domain: Mapped[str] = mapped_column(Text, nullable=False)
+    display_name: Mapped[str] = mapped_column(Text, nullable=False)
+    url_patterns: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+    login_type: Mapped[str] = mapped_column(Text, nullable=False, default="unknown")
+    adapter_status: Mapped[str] = mapped_column(
+        Text, nullable=False, default="not_started"
+    )
+    adapter_module: Mapped[str | None] = mapped_column(Text)
+    priority: Mapped[str] = mapped_column(Text, nullable=False, default="medium")
+    tender_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    classification_data: Mapped[dict | None] = mapped_column(JSONB)
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    sightings: Mapped[list[PortalUrlSighting]] = relationship(
+        back_populates="portal", cascade="all, delete-orphan"
+    )
+
+
+class PortalUrlSighting(Base):
+    """One observed URL on a tender, linked to a Portal once the domain is
+    associated. Multiple sightings per (portal, tender) are expected — e.g.
+    the description has a link, and three document attachments live on the
+    same domain.
+    """
+
+    __tablename__ = "portal_url_sightings"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    portal_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("portals.id", ondelete="CASCADE"),
+        index=True,
+    )
+    tender_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("tenders.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    extracted_from: Mapped[str] = mapped_column(Text, nullable=False)
+    sighting_type: Mapped[str] = mapped_column(Text, nullable=False)
+    extracted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    portal: Mapped[Portal | None] = relationship(back_populates="sightings")
+    tender: Mapped[Tender] = relationship()
+
+
+class PortalBlocklistDomain(Base):
+    """Domains we never cluster as portals. Seeded with our own source
+    domains (Contracts Finder, etc.), social media, and the gov.uk apex;
+    user-managed via the dashboard."""
+
+    __tablename__ = "portal_blocklist_domains"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    domain: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    reason: Mapped[str | None] = mapped_column(Text)
+    added_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    added_by: Mapped[str] = mapped_column(Text, nullable=False, default="system")
 
