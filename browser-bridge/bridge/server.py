@@ -1,0 +1,286 @@
+"""The browser bridge FastAPI app.
+
+Runs natively on Windows (NOT in Docker) and owns a real, visible Chrome via
+Playwright. The Docker backend drives it over this local HTTP API, secured by a
+shared token. The user logs in by hand in the visible window; the bridge never
+sees or stores a password — only the resulting cookies (on disk, in the
+persistent context).
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import contextlib
+import mimetypes
+import re
+import time
+from contextlib import asynccontextmanager
+
+from fastapi import Depends, FastAPI, Header, HTTPException
+from pydantic import BaseModel
+
+from bridge import config
+from bridge.sessions import SessionManager, authenticated_guess
+
+manager = SessionManager()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    try:
+        yield
+    finally:
+        await manager.shutdown()
+
+
+app = FastAPI(title="Tender Agent Browser Bridge", version="0.1.0", lifespan=lifespan)
+
+
+def require_token(x_bridge_token: str | None = Header(default=None)) -> None:
+    """Reject anything that doesn't present the shared token. This is what stops
+    arbitrary local processes from driving the user's logged-in browser."""
+    expected = config.bridge_token()
+    if not expected or x_bridge_token != expected:
+        raise HTTPException(status_code=401, detail="invalid or missing bridge token")
+
+
+# --- request models -----------------------------------------------------
+
+
+class OpenSessionBody(BaseModel):
+    platform_slug: str
+    start_url: str | None = None
+
+
+class WaitForLoginBody(BaseModel):
+    success_url_pattern: str
+    login_url: str | None = None
+    timeout_seconds: int = 600
+
+
+class NavigateBody(BaseModel):
+    url: str
+
+
+class FindLinksBody(BaseModel):
+    pattern: str
+
+
+class DownloadBody(BaseModel):
+    url: str
+    dest_filename: str | None = None
+
+
+class ClickDownloadBody(BaseModel):
+    selector: str
+    dest_filename: str | None = None
+
+
+class ScreenshotBody(BaseModel):
+    label: str = "screenshot"
+
+
+# --- health (no token: availability probe only) ------------------------
+
+
+@app.get("/health")
+async def health() -> dict:
+    return {"status": "ok", "service": "browser-bridge", "version": "0.1.0"}
+
+
+# --- session endpoints (all require the token) -------------------------
+
+
+async def _page_state(session) -> tuple[str, bool]:
+    page = session.page
+    current_url = page.url
+    try:
+        html = await page.content()
+    except Exception:  # noqa: BLE001
+        html = ""
+    return current_url, authenticated_guess(current_url, html)
+
+
+def _require_session(slug: str):
+    session = manager.get(slug)
+    if session is None:
+        raise HTTPException(status_code=404, detail="session not open")
+    return session
+
+
+@app.post("/session/open")
+async def open_session(
+    body: OpenSessionBody, _: None = Depends(require_token)
+) -> dict:
+    session = await manager.open(body.platform_slug, body.start_url)
+    current_url, guess = await _page_state(session)
+    return {
+        "session_id": body.platform_slug,
+        "current_url": current_url,
+        "authenticated_guess": guess,
+    }
+
+
+@app.get("/session/{slug}/status")
+async def session_status(slug: str, _: None = Depends(require_token)) -> dict:
+    session = manager.get(slug)
+    if session is None:
+        return {"exists": False, "current_url": None, "authenticated_guess": False}
+    current_url, guess = await _page_state(session)
+    return {"exists": True, "current_url": current_url, "authenticated_guess": guess}
+
+
+@app.post("/session/{slug}/wait-for-login")
+async def wait_for_login(
+    slug: str, body: WaitForLoginBody, _: None = Depends(require_token)
+) -> dict:
+    session = _require_session(slug)
+    page = session.page
+    if body.login_url:
+        with contextlib.suppress(Exception):
+            await page.goto(body.login_url, wait_until="domcontentloaded")
+    # Bring the visible window forward so the user notices it.
+    with contextlib.suppress(Exception):
+        await page.bring_to_front()
+
+    pattern = re.compile(body.success_url_pattern)
+    deadline = time.monotonic() + max(2, body.timeout_seconds)
+    while time.monotonic() < deadline:
+        current_url = page.url or ""
+        if pattern.search(current_url):
+            return {"status": "logged_in", "current_url": current_url}
+        await asyncio.sleep(2)
+    return {"status": "timeout", "current_url": page.url}
+
+
+@app.post("/session/{slug}/navigate")
+async def navigate(
+    slug: str, body: NavigateBody, _: None = Depends(require_token)
+) -> dict:
+    session = _require_session(slug)
+    try:
+        resp = await session.page.goto(body.url, wait_until="domcontentloaded")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"navigation failed: {exc}") from exc
+    title = ""
+    with contextlib.suppress(Exception):
+        title = await session.page.title()
+    return {
+        "current_url": session.page.url,
+        "status_code": resp.status if resp else None,
+        "title": title,
+    }
+
+
+@app.get("/session/{slug}/page-text")
+async def page_text(slug: str, _: None = Depends(require_token)) -> dict:
+    session = _require_session(slug)
+    try:
+        text = await session.page.inner_text("body")
+    except Exception:  # noqa: BLE001
+        text = ""
+    return {"current_url": session.page.url, "text": text}
+
+
+@app.get("/session/{slug}/page-html")
+async def page_html(slug: str, _: None = Depends(require_token)) -> dict:
+    session = _require_session(slug)
+    try:
+        html = await session.page.content()
+    except Exception:  # noqa: BLE001
+        html = ""
+    return {"current_url": session.page.url, "html": html}
+
+
+@app.post("/session/{slug}/find-links")
+async def find_links(
+    slug: str, body: FindLinksBody, _: None = Depends(require_token)
+) -> dict:
+    session = _require_session(slug)
+    hrefs: list[str] = await session.page.eval_on_selector_all(
+        "a[href]", "els => els.map(e => e.href)"
+    )
+    pattern = re.compile(body.pattern)
+    matched = [h for h in hrefs if h and pattern.search(h)]
+    return {"links": matched}
+
+
+@app.post("/session/{slug}/download")
+async def download(
+    slug: str, body: DownloadBody, _: None = Depends(require_token)
+) -> dict:
+    session = _require_session(slug)
+    # Use the context's request API so the download carries the session cookies.
+    try:
+        resp = await session.context.request.get(body.url)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"download failed: {exc}") from exc
+    if resp.status >= 400:
+        raise HTTPException(status_code=502, detail=f"download http {resp.status}")
+    data = await resp.body()
+    filename = _safe_name(body.dest_filename or _name_from_url(body.url))
+    path = config.download_dir() / filename
+    path.write_bytes(data)
+    mime = resp.headers.get("content-type", "").split(";")[0] or _guess_mime(filename)
+    return {
+        "path": filename,
+        "size_bytes": len(data),
+        "mime_type": mime,
+        "b64": base64.b64encode(data).decode("ascii") if len(data) < 1_000_000 else None,
+    }
+
+
+@app.post("/session/{slug}/click-download")
+async def click_download(
+    slug: str, body: ClickDownloadBody, _: None = Depends(require_token)
+) -> dict:
+    session = _require_session(slug)
+    page = session.page
+    try:
+        async with page.expect_download() as dl_info:
+            await page.click(body.selector)
+        dl = await dl_info.value
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502, detail=f"click-download failed: {exc}"
+        ) from exc
+    filename = _safe_name(body.dest_filename or dl.suggested_filename or "download.bin")
+    path = config.download_dir() / filename
+    await dl.save_as(str(path))
+    size = path.stat().st_size if path.exists() else 0
+    return {"path": filename, "size_bytes": size, "mime_type": _guess_mime(filename)}
+
+
+@app.post("/session/{slug}/screenshot")
+async def screenshot(
+    slug: str, body: ScreenshotBody, _: None = Depends(require_token)
+) -> dict:
+    session = _require_session(slug)
+    filename = _safe_name(f"{body.label}.png")
+    path = config.download_dir() / filename
+    await session.page.screenshot(path=str(path), full_page=True)
+    return {"path": filename, "size_bytes": path.stat().st_size if path.exists() else 0}
+
+
+@app.post("/session/{slug}/close")
+async def close_session(slug: str, _: None = Depends(require_token)) -> dict:
+    closed = await manager.close(slug)
+    return {"closed": closed}
+
+
+# --- helpers ------------------------------------------------------------
+
+
+def _safe_name(name: str) -> str:
+    name = (name or "file").replace("\\", "/").split("/")[-1]
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", name).lstrip("._")
+    return name[:200] or "file"
+
+
+def _name_from_url(url: str) -> str:
+    tail = url.split("?")[0].rstrip("/").split("/")[-1]
+    return tail or "download.bin"
+
+
+def _guess_mime(filename: str) -> str:
+    return mimetypes.guess_type(filename)[0] or "application/octet-stream"
