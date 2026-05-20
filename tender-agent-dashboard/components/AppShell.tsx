@@ -4,6 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useState } from "react";
 
+import BridgeIndicator from "./BridgeIndicator";
 import PushBell from "./PushBell";
 
 type NavLink = { href: string; label: string; matches?: (p: string) => boolean };
@@ -71,6 +72,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         </div>
 
         <div className="flex items-center gap-4">
+          <BridgeIndicator />
           <PushBell />
           <div
             className="flex h-10 w-10 items-center justify-center rounded-full border border-border-strong font-display text-sm font-medium text-mint-pale"
