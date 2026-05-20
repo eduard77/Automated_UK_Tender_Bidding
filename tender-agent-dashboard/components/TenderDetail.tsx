@@ -1,15 +1,20 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import useSWR from "swr";
 
 import PillKicker from "./PillKicker";
 import {
   ApiError,
+  documentFileUrl,
   fetcher,
+  getFetchStatus,
+  isFetchTaskActive,
+  startFetchDocuments,
   type DocumentRequired,
   type EvaluationCriterion,
+  type FetchTask,
   type QuestionToAnswer,
   type RequirementItem,
   type Tender,
@@ -44,6 +49,42 @@ export default function TenderDetail({ id }: { id: number }) {
     { revalidateOnFocus: false },
   );
 
+  const [fetchTask, setFetchTask] = useState<FetchTask | null>(null);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+  const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const pollTask = useCallback(
+    (taskId: string) => {
+      const tick = async () => {
+        try {
+          const task = await getFetchStatus(id, taskId);
+          setFetchTask(task);
+          if (isFetchTaskActive(task.status)) {
+            pollRef.current = setTimeout(tick, 1500);
+          } else {
+            void documents.mutate();
+          }
+        } catch {
+          setFetchError("Lost track of the fetch task.");
+        }
+      };
+      pollRef.current = setTimeout(tick, 1200);
+    },
+    [id, documents],
+  );
+
+  const startFetch = useCallback(async () => {
+    setFetchError(null);
+    if (pollRef.current) clearTimeout(pollRef.current);
+    try {
+      const task = await startFetchDocuments(id);
+      setFetchTask(task);
+      pollTask(task.task_id);
+    } catch {
+      setFetchError("Couldn't start the document fetch.");
+    }
+  }, [id, pollTask]);
+
   if (tender.error instanceof ApiError && tender.error.status === 404) {
     return <NotFound />;
   }
@@ -71,10 +112,14 @@ export default function TenderDetail({ id }: { id: number }) {
         onReload={() => requirements.mutate()}
       />
       <DocumentsSection
+        tenderId={id}
         files={documents.data ?? null}
         loading={!documents.data && !documents.error}
         error={documents.error}
         onRetry={() => documents.mutate()}
+        onFetch={startFetch}
+        task={fetchTask}
+        fetchError={fetchError}
       />
     </div>
   );
@@ -784,19 +829,47 @@ function QuestionsList({ items }: { items: QuestionToAnswer[] | null }) {
 // ---------------------------------------------------------------------------
 
 function DocumentsSection({
+  tenderId,
   files,
   loading,
   error,
   onRetry,
+  onFetch,
+  task,
+  fetchError,
 }: {
+  tenderId: number;
   files: TenderDocumentFile[] | null;
   loading: boolean;
   error: unknown;
   onRetry: () => void;
+  onFetch: () => void;
+  task: FetchTask | null;
+  fetchError: string | null;
 }) {
+  const active = task != null && isFetchTaskActive(task.status);
   return (
     <section className="space-y-4">
-      <div className="section-eyebrow">Attached documents</div>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="section-eyebrow">Attached documents</div>
+        <button
+          type="button"
+          onClick={onFetch}
+          disabled={active}
+          className="btn-primary disabled:opacity-50"
+        >
+          {active ? "Fetching…" : "Fetch documents"}{" "}
+          <span className="arrow">→</span>
+        </button>
+      </div>
+
+      {fetchError && (
+        <p className="text-danger" style={{ fontSize: "13px" }}>
+          {fetchError}
+        </p>
+      )}
+      {task && <FetchStatusBanner task={task} />}
+
       {error ? (
         <div
           role="alert"
@@ -822,13 +895,15 @@ function DocumentsSection({
         </ul>
       ) : !files?.length ? (
         <p className="text-text-dim italic" style={{ fontSize: "14px" }}>
-          No documents downloaded yet.
+          No documents downloaded yet. Click{" "}
+          <span className="text-text-muted">Fetch documents</span> to pull any
+          publicly available files.
         </p>
       ) : (
         <ul className="space-y-2.5">
           {files.map((f) => (
             <li key={f.id}>
-              <DocumentRow file={f} />
+              <DocumentRow tenderId={tenderId} file={f} />
             </li>
           ))}
         </ul>
@@ -837,7 +912,55 @@ function DocumentsSection({
   );
 }
 
-function DocumentRow({ file }: { file: TenderDocumentFile }) {
+function FetchStatusBanner({ task }: { task: FetchTask }) {
+  const active = isFetchTaskActive(task.status);
+  const tone =
+    task.status === "complete"
+      ? { border: "rgba(151,213,188,0.3)", bg: "rgba(151,213,188,0.06)" }
+      : task.status === "partial"
+        ? { border: "rgba(245,166,35,0.3)", bg: "rgba(245,166,35,0.06)" }
+        : task.status === "error"
+          ? { border: "rgba(248,113,113,0.3)", bg: "rgba(248,113,113,0.06)" }
+          : { border: "rgba(255,255,255,0.12)", bg: "rgba(255,255,255,0.03)" };
+
+  let message: string;
+  if (active) {
+    message = "Fetching documents from the source…";
+  } else if (task.status === "complete" && task.files_count === 0) {
+    message = `No documents available for this tender${
+      task.adapter === "ContractsFinderDirectAdapter" ? " from CF" : ""
+    }.`;
+  } else if (task.status === "complete") {
+    message = `Fetched ${task.files_count} document${task.files_count === 1 ? "" : "s"}.`;
+  } else if (task.status === "partial") {
+    message = `Limited documents available — ${task.files_count} fetched, ${task.missing_count} require login${
+      task.platform_slug ? ` to ${task.platform_slug}` : ""
+    }.`;
+  } else if (task.status === "no_portal") {
+    message = "No known portal hosts this tender's documents.";
+  } else if (task.status === "error") {
+    message = `Fetch failed${task.detail ? `: ${task.detail}` : ""}.`;
+  } else {
+    message = `Status: ${task.status}.`;
+  }
+
+  return (
+    <div
+      role="status"
+      className="rounded-xl border p-4"
+      style={{ borderRadius: "14px", border: `1px solid ${tone.border}`, background: tone.bg }}
+    >
+      <span className="text-text" style={{ fontSize: "13px" }}>
+        {active && <span className="mr-2 inline-block animate-pulse">●</span>}
+        {message}
+      </span>
+    </div>
+  );
+}
+
+function DocumentRow({ tenderId, file }: { tenderId: number; file: TenderDocumentFile }) {
+  const downloadable = file.download_status === "ok";
+  const href = downloadable ? documentFileUrl(tenderId, file.id) : file.url;
   return (
     <div
       className="flex items-center gap-4 rounded-xl border border-border bg-bg-elevated p-5 backdrop-blur-sm"
@@ -846,12 +969,12 @@ function DocumentRow({ file }: { file: TenderDocumentFile }) {
       <DownloadStatusBadge status={file.download_status} />
       <div className="flex-1 min-w-0">
         <a
-          href={file.url}
+          href={href}
           target="_blank"
           rel="noopener noreferrer"
           className="block truncate text-text hover:text-mint-pale focus:outline-none"
           style={{ fontSize: "14px" }}
-          aria-label={`Open ${file.title ?? "document"} (opens in new tab)`}
+          aria-label={`${downloadable ? "Download" : "Open"} ${file.title ?? "document"}`}
         >
           {file.title || file.url}
         </a>

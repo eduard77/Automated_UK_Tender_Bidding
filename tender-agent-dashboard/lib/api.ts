@@ -201,6 +201,37 @@ export const getTenderRequirements = (id: number) =>
 export const getTenderDocuments = (id: number) =>
   request<TenderDocumentFile[]>(`/tenders/${id}/documents`);
 
+export interface FetchTask {
+  task_id: string;
+  tender_id: number;
+  status: string;
+  adapter: string | null;
+  platform_slug: string | null;
+  files_count: number;
+  missing_count: number;
+  detail: string | null;
+  created_at: string;
+  updated_at: string;
+  finished_at: string | null;
+}
+
+export const startFetchDocuments = (tenderId: number) =>
+  request<FetchTask>(`/tenders/${tenderId}/fetch-documents`, { method: "POST" });
+
+export const getFetchStatus = (tenderId: number, taskId: string) =>
+  request<FetchTask>(`/tenders/${tenderId}/fetch-documents/${taskId}`);
+
+// Direct link to a stored document's bytes (served by the backend with a
+// sanitised download filename). Goes through the same /__api proxy.
+export function documentFileUrl(tenderId: number, docId: number): string {
+  return `${API_BASE}/tenders/${tenderId}/documents/${docId}/file`;
+}
+
+// A fetch task is finished once it leaves the queued/running states.
+export function isFetchTaskActive(status: string): boolean {
+  return status === "queued" || status === "running";
+}
+
 export const listFilters = () => request<FilterProfile[]>("/filters");
 
 export const createFilter = (payload: FilterProfileCreate) =>

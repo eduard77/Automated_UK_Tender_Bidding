@@ -543,3 +543,34 @@ class PortalBlocklistDomain(Base):
     )
     added_by: Mapped[str] = mapped_column(Text, nullable=False, default="system")
 
+
+class FetchTask(Base):
+    """One 'fetch documents' run for a tender. Created when the user clicks
+    Fetch documents; updated as the orchestrator progresses. Durable record
+    that replaces the chunk-2 in-memory stub."""
+
+    __tablename__ = "fetch_tasks"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    task_id: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    tender_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("tenders.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="queued")
+    adapter: Mapped[str | None] = mapped_column(Text)
+    platform_slug: Mapped[str | None] = mapped_column(Text)
+    files_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    missing_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    detail: Mapped[str | None] = mapped_column(Text)
+    result: Mapped[dict | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+

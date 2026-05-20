@@ -1,9 +1,11 @@
-"""PortalOrchestrator — the 'click Generate brief' flow up to documents
-downloaded.
+"""PortalOrchestrator — the 'click Fetch documents' flow up to documents on
+disk.
 
-This prompt wires the full control flow and makes it work end-to-end for the
-FallbackAdapter (the only real adapter shipping in chunk 2). Real platform
-adapters plug in via services/portals/registry.ADAPTERS in later prompts.
+Chunk 3 makes this real for Contracts Finder: CF tenders route to the
+ContractsFinderDirectAdapter, which downloads public assets.publishing
+documents; everything else falls back to a best-effort public download.
+Fetched files are persisted as TenderDocumentFile rows (sha256-deduped, so the
+flow is idempotent). Real authenticated portal adapters land in chunk 4+.
 """
 from __future__ import annotations
 
@@ -13,6 +15,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 import structlog
@@ -20,12 +23,15 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from tender_agent.config import settings
-from tender_agent.models import Portal, PortalUrlSighting, Tender
+from tender_agent.models import Portal, PortalUrlSighting, Tender, TenderDocumentFile
 from tender_agent.services.credentials import CredentialsStore
 from tender_agent.services.portals.base import (
     Credentials,
     PortalAdapter,
     PortalContext,
+)
+from tender_agent.services.portals.contracts_finder import (
+    ContractsFinderDirectAdapter,
 )
 from tender_agent.services.portals.registry import (
     get_adapter_for_platform,
@@ -33,12 +39,16 @@ from tender_agent.services.portals.registry import (
 )
 from tender_agent.services.portals.results import (
     AuthStatus,
+    DownloadResult,
     DownloadStatus,
     LocateStatus,
     RegisterStatus,
 )
 
 logger = structlog.get_logger(__name__)
+
+# Source codes whose tenders route to the Contracts Finder direct adapter.
+CF_SOURCE_CODES = {"CF"}
 
 
 class OrchestrationStatus(StrEnum):
@@ -65,6 +75,7 @@ class OrchestrationResult:
     adapter: str | None = None
     files: list[dict] = field(default_factory=list)
     missing: list[str] = field(default_factory=list)
+    files_persisted: int = 0
     detail: str | None = None
 
 
@@ -166,6 +177,23 @@ class PortalOrchestrator:
                 return await self._run(tender_id, user_id, owned_db)
         return await self._run(tender_id, user_id, db)
 
+    def _select_adapter(
+        self, tender: Tender, candidate_urls: list[str], portal: Portal | None
+    ) -> tuple[PortalAdapter, str | None]:
+        """Pick the adapter. CF tenders (by source or asset-host URL) get the
+        ContractsFinderDirectAdapter; otherwise the portal's registered
+        platform adapter, else the FallbackAdapter."""
+        platform_slug = portal.platform.slug if (portal and portal.platform) else None
+        cf = ContractsFinderDirectAdapter()
+        if tender.source_code in CF_SOURCE_CODES or any(
+            cf.matches_url(u) for u in candidate_urls
+        ):
+            return cf, "contracts_finder_direct"
+        registered = get_adapter_for_platform(platform_slug)
+        if registered is not None:
+            return registered(), platform_slug
+        return get_fallback_adapter()(), platform_slug
+
     async def _run(
         self, tender_id: int, user_id: str, db: Session
     ) -> OrchestrationResult:
@@ -178,35 +206,47 @@ class PortalOrchestrator:
             )
 
         portal, sightings = self._select_portal(db, tender_id)
-        if portal is None:
+        candidate_urls = _candidate_urls(tender, sightings)
+
+        cf = ContractsFinderDirectAdapter()
+        is_cf_route = tender.source_code in CF_SOURCE_CODES or any(
+            cf.matches_url(u) for u in candidate_urls
+        )
+        # Nothing to act on: no portal, no URLs, and not a CF tender. (CF
+        # tenders with no public docs still resolve to a complete-but-empty
+        # answer, which the adapter handles.)
+        if portal is None and not candidate_urls and not is_cf_route:
             return OrchestrationResult(
                 status=OrchestrationStatus.no_portal,
                 tender_id=tender_id,
                 detail="no non-deprecated portal with a link sighting",
             )
 
-        platform_slug = portal.platform.slug if portal.platform else None
-        adapter_cls = get_adapter_for_platform(platform_slug) or get_fallback_adapter()
-        adapter: PortalAdapter = adapter_cls()
-        adapter_name = adapter_cls.__name__
+        adapter, platform_slug = self._select_adapter(tender, candidate_urls, portal)
+        adapter_name = type(adapter).__name__
+        portal_id = portal.id if portal else 0
+        domain = portal.domain if portal else (
+            urlparse(candidate_urls[0]).hostname if candidate_urls else ""
+        )
 
         ctx = PortalContext(
-            portal_id=portal.id,
+            portal_id=portal_id,
             user_id=user_id,
-            domain=portal.domain,
-            candidate_urls=_candidate_urls(tender, sightings),
+            domain=domain or "",
+            candidate_urls=candidate_urls,
+            tender_id=tender.id,
         )
 
         http_client: httpx.AsyncClient | None = None
         launched = None
         try:
             if adapter.requires_browser:
-                launched = await self._launch_browser(portal.id, user_id)
+                launched = await self._launch_browser(portal_id, user_id)
                 if launched is None:
                     return OrchestrationResult(
                         status=OrchestrationStatus.error,
                         tender_id=tender_id,
-                        portal_id=portal.id,
+                        portal_id=portal_id or None,
                         platform_slug=platform_slug,
                         adapter=adapter_name,
                         detail="browser context unavailable",
@@ -221,7 +261,7 @@ class PortalOrchestrator:
                 ctx.http = http_client
 
             return await self._drive_adapter(
-                adapter, ctx, tender, portal, platform_slug, adapter_name, user_id
+                db, adapter, ctx, tender, portal, platform_slug, adapter_name, user_id
             )
         finally:
             if http_client is not None:
@@ -251,23 +291,29 @@ class PortalOrchestrator:
 
     async def _drive_adapter(
         self,
+        db: Session,
         adapter: PortalAdapter,
         ctx: PortalContext,
         tender: Tender,
-        portal: Portal,
+        portal: Portal | None,
         platform_slug: str | None,
         adapter_name: str,
         user_id: str,
     ) -> OrchestrationResult:
+        portal_id = portal.id if portal else None
         base = OrchestrationResult(
             status=OrchestrationStatus.error,
             tender_id=tender.id,
-            portal_id=portal.id,
+            portal_id=portal_id,
             platform_slug=platform_slug,
             adapter=adapter_name,
         )
 
-        creds = self._load_credentials(portal.id, user_id)
+        creds = (
+            self._load_credentials(portal_id, user_id)
+            if portal_id is not None
+            else None
+        )
         auth = await adapter.authenticate(ctx, creds)
         if auth.status == AuthStatus.needs_registration:
             base.status = OrchestrationStatus.needs_registration
@@ -275,9 +321,9 @@ class PortalOrchestrator:
             return base
         if auth.status == AuthStatus.invalid_credentials:
             store = self._store()
-            if store is not None:
+            if store is not None and portal_id is not None:
                 try:
-                    store.mark_invalid(portal.id, user_id)
+                    store.mark_invalid(portal_id, user_id)
                 except Exception:  # noqa: BLE001
                     logger.warning("orchestrator.mark_invalid_failed")
             base.status = OrchestrationStatus.credentials_invalid
@@ -314,14 +360,15 @@ class PortalOrchestrator:
         base.files = [
             {
                 "url": f.url,
-                "path": f.path,
                 "filename": f.filename,
                 "bytes": f.bytes,
                 "content_type": f.content_type,
+                "sha256": f.sha256,
             }
             for f in download.files
         ]
         base.missing = list(download.missing)
+        base.files_persisted = self._persist_documents(db, tender, download)
         if download.status == DownloadStatus.complete:
             base.status = OrchestrationStatus.complete
         elif download.status == DownloadStatus.partial:
@@ -333,10 +380,56 @@ class PortalOrchestrator:
             base.detail = download.detail
 
         store = self._store()
-        if store is not None and base.status in (
-            OrchestrationStatus.complete,
-            OrchestrationStatus.partial,
+        if (
+            store is not None
+            and portal_id is not None
+            and base.status
+            in (OrchestrationStatus.complete, OrchestrationStatus.partial)
         ):
             with contextlib.suppress(Exception):
-                store.mark_used(portal.id, user_id)
+                store.mark_used(portal_id, user_id)
         return base
+
+    def _persist_documents(
+        self, db: Session, tender: Tender, download: DownloadResult
+    ) -> int:
+        """Persist downloaded files as TenderDocumentFile rows, deduped by
+        sha256 so re-running fetch never duplicates. Files without a sha256
+        (e.g. from non-persisting adapters in tests) are skipped."""
+        persisted = 0
+        for f in download.files:
+            if not f.sha256 or not f.storage_key:
+                continue
+            existing_sha = db.execute(
+                select(TenderDocumentFile)
+                .where(TenderDocumentFile.tender_id == tender.id)
+                .where(TenderDocumentFile.sha256 == f.sha256)
+                .limit(1)
+            ).scalar_one_or_none()
+            if existing_sha is not None:
+                persisted += 1
+                continue
+            by_url = db.execute(
+                select(TenderDocumentFile)
+                .where(TenderDocumentFile.tender_id == tender.id)
+                .where(TenderDocumentFile.url == f.url)
+                .limit(1)
+            ).scalar_one_or_none()
+            rec = by_url or TenderDocumentFile(tender_id=tender.id, url=f.url)
+            rec.title = f.filename
+            rec.format = (
+                (f.content_type or "").split("/")[-1].split("+")[0] or None
+            )
+            rec.storage_key = f.storage_key
+            rec.storage_backend = "local"
+            rec.bytes = f.bytes
+            rec.sha256 = f.sha256
+            rec.download_status = "ok"
+            rec.error = None
+            rec.downloaded_at = datetime.now(UTC)
+            if by_url is None:
+                db.add(rec)
+            db.flush()
+            persisted += 1
+        db.commit()
+        return persisted

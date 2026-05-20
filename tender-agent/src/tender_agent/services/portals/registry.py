@@ -7,10 +7,15 @@ None so the orchestrator can fall back to FallbackAdapter.
 from __future__ import annotations
 
 from tender_agent.services.portals.base import PortalAdapter
+from tender_agent.services.portals.contracts_finder import (
+    ContractsFinderDirectAdapter,
+)
 from tender_agent.services.portals.fallback import FallbackAdapter
 
 # slug -> adapter class. Populated as real adapters land (prompts 3-9).
-ADAPTERS: dict[str, type[PortalAdapter]] = {}
+ADAPTERS: dict[str, type[PortalAdapter]] = {
+    "contracts_finder_direct": ContractsFinderDirectAdapter,
+}
 
 
 def get_adapter_for_platform(slug: str | None) -> type[PortalAdapter] | None:

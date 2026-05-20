@@ -48,6 +48,10 @@ class DownloadedFile:
     filename: str
     bytes: int
     content_type: str | None = None
+    # Set by adapters that persist real files; the orchestrator dedups by
+    # sha256 and stores storage_key (relative to the document storage root).
+    sha256: str | None = None
+    storage_key: str | None = None
 
 
 @dataclass
