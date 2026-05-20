@@ -23,7 +23,15 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from tender_agent.config import settings
-from tender_agent.models import Portal, PortalUrlSighting, Tender, TenderDocumentFile
+from tender_agent.models import (
+    FetchTask,
+    Portal,
+    PortalUrlSighting,
+    Tender,
+    TenderDocumentFile,
+)
+from tender_agent.services import push
+from tender_agent.services.bridge_client import BridgeClient
 from tender_agent.services.credentials import CredentialsStore
 from tender_agent.services.portals.base import (
     Credentials,
@@ -63,6 +71,11 @@ class OrchestrationStatus(StrEnum):
     register_failed = "register_failed"
     download_failed = "download_failed"
     nothing_available = "nothing_available"
+    # Login-via-human flow (chunk 4)
+    waiting_for_login = "waiting_for_login"
+    needs_user_confirmation = "needs_user_confirmation"
+    bridge_unavailable = "bridge_unavailable"
+    failed = "failed"
     error = "error"
 
 
@@ -115,8 +128,20 @@ class PortalOrchestrator:
     def __init__(
         self,
         credentials_store: CredentialsStore | None = None,
+        bridge: BridgeClient | None = None,
+        login_wait_cycle_seconds: int = 600,
+        login_wait_total_seconds: int = 3600,
     ) -> None:
         self._creds_store = credentials_store
+        self._bridge = bridge
+        # Wait-for-login cadence. Each cycle re-pokes the bridge; the total is
+        # the budget before giving up (so the user can be away). Tests pass
+        # tiny values.
+        self.login_wait_cycle_seconds = login_wait_cycle_seconds
+        self.login_wait_total_seconds = login_wait_total_seconds
+
+    def _get_bridge(self) -> BridgeClient:
+        return self._bridge if self._bridge is not None else BridgeClient()
 
     def _store(self) -> CredentialsStore | None:
         if self._creds_store is not None:
@@ -168,34 +193,48 @@ class PortalOrchestrator:
         return chosen, chosen_sightings
 
     async def fetch_tender_documents(
-        self, tender_id: int, user_id: str = "eduard", db: Session | None = None
+        self,
+        tender_id: int,
+        user_id: str = "eduard",
+        db: Session | None = None,
+        task_id: str | None = None,
+        resume_from_confirm: bool = False,
     ) -> OrchestrationResult:
         if db is None:
             from tender_agent.db import SessionLocal
 
             with SessionLocal() as owned_db:
-                return await self._run(tender_id, user_id, owned_db)
-        return await self._run(tender_id, user_id, db)
+                return await self._run(
+                    tender_id, user_id, owned_db, task_id, resume_from_confirm
+                )
+        return await self._run(tender_id, user_id, db, task_id, resume_from_confirm)
 
     def _select_adapter(
         self, tender: Tender, candidate_urls: list[str], portal: Portal | None
     ) -> tuple[PortalAdapter, str | None]:
-        """Pick the adapter. CF tenders (by source or asset-host URL) get the
-        ContractsFinderDirectAdapter; otherwise the portal's registered
-        platform adapter, else the FallbackAdapter."""
+        """Pick the adapter. A portal's registered platform adapter (Delta, CF,
+        …) wins; then CF by source/asset-host URL; else the FallbackAdapter.
+
+        Registered-first is what routes a Delta-hosted tender to the Delta
+        adapter even when the tender was *listed* on Contracts Finder."""
         platform_slug = portal.platform.slug if (portal and portal.platform) else None
+        registered = get_adapter_for_platform(platform_slug)
+        if registered is not None:
+            return registered(), platform_slug
         cf = ContractsFinderDirectAdapter()
         if tender.source_code in CF_SOURCE_CODES or any(
             cf.matches_url(u) for u in candidate_urls
         ):
             return cf, "contracts_finder_direct"
-        registered = get_adapter_for_platform(platform_slug)
-        if registered is not None:
-            return registered(), platform_slug
         return get_fallback_adapter()(), platform_slug
 
     async def _run(
-        self, tender_id: int, user_id: str, db: Session
+        self,
+        tender_id: int,
+        user_id: str,
+        db: Session,
+        task_id: str | None = None,
+        resume_from_confirm: bool = False,
     ) -> OrchestrationResult:
         tender = db.get(Tender, tender_id)
         if tender is None:
@@ -207,6 +246,16 @@ class PortalOrchestrator:
 
         portal, sightings = self._select_portal(db, tender_id)
         candidate_urls = _candidate_urls(tender, sightings)
+
+        adapter, platform_slug = self._select_adapter(tender, candidate_urls, portal)
+        adapter_name = type(adapter).__name__
+
+        # Login adapters (Delta, …) take a separate bridge-driven path.
+        if adapter.requires_login:
+            return await self._run_login_adapter(
+                db, adapter, tender, portal, platform_slug, adapter_name,
+                user_id, candidate_urls, task_id, resume_from_confirm,
+            )
 
         cf = ContractsFinderDirectAdapter()
         is_cf_route = tender.source_code in CF_SOURCE_CODES or any(
@@ -222,8 +271,6 @@ class PortalOrchestrator:
                 detail="no non-deprecated portal with a link sighting",
             )
 
-        adapter, platform_slug = self._select_adapter(tender, candidate_urls, portal)
-        adapter_name = type(adapter).__name__
         portal_id = portal.id if portal else 0
         domain = portal.domain if portal else (
             urlparse(candidate_urls[0]).hostname if candidate_urls else ""
@@ -268,6 +315,205 @@ class PortalOrchestrator:
                 await http_client.aclose()
             if launched is not None:
                 await launched.close()
+
+    # --- login-via-human path (chunk 4) --------------------------------
+
+    def _set_task(self, db: Session, task_id: str | None, **fields) -> None:
+        if task_id is None:
+            return
+        task = db.execute(
+            select(FetchTask).where(FetchTask.task_id == task_id)
+        ).scalar_one_or_none()
+        if task is None:
+            return
+        for k, v in fields.items():
+            setattr(task, k, v)
+        task.updated_at = datetime.now(UTC)
+        db.commit()
+
+    def _notify_waiting(self, db: Session, tender: Tender, platform_slug: str | None) -> None:
+        try:
+            base = settings.dashboard_base_url.rstrip("/")
+            push.send_system_notification(
+                db,
+                title="Action needed: log in",
+                body=(
+                    f"Log in to {platform_slug or 'the portal'} to fetch documents "
+                    f"for {tender.title}"
+                ),
+                url=f"{base}/tenders/{tender.id}",
+                tag=f"login-{tender.id}",
+            )
+            db.commit()
+        except Exception:  # noqa: BLE001
+            logger.warning("orchestrator.notify_waiting_failed", tender_id=tender.id)
+
+    async def _wait_for_login(
+        self, bridge: BridgeClient, adapter: PortalAdapter, ctx: PortalContext, slug: str
+    ) -> bool:
+        """Re-poke the bridge in cycles until login is detected or the budget is
+        exhausted. Waiting (not failing) while the user is away is deliberate."""
+        import math
+
+        cycle = max(1, self.login_wait_cycle_seconds)
+        total = max(cycle, self.login_wait_total_seconds)
+        iterations = max(1, math.ceil(total / cycle))
+        pattern = adapter.login_success_pattern()
+        for _ in range(iterations):
+            try:
+                res = await bridge.wait_for_login(
+                    slug, pattern, login_url=adapter.login_url(), timeout_seconds=cycle
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.info("orchestrator.wait_for_login_error", error=str(exc))
+                res = {}
+            if res.get("status") == "logged_in":
+                return True
+            try:
+                if await adapter.is_authenticated(ctx):
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+        return False
+
+    async def _run_login_adapter(
+        self,
+        db: Session,
+        adapter: PortalAdapter,
+        tender: Tender,
+        portal: Portal | None,
+        platform_slug: str | None,
+        adapter_name: str,
+        user_id: str,
+        candidate_urls: list[str],
+        task_id: str | None,
+        resume_from_confirm: bool,
+    ) -> OrchestrationResult:
+        portal_id = portal.id if portal else None
+        base = OrchestrationResult(
+            status=OrchestrationStatus.error,
+            tender_id=tender.id,
+            portal_id=portal_id,
+            platform_slug=platform_slug,
+            adapter=adapter_name,
+        )
+        bridge = self._get_bridge()
+        if not await bridge.bridge_available():
+            base.status = OrchestrationStatus.bridge_unavailable
+            base.detail = (
+                "Browser bridge not running. Start start-bridge.ps1 on your PC, "
+                "then retry."
+            )
+            return base
+
+        slug = platform_slug or adapter.platform_slug or "portal"
+        start_url = (
+            next((u for u in candidate_urls if adapter.matches_url(u)), None)
+            or (tender.source_url if tender.source_url else None)
+            or adapter.login_url()
+        )
+        try:
+            await bridge.open_session(slug, start_url)
+        except Exception as exc:  # noqa: BLE001
+            base.status = OrchestrationStatus.error
+            base.detail = f"bridge open failed: {exc}"
+            return base
+
+        ctx = PortalContext(
+            portal_id=portal_id or 0,
+            user_id=user_id,
+            domain=portal.domain if portal else "",
+            candidate_urls=candidate_urls,
+            tender_id=tender.id,
+            bridge=bridge,
+            platform_slug=slug,
+            tender_ref=tender.source_ref,
+            source_url=tender.source_url,
+        )
+        ref = tender.source_ref or str(tender.id)
+
+        if not resume_from_confirm:
+            if not await adapter.is_authenticated(ctx):
+                self._set_task(
+                    db,
+                    task_id,
+                    status="waiting_for_login",
+                    waiting_since=datetime.now(UTC),
+                    login_url=adapter.login_url(),
+                    bridge_session_slug=slug,
+                    detail="Waiting for you to log in to the portal.",
+                )
+                self._notify_waiting(db, tender, platform_slug)
+                if not await self._wait_for_login(bridge, adapter, ctx, slug):
+                    base.status = OrchestrationStatus.failed
+                    base.detail = "Login not completed — retry when you're ready."
+                    return base
+                self._set_task(db, task_id, status="running", detail=None)
+
+            locate = await adapter.locate_tender(ctx, ref)
+            if locate.status == LocateStatus.requires_interest_first:
+                self._set_task(
+                    db,
+                    task_id,
+                    status="needs_user_confirmation",
+                    bridge_session_slug=slug,
+                    login_url=locate.tender_url,
+                    detail=(
+                        locate.detail
+                        or "Express Interest is required before documents are released."
+                    ),
+                )
+                base.status = OrchestrationStatus.needs_user_confirmation
+                base.detail = locate.detail
+                return base
+            if locate.status != LocateStatus.found:
+                base.status = OrchestrationStatus.locate_failed
+                base.detail = locate.detail or locate.status.value
+                return base
+        else:
+            # Resuming after the user confirmed Express Interest.
+            if not await adapter.is_authenticated(ctx):
+                base.status = OrchestrationStatus.failed
+                base.detail = "Session expired — retry to log in again."
+                return base
+            await adapter.locate_tender(ctx, ref)
+            reg = await adapter.register_interest(ctx)
+            if reg.status not in (
+                RegisterStatus.success,
+                RegisterStatus.already_registered,
+            ):
+                base.status = OrchestrationStatus.register_failed
+                base.detail = reg.detail
+                return base
+            await adapter.locate_tender(ctx, ref)
+
+        dest = _dest_dir(tender.id)
+        download = await adapter.download_documents(ctx, dest)
+        base.files = [
+            {
+                "url": f.url,
+                "filename": f.filename,
+                "bytes": f.bytes,
+                "content_type": f.content_type,
+                "sha256": f.sha256,
+            }
+            for f in download.files
+        ]
+        base.missing = list(download.missing)
+        base.files_persisted = self._persist_documents(db, tender, download)
+        if download.status == DownloadStatus.complete:
+            base.status = OrchestrationStatus.complete
+        elif download.status == DownloadStatus.partial:
+            base.status = OrchestrationStatus.partial
+        elif download.status == DownloadStatus.nothing_available:
+            base.status = OrchestrationStatus.nothing_available
+        else:
+            base.status = OrchestrationStatus.download_failed
+            base.detail = download.detail
+
+        with contextlib.suppress(Exception):
+            await bridge.close_session(slug)
+        return base
 
     def _load_credentials(self, portal_id: int, user_id: str) -> Credentials | None:
         store = self._store()
