@@ -137,9 +137,11 @@ async def test_cf_route_persists_and_idempotent(db, tmp_path, monkeypatch):
         ref="e2e-1",
         documents=[{"url": ASSET, "title": "ITT", "format": "pdf"}],
     )
-    # Portal + link sighting so candidate URLs include the asset.
+    # Portal + link sighting so candidate URLs include the asset. Unique
+    # subdomain to avoid colliding with a real assets.publishing portal in a
+    # populated dev DB (CF routing is by source/URL, not portal domain).
     portal = Portal(
-        domain="assets.publishing.service.gov.uk",
+        domain="e2e-1.assets.publishing.service.gov.uk",
         display_name="CF assets",
         first_seen_at=datetime.now(UTC),
         last_seen_at=datetime.now(UTC),
