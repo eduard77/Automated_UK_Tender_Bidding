@@ -10,9 +10,12 @@ from fastapi import FastAPI
 
 from tender_agent import scheduler
 from tender_agent.api import admin as admin_api
+from tender_agent.api import credentials as credentials_api
 from tender_agent.api import filters as filters_api
+from tender_agent.api import platforms as platforms_api
 from tender_agent.api import portals as portals_api
 from tender_agent.api import push as push_api
+from tender_agent.api import tender_fetch as tender_fetch_api
 from tender_agent.api import tenders as tenders_api
 from tender_agent.api import vault as vault_api
 from tender_agent.config import settings
@@ -62,3 +65,6 @@ app.include_router(push_api.router)
 app.include_router(admin_api.router)
 app.include_router(vault_api.router)
 app.include_router(portals_api.router)
+app.include_router(platforms_api.router)
+app.include_router(credentials_api.router)
+app.include_router(tender_fetch_api.router)

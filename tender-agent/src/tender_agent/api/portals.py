@@ -68,6 +68,10 @@ def list_portals(
     priority: Priority | None = Query(None),
     search: str | None = Query(None),
     has_login_type: LoginType | None = Query(None),
+    platform_id: int | None = Query(None),
+    include_email_domains: bool = Query(
+        False, description="Include is_email_domain portals (hidden by default)"
+    ),
     sort: str | None = Query(
         None,
         description="One of: priority (default), tender_count, last_seen, first_seen",
@@ -82,6 +86,10 @@ def list_portals(
         stmt = stmt.where(Portal.priority == priority.value)
     if has_login_type:
         stmt = stmt.where(Portal.login_type == has_login_type.value)
+    if platform_id is not None:
+        stmt = stmt.where(Portal.platform_id == platform_id)
+    if not include_email_domains:
+        stmt = stmt.where(Portal.is_email_domain.is_(False))
     if search:
         pattern = f"%{search.lower()}%"
         stmt = stmt.where(
