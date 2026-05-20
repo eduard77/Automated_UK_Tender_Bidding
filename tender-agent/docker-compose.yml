@@ -21,9 +21,23 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql+psycopg://tender:tender@db:5432/tender_agent
+      # Reach the native Windows browser bridge on the host.
+      BRIDGE_URL: ${BRIDGE_URL:-http://host.docker.internal:8765}
     env_file: .env
+    # host.docker.internal lets the container reach a service on the host
+    # (the browser bridge). host-gateway is required on Linux engines.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8000:8000"
+    volumes:
+      # Shared download folder: the bridge (on Windows) writes fetched files
+      # here; the backend reads them back. The host path defaults to the user's
+      # profile; on Windows Docker Desktop passes USERPROFILE through. If the
+      # interpolation is awkward on your machine, replace the left side with an
+      # absolute host path, e.g.
+      #   - "C:/Users/you/.tender-agent/bridge-downloads:/app/data/bridge-downloads"
+      - "${USERPROFILE:-${HOME}}/.tender-agent/bridge-downloads:/app/data/bridge-downloads"
     command: >
       sh -c "alembic upgrade head &&
              uvicorn tender_agent.main:app --host 0.0.0.0 --port 8000"

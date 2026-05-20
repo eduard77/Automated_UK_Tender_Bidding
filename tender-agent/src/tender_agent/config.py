@@ -45,6 +45,14 @@ class Settings(BaseSettings):
     # Dashboard origin — used as the base for notification `url` paths.
     dashboard_base_url: str = "http://localhost:3000"
 
+    # Browser bridge (native Windows helper, outside Docker). The container
+    # reaches the host at host.docker.internal. The token must match the
+    # bridge's TENDER_AGENT_BRIDGE_TOKEN. The download dir is the in-container
+    # mount of the host folder the bridge writes to.
+    bridge_url: str = "http://host.docker.internal:8765"
+    bridge_token: str = ""
+    bridge_download_dir: str = "/app/data/bridge-downloads"
+
 
 @lru_cache
 def get_settings() -> Settings:
