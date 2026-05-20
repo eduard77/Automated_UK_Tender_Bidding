@@ -566,6 +566,11 @@ class FetchTask(Base):
     missing_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     detail: Mapped[str | None] = mapped_column(Text)
     result: Mapped[dict | None] = mapped_column(JSONB)
+    # Login-via-human flow (chunk 4): set while a task waits for the user to
+    # log in to a portal in the visible browser window.
+    login_url: Mapped[str | None] = mapped_column(Text)
+    bridge_session_slug: Mapped[str | None] = mapped_column(Text)
+    waiting_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
