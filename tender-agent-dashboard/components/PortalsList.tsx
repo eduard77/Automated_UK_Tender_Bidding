@@ -53,12 +53,14 @@ function PortalsListInner() {
   const [priorityFilter, setPriorityFilter] = useState<Priority | "">("");
   const [search, setSearch] = useState("");
   const [sort, setSort] = useState<ListPortalsParams["sort"]>("");
+  const [showEmailDomains, setShowEmailDomains] = useState(false);
 
   const params: ListPortalsParams = {
     adapter_status: statusFilter || undefined,
     priority: priorityFilter || undefined,
     search: search || undefined,
     sort: sort || undefined,
+    include_email_domains: showEmailDomains || undefined,
     limit: 100,
   };
   const path = portalsPath(params);
@@ -192,6 +194,17 @@ function PortalsListInner() {
               ))}
             </select>
           </div>
+          <label className="flex items-center gap-2 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={showEmailDomains}
+              onChange={(e) => setShowEmailDomains(e.target.checked)}
+              className="accent-mint"
+            />
+            <span className="text-text-muted" style={{ fontSize: "13px" }}>
+              Show email domains
+            </span>
+          </label>
         </div>
       </div>
 

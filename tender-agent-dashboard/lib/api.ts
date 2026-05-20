@@ -534,6 +534,8 @@ export interface Portal {
   last_seen_at: string;
   classification_data: Record<string, unknown> | null;
   notes: string | null;
+  platform_id: number | null;
+  is_email_domain: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -558,9 +560,50 @@ export interface ListPortalsParams {
   priority?: Priority | "";
   search?: string;
   has_login_type?: LoginType | "";
+  platform_id?: number;
+  include_email_domains?: boolean;
   sort?: "tender_count" | "last_seen" | "first_seen" | "priority" | "";
   limit?: number;
   offset?: number;
+}
+
+export type PlatformKind = "transactional" | "special";
+
+export interface PortalPlatform {
+  id: number;
+  slug: string;
+  vendor: string;
+  display_name: string;
+  domain_patterns: string[];
+  kind: PlatformKind;
+  adapter_status: AdapterStatus;
+  adapter_module: string | null;
+  login_type: LoginType;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+  total_tender_count: number;
+  buyer_instance_count: number;
+}
+
+export interface PlatformPortalRow {
+  id: number;
+  domain: string;
+  display_name: string;
+  tender_count: number;
+  adapter_status: AdapterStatus;
+}
+
+export interface PortalPlatformDetail extends PortalPlatform {
+  portals: PlatformPortalRow[];
+  sample_tender_urls: string[];
+}
+
+export interface PlatformUpdate {
+  adapter_status?: AdapterStatus;
+  adapter_module?: string | null;
+  login_type?: LoginType;
+  notes?: string | null;
 }
 
 export interface PortalUpdate {
@@ -626,6 +669,19 @@ export const addBlocklistDomain = (body: { domain: string; reason?: string }) =>
 
 export const removeBlocklistDomain = (id: number) =>
   request<void>(`/portal-blocklist/${id}`, { method: "DELETE" });
+
+// --- Platforms ---
+
+export const listPlatforms = () => request<PortalPlatform[]>("/platforms");
+
+export const getPlatform = (slug: string) =>
+  request<PortalPlatformDetail>(`/platforms/${slug}`);
+
+export const updatePlatform = (slug: string, body: PlatformUpdate) =>
+  request<PortalPlatform>(`/platforms/${slug}`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
 
 const ADAPTER_STATUS_LABELS: Record<AdapterStatus, string> = {
   not_started: "Not started",
