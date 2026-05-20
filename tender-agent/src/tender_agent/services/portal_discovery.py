@@ -32,6 +32,7 @@ from tender_agent.models import (
     PortalUrlSighting,
     Tender,
 )
+from tender_agent.services.platform_matching import find_platform_for_domain
 
 logger = structlog.get_logger(__name__)
 
@@ -316,6 +317,9 @@ def _find_additional_information(raw: dict | None) -> str | None:
 # --- Persistence --------------------------------------------------------
 
 
+LINK_SIGHTING_TYPES = ("tender_link", "document_link")
+
+
 def _get_or_create_portal(
     db: Session, domain: str
 ) -> tuple[Portal, bool]:
@@ -323,15 +327,37 @@ def _get_or_create_portal(
         select(Portal).where(Portal.domain == domain)
     ).scalar_one_or_none()
     if portal is not None:
+        # Backfill platform link if a matching platform was seeded after the
+        # portal was first discovered.
+        if portal.platform_id is None:
+            platform = find_platform_for_domain(db, domain)
+            if platform is not None:
+                portal.platform_id = platform.id
         return portal, False
+    platform = find_platform_for_domain(db, domain)
     portal = Portal(
         domain=domain,
         display_name=domain,
+        platform_id=platform.id if platform is not None else None,
         # url_patterns / classification_data left at SQL defaults.
     )
     db.add(portal)
     db.flush()
     return portal, True
+
+
+def _portal_has_sighting_type(
+    db: Session, portal_id: int, sighting_types: tuple[str, ...]
+) -> bool:
+    return (
+        db.execute(
+            select(PortalUrlSighting.id)
+            .where(PortalUrlSighting.portal_id == portal_id)
+            .where(PortalUrlSighting.sighting_type.in_(sighting_types))
+            .limit(1)
+        ).scalar_one_or_none()
+        is not None
+    )
 
 
 def process_tender_for_portals(
@@ -362,15 +388,21 @@ def process_tender_for_portals(
             classifications_queued += 1
             queued_ids.append(portal.id)
 
-        # Has this tender ever produced a sighting for this portal? If not,
-        # the tender_count increment is owed.
-        prior_count = db.execute(
-            select(PortalUrlSighting.id)
-            .where(PortalUrlSighting.portal_id == portal.id)
-            .where(PortalUrlSighting.tender_id == tender.id)
-            .limit(1)
-        ).scalar_one_or_none()
-        first_time_pair = prior_count is None
+        # tender_count counts a tender once it has at least one *link-type*
+        # sighting (tender_link / document_link) on this portal. Pure
+        # contact_email / reference_text sightings never count — that was the
+        # v1 bug that inflated email domains like nhs.net.
+        had_link_before = (
+            db.execute(
+                select(PortalUrlSighting.id)
+                .where(PortalUrlSighting.portal_id == portal.id)
+                .where(PortalUrlSighting.tender_id == tender.id)
+                .where(PortalUrlSighting.sighting_type.in_(LINK_SIGHTING_TYPES))
+                .limit(1)
+            ).scalar_one_or_none()
+            is not None
+        )
+        inserted_link = False
 
         for u in urls:
             # Idempotency at the sighting level: skip if (portal, tender, url,
@@ -397,9 +429,25 @@ def process_tender_for_portals(
                 )
             )
             new_sightings += 1
+            if u.sighting_type in LINK_SIGHTING_TYPES:
+                inserted_link = True
 
-        if first_time_pair:
+        # Only bump when this (portal, tender) pair transitions from "no link"
+        # to "has link".
+        if not had_link_before and inserted_link:
             portal.tender_count = (portal.tender_count or 0) + 1
+
+        db.flush()  # ensure new sightings are visible to the queries below
+        # Recompute is_email_domain: true iff every sighting is contact_email.
+        has_link = had_link_before or inserted_link or _portal_has_sighting_type(
+            db, portal.id, LINK_SIGHTING_TYPES
+        )
+        if has_link:
+            portal.is_email_domain = False
+        else:
+            portal.is_email_domain = _portal_has_sighting_type(
+                db, portal.id, ("contact_email",)
+            )
         portal.last_seen_at = now
         portal.updated_at = now
 

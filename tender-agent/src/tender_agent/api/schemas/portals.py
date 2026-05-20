@@ -78,6 +78,8 @@ class PortalRead(BaseModel):
     last_seen_at: datetime
     classification_data: dict[str, Any] | None = None
     notes: str | None = None
+    platform_id: int | None = None
+    is_email_domain: bool = False
     created_at: datetime
     updated_at: datetime
 

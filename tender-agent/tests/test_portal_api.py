@@ -71,14 +71,17 @@ def _make_portal(
 def test_list_portals_returns_seed_blocklist_unaffected(
     client: TestClient, session: Session
 ) -> None:
-    _make_portal(session, domain="alpha.example.com", priority="high", tender_count=5)
-    _make_portal(session, domain="beta.example.com", priority="low", tender_count=1)
+    # Use a unique search token so the assertion is independent of how many
+    # other portals exist in the database (CI starts empty; a dev DB may hold
+    # thousands, which would otherwise push low-priority rows past the limit).
+    _make_portal(session, domain="alpha-uniq42.example.com", priority="high", tender_count=5)
+    _make_portal(session, domain="beta-uniq42.example.com", priority="low", tender_count=1)
     session.flush()
-    resp = client.get("/portals?limit=100")
+    resp = client.get("/portals?search=uniq42&limit=100")
     assert resp.status_code == 200
     domains = [p["domain"] for p in resp.json()]
-    assert "alpha.example.com" in domains
-    assert "beta.example.com" in domains
+    assert "alpha-uniq42.example.com" in domains
+    assert "beta-uniq42.example.com" in domains
 
 
 def test_list_portals_filters_by_priority(client: TestClient, session: Session) -> None:

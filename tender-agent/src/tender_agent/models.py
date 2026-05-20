@@ -403,6 +403,41 @@ class VaultDocumentVersion(Base):
     )
 
 
+class PortalPlatform(Base):
+    """An e-tendering *product* (Delta eSourcing, ProContract, JAGGAER, ...).
+
+    One platform owns many buyer-instance portals. Membership is computed from
+    `domain_patterns` (a list of Python regexes matched against
+    `Portal.domain`). Adapters are built per-platform, not per-portal: one
+    Delta adapter serves every Delta-hosted buyer.
+    """
+
+    __tablename__ = "portal_platforms"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    slug: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    vendor: Mapped[str] = mapped_column(Text, nullable=False)
+    display_name: Mapped[str] = mapped_column(Text, nullable=False)
+    domain_patterns: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+    kind: Mapped[str] = mapped_column(Text, nullable=False, default="transactional")
+    adapter_status: Mapped[str] = mapped_column(
+        Text, nullable=False, default="not_started"
+    )
+    adapter_module: Mapped[str | None] = mapped_column(Text)
+    login_type: Mapped[str] = mapped_column(Text, nullable=False, default="unknown")
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    portals: Mapped[list[Portal]] = relationship(back_populates="platform")
+
+
 class Portal(Base):
     """A procurement portal we've discovered — typically a buyer-hosted or
     aggregator-hosted site that publishes ITT documents and gates them behind
@@ -436,6 +471,16 @@ class Portal(Base):
     )
     classification_data: Mapped[dict | None] = mapped_column(JSONB)
     notes: Mapped[str | None] = mapped_column(Text)
+    # Platform-first layer (chunk 2). Null when no known platform owns this
+    # domain (buyer-direct gov.uk sites, NHS email domains, etc.).
+    platform_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("portal_platforms.id", ondelete="SET NULL"), index=True
+    )
+    # True when every sighting for this portal is a contact email (e.g.
+    # nhs.net): not a real portal, hidden from the registry by default.
+    is_email_domain: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
@@ -445,6 +490,9 @@ class Portal(Base):
 
     sightings: Mapped[list[PortalUrlSighting]] = relationship(
         back_populates="portal", cascade="all, delete-orphan"
+    )
+    platform: Mapped[PortalPlatform | None] = relationship(
+        back_populates="portals"
     )
 
 
