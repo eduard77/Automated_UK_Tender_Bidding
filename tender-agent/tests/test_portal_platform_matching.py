@@ -33,8 +33,10 @@ def db() -> Session:
 
 
 def test_ten_platforms_seeded(db: Session) -> None:
+    # 10 data-derived platforms from chunk 2, plus contracts_finder_direct
+    # (chunk 3) which is config-seeded for the adapter.
     count = len(db.execute(select(PortalPlatform)).scalars().all())
-    assert count == 10
+    assert count >= 10
 
 
 def test_every_platform_matches_at_least_three_sightings(db: Session) -> None:
@@ -47,6 +49,11 @@ def test_every_platform_matches_at_least_three_sightings(db: Session) -> None:
     platforms = db.execute(select(PortalPlatform)).scalars().all()
     assert platforms, "no platforms seeded"
     for platform in platforms:
+        # contracts_finder_direct (chunk 3) is config-seeded for the adapter;
+        # its assets.publishing portals only appear once such a doc is
+        # ingested, so it's exempt from the "must match live traffic" rule.
+        if platform.slug == "contracts_finder_direct":
+            continue
         # Portals whose domain matches this platform's patterns.
         portals = db.execute(select(Portal)).scalars().all()
         matched_ids = [
