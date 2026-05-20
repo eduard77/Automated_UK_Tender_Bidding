@@ -4,6 +4,9 @@ from tender_agent.services.portals.base import (
     PortalAdapter,
     PortalContext,
 )
+from tender_agent.services.portals.contracts_finder import (
+    ContractsFinderDirectAdapter,
+)
 from tender_agent.services.portals.fallback import FallbackAdapter
 from tender_agent.services.portals.registry import (
     ADAPTERS,
@@ -26,6 +29,7 @@ __all__ = [
     "ADAPTERS",
     "AuthResult",
     "AuthStatus",
+    "ContractsFinderDirectAdapter",
     "Credentials",
     "DownloadResult",
     "DownloadStatus",

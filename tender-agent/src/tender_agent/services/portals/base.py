@@ -55,6 +55,8 @@ class PortalContext:
     # (from the tender's documents[] and link-type sightings). The
     # FallbackAdapter downloads straight from these.
     candidate_urls: list[str] = field(default_factory=list)
+    # Tender scope for on-disk storage layout. 0 when not run per-tender.
+    tender_id: int = 0
 
 
 class PortalAdapter(ABC):
