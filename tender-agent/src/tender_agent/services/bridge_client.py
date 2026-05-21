@@ -100,6 +100,24 @@ class BridgeClient:
     async def navigate(self, slug: str, url: str) -> dict:
         return await self._post(f"/session/{slug}/navigate", {"url": url})
 
+    async def fill(self, slug: str, selector: str, value: str) -> dict:
+        """Type a value into a form field (e.g. Delta's Access Code box)."""
+        return await self._post(
+            f"/session/{slug}/fill", {"selector": selector, "value": value}
+        )
+
+    async def click(self, slug: str, selector: str) -> dict:
+        """Click a non-download control (e.g. a Submit button). Use
+        click_download for controls that trigger a file download."""
+        return await self._post(f"/session/{slug}/click", {"selector": selector})
+
+    async def element_exists(self, slug: str, selector: str) -> bool:
+        """Whether a selector matches anything on the current page."""
+        data = await self._post(
+            f"/session/{slug}/element-exists", {"selector": selector}
+        )
+        return bool(data.get("exists", False))
+
     async def page_text(self, slug: str) -> str:
         return (await self._get(f"/session/{slug}/page-text")).get("text", "")
 
