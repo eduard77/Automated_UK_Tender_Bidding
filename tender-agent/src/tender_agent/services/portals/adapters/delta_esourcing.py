@@ -1,18 +1,24 @@
 """Delta eSourcing adapter (platform_slug='delta_esourcing').
 
 Login model: a human logs in to the real Delta site in the visible browser
-window the bridge opens. This adapter NEVER submits credentials and never sees
-the password. After the orchestrator confirms login (via wait-for-login), it
-drives this adapter through the bridge to locate the tender and download
-documents.
+window the bridge opens — password AND Microsoft Authenticator (app-based 2FA),
+entirely by hand. This adapter NEVER submits credentials or 2FA codes and never
+sees the password. Because of the authenticator, the persistent bridge session
+is reused across fetches so the human re-authenticates as rarely as possible.
 
 ╔══════════════════════════════════════════════════════════════════════════╗
-║  HONESTY NOTE — read before trusting this adapter.                         ║
-║  This was written WITHOUT a Delta account, against the *known structure*   ║
-║  of Delta eSourcing (a JAGGAER-family platform). Every Delta-specific URL  ║
-║  and selector below is a best-effort guess and is marked                   ║
-║  "VALIDATE ON FRIDAY". The control flow is real and tested with a mocked   ║
-║  bridge; the constants are what need correcting against the live site.     ║
+║  REAL-FLOW NOTE (corrected from chunk 4 after live reconnaissance).        ║
+║  Delta has NO supplier-side tender search. The entry path is the           ║
+║  Response Manager: the supplier types the tender's *access code* (which     ║
+║  comes from the FTS/CF notice we already ingest) into the "Access Code"     ║
+║  box and clicks Submit. If the tender is open it lands in the supplier's    ║
+║  "Responses" table and documents become reachable; if closed Delta shows   ║
+║  the literal banner "This opportunity is not currently open."              ║
+║                                                                            ║
+║  CONFIRMED constants below are validated against the live site. Selectors  ║
+║  marked "CONFIRM SELECTOR" / "DRY-RUN" are best-effort and get corrected    ║
+║  by the user's manual validation — the flow around them is real and tested ║
+║  with a mocked bridge.                                                      ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 """
 from __future__ import annotations
@@ -20,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+from collections.abc import Iterable
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -46,45 +53,118 @@ from tender_agent.services.portals.results import (
 logger = structlog.get_logger(__name__)
 
 
-# --- Delta-specific constants — VALIDATE ON FRIDAY ----------------------
-# Correcting these against the live site is the entire Friday fix-up; the
-# logic around them is platform-agnostic.
+# --- Delta-specific constants — from live reconnaissance ----------------
+# CONFIRMED = verified against the live site. CONFIRM SELECTOR / DRY-RUN =
+# best-effort, to be corrected by the user's manual validation. Correcting
+# these is the whole of the remaining fix-up; the logic is platform-agnostic.
 
 DELTA_URLS = {
-    # VALIDATE ON FRIDAY — supplier login page.
-    "login": "https://www.delta-esourcing.com/delta/login.html",
-    # VALIDATE ON FRIDAY — landing page after login (used to detect a live
-    # session): the supplier dashboard / home.
-    "authenticated_landing": "https://www.delta-esourcing.com/delta/respond.html",
-    # VALIDATE ON FRIDAY — tender search; %s is the tender reference.
-    "search": "https://www.delta-esourcing.com/delta/searchTenders.html?q=%s",
+    # CONFIRMED — supplier login starts from the homepage; Delta redirects an
+    # unauthenticated user to its login page automatically when they hit a
+    # supplier page (so login_url points at the Response Manager below).
+    "login": "https://www.delta-esourcing.com/",
+    # CONFIRMED — the Response Manager. Logged-in suppliers enter a tender
+    # access code here; unauthenticated users are bounced to login.
+    "response_manager": (
+        "https://www.delta-esourcing.com/delta/suppliers/select/addToList.html"
+    ),
+    # CONFIRMED — legacy direct-respond URL for numeric notice ids (the third
+    # URL pattern); %s is the noticeId. No access-code box is involved.
+    "legacy_respond": (
+        "https://www.delta-esourcing.com/delta/respondToList.html?noticeId=%s"
+    ),
 }
 
 DELTA_SELECTORS = {
-    # VALIDATE ON FRIDAY — present only when logged in (e.g. a logout link).
-    "logged_in_marker": "a[href*='logout'], a:has-text('My Account'), #logoutLink",
-    # VALIDATE ON FRIDAY — present on the login page.
-    "login_form_marker": "form[action*='login'], input[type='password']",
-    # VALIDATE ON FRIDAY — the "Express Interest" control that gates documents.
-    "express_interest": (
-        "a:has-text('Express Interest'), button:has-text('Express Interest'), "
-        "#expressInterestBtn"
+    # CONFIRM SELECTOR (placeholder #1) — the "Access Code" text input.
+    "access_code_input": (
+        "input#accessCode, input[name='accessCode'], input[name*='access']"
     ),
-    # VALIDATE ON FRIDAY — container shown once documents are released.
-    "documents_area": "#documents, .tender-documents, section:has-text('Documents')",
-    # VALIDATE ON FRIDAY — individual document download anchors.
-    "document_link": "a[href*='download'], a[href$='.pdf'], a[href$='.docx']",
+    # CONFIRM SELECTOR (placeholder #2) — the "Submit" button next to it.
+    "submit_button": (
+        "button[type='submit'], input[type='submit'], button:has-text('Submit')"
+    ),
+    # CONFIRMED — the literal error banner shown for a closed opportunity.
+    # Matched as plain text against the rendered page (not a CSS selector).
+    "not_open_error_text": "This opportunity is not currently open.",
+    # CONFIRM SELECTOR — a stable left-menu item that only renders for an
+    # authenticated supplier (Profile Manager / Response Manager / etc.).
+    "logged_in_marker": (
+        "a:has-text('Response Manager'), a:has-text('Profile Manager'), "
+        "#supplierMenu, nav a:has-text('Resources')"
+    ),
+    # CONFIRM SELECTOR (placeholder #3) — the "Responses" table that lists the
+    # opportunities added via access code.
+    "responses_table": (
+        "table#responses, table.responses, table:has-text('Responses')"
+    ),
+    # DRY-RUN (placeholder #3, the one screen not yet seen) — documents area.
+    "documents_area": (
+        "#documents, .tender-documents, section:has-text('Documents')"
+    ),
+    # DRY-RUN — individual document download anchors.
+    "document_links": "a[href*='download'], a[href$='.pdf'], a[href$='.docx']",
+    # DRY-RUN — the Express/Register Interest control that signals intent to
+    # bid. Never auto-clicked: it goes through the needs_user_confirmation pause.
+    "express_interest_button": (
+        "a:has-text('Express Interest'), button:has-text('Express Interest'), "
+        "a:has-text('Register Interest'), button:has-text('Register Interest')"
+    ),
 }
 
 # href pattern used with the bridge's find-links to enumerate document URLs.
-# VALIDATE ON FRIDAY.
+# DRY-RUN — confirm once the documents screen is seen.
 DELTA_DOCUMENT_HREF_PATTERN = r"(download|\.pdf|\.docx|\.doc|\.xls|\.xlsx|\.zip)"
 
-# Login-success URL pattern for wait-for-login (NOT the login page).
-# VALIDATE ON FRIDAY.
-DELTA_LOGIN_SUCCESS_PATTERN = r"delta-esourcing\.com/delta/(?!login)"
+# Login-success URL pattern for wait-for-login: after the human logs in (and
+# clears Microsoft Authenticator) Delta lands them in the supplier area. The
+# orchestrator also falls back to is_authenticated(), so this is a hint.
+DELTA_LOGIN_SUCCESS_PATTERN = r"delta-esourcing\.com/delta/suppliers/"
 
 DELTA_DOMAIN_RE = re.compile(r"(^|\.)delta-esourcing\.com$", re.IGNORECASE)
+
+# --- access-code extraction --------------------------------------------
+# The access code comes from the tender notice we already ingest from FTS/CF.
+# Three URL patterns appear in Delta notices; each ends in the code (or, for
+# the legacy form, a numeric noticeId). We extract from the tender's own data —
+# never by searching Delta (it has no supplier-side search).
+
+# https://www.delta-esourcing.com/respond/286EVX23TV
+_RESPOND_RE = re.compile(
+    r"delta-esourcing\.com/respond/([A-Za-z0-9]{4,})(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+# https://www.delta-esourcing.com/tenders/{description}/W5C25992M5
+_TENDERS_RE = re.compile(
+    r"delta-esourcing\.com/tenders/[^\s\"'<>]+/([A-Za-z0-9]{4,})(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+# https://www.delta-esourcing.com/delta/respondToList.html?noticeId=1032668140
+_LEGACY_RE = re.compile(
+    r"respondToList\.html\?[^\s\"'<>]*?\bnoticeId=(\d+)",
+    re.IGNORECASE,
+)
+
+_CODE_PATTERNS = (_RESPOND_RE, _TENDERS_RE, _LEGACY_RE)
+
+
+def extract_access_code(*sources: str | None) -> str | None:
+    """Return the Delta access code (or legacy numeric noticeId) found in any of
+    the given strings — typically the tender's source_url, description, and
+    candidate document URLs. None if no Delta URL pattern is present.
+
+    Sources are scanned in order; within each, the patterns are tried
+    respond → tenders → legacy, so the first match wins.
+    """
+    for src in sources:
+        if not src:
+            continue
+        for rx in _CODE_PATTERNS:
+            m = rx.search(src)
+            if m:
+                return m.group(1)
+    return None
+
 
 MAX_FILE_BYTES = 100 * 1024 * 1024
 MAX_DOCS = 50
@@ -102,116 +182,152 @@ class DeltaEsourcingAdapter(PortalAdapter):
         return bool(host) and bool(DELTA_DOMAIN_RE.search(host))
 
     def login_url(self) -> str | None:
-        return DELTA_URLS["login"]
+        # Point the visible window at the Response Manager; Delta redirects an
+        # unauthenticated user to its real login page automatically.
+        return DELTA_URLS["response_manager"]
 
     def login_success_pattern(self) -> str:
         return DELTA_LOGIN_SUCCESS_PATTERN
 
+    def _code_sources(self, ctx: PortalContext) -> Iterable[str | None]:
+        return (ctx.source_url, ctx.description, *ctx.candidate_urls, ctx.tender_ref)
+
     async def is_authenticated(self, ctx: PortalContext) -> bool:
-        """Navigate to the authenticated landing page; logged in if we're not
-        bounced to login and a logged-in marker is present. Best-effort,
-        constant-driven."""
+        """Navigate to the Response Manager; authenticated if we're not bounced
+        to login and the logged-in supplier menu is present. Logs whether the
+        session was reused or a fresh login is required."""
         bridge, slug = ctx.bridge, ctx.platform_slug
         if bridge is None or slug is None:
             return False
         try:
-            await bridge.navigate(slug, DELTA_URLS["authenticated_landing"])
+            await bridge.navigate(slug, DELTA_URLS["response_manager"])
             status = await bridge.session_status(slug)
         except Exception as exc:  # noqa: BLE001
-            logger.info("delta.is_authenticated_error", error=str(exc))
+            logger.info("delta.fresh_login_required", reason="navigate_failed",
+                        error=str(exc))
             return False
         current = (status.get("current_url") or "").lower()
         if "login" in current:
+            logger.info("delta.fresh_login_required", reason="redirected_to_login")
             return False
         try:
-            html = await bridge.page_html(slug)
+            marker = await bridge.element_exists(
+                slug, DELTA_SELECTORS["logged_in_marker"]
+            )
         except Exception:  # noqa: BLE001
-            html = ""
-        # Logged in if a known marker text is present (cheap check on HTML).
-        return ("logout" in html.lower()) or ("my account" in html.lower())
+            marker = False
+        if marker:
+            logger.info("delta.session_reused", slug=slug)
+            return True
+        logger.info("delta.fresh_login_required", reason="no_logged_in_marker")
+        return False
 
     async def authenticate(
         self, ctx: PortalContext, creds: Credentials | None
     ) -> AuthResult:
-        # Login is performed by the human in the visible window; the
-        # orchestrator only calls this once wait-for-login has confirmed it.
-        # The adapter never submits credentials.
+        # Login is performed by the human in the visible window (password +
+        # Microsoft Authenticator); the orchestrator only calls this once
+        # wait-for-login has confirmed it. The adapter never submits credentials.
         return AuthResult(status=AuthStatus.success, detail="human login (no creds)")
 
     # --- locate / interest / download ----------------------------------
 
-    def _tender_url(self, ctx: PortalContext) -> str | None:
-        """Prefer a direct Delta URL from the tender's source data; else a
-        search URL built from the reference."""
-        if ctx.source_url and self.matches_url(ctx.source_url):
-            return ctx.source_url
-        for u in ctx.candidate_urls:
-            if self.matches_url(u):
-                return u
-        if ctx.tender_ref:
-            return DELTA_URLS["search"] % ctx.tender_ref
-        return None
-
     async def locate_tender(
         self, ctx: PortalContext, tender_ref: str
     ) -> LocateResult:
+        """Submit the tender's access code on the Response Manager. There is NO
+        search on Delta — the code comes from the notice we already ingest."""
         bridge, slug = ctx.bridge, ctx.platform_slug
         if bridge is None or slug is None:
             return LocateResult(status=LocateStatus.error, detail="no bridge session")
-        url = self._tender_url(ctx)
-        if url is None:
+
+        code = extract_access_code(*self._code_sources(ctx))
+        if not code:
             return LocateResult(
-                status=LocateStatus.not_found, detail="no Delta tender URL derivable"
+                status=LocateStatus.not_found,
+                detail="No Delta access code found in the tender notice.",
             )
-        if not self.matches_url(url):
-            # Security boundary: never navigate off-platform.
-            return LocateResult(
-                status=LocateStatus.error, detail=f"refusing off-platform URL: {url}"
-            )
+
         try:
-            await bridge.navigate(slug, url)
-            html = await bridge.page_html(slug)
+            if code.isdigit():
+                # Legacy numeric notice: direct respond URL, no access-code box.
+                url = DELTA_URLS["legacy_respond"] % code
+                logger.info("delta.locate_legacy", slug=slug, notice_id=code)
+                await bridge.navigate(slug, url)
+            else:
+                logger.info("delta.locate_access_code", slug=slug, code=code)
+                await bridge.navigate(slug, DELTA_URLS["response_manager"])
+                await bridge.fill(
+                    slug, DELTA_SELECTORS["access_code_input"], code
+                )
+                await bridge.click(slug, DELTA_SELECTORS["submit_button"])
+            text = await bridge.page_text(slug)
         except Exception as exc:  # noqa: BLE001
             return LocateResult(status=LocateStatus.error, detail=str(exc))
 
-        low = html.lower()
-        # Documents already visible? then we're good.
-        if re.search(DELTA_DOCUMENT_HREF_PATTERN, low):
-            return LocateResult(status=LocateStatus.found, tender_url=url)
-        # Express-Interest gate present → must pause for user confirmation.
-        if "express interest" in low:
+        # Closed tender — a common, expected state. Handle gracefully.
+        if DELTA_SELECTORS["not_open_error_text"].lower() in (text or "").lower():
+            logger.info("delta.tender_closed", slug=slug, code=code)
+            return LocateResult(
+                status=LocateStatus.not_found,
+                detail='Tender is closed on Delta ("not currently open").',
+            )
+
+        try:
+            docs = await bridge.element_exists(
+                slug, DELTA_SELECTORS["documents_area"]
+            )
+            interest = await bridge.element_exists(
+                slug, DELTA_SELECTORS["express_interest_button"]
+            )
+            in_responses = await bridge.element_exists(
+                slug, DELTA_SELECTORS["responses_table"]
+            )
+        except Exception as exc:  # noqa: BLE001
+            return LocateResult(status=LocateStatus.error, detail=str(exc))
+
+        # Documents gated behind Express Interest → pause for the user. The
+        # orchestrator must NOT auto-click it (signals intent to bid).
+        if interest and not docs:
             return LocateResult(
                 status=LocateStatus.requires_interest_first,
-                tender_url=url,
-                detail="Documents are released only after Express Interest.",
+                tender_url=DELTA_URLS["response_manager"],
+                detail=(
+                    "Delta requires you to Express Interest before documents are "
+                    "released. This signals intent to bid. Confirm to proceed."
+                ),
             )
-        # Loaded but nothing obvious — treat as found; download step will report
-        # nothing_available if there's truly nothing.
-        return LocateResult(status=LocateStatus.found, tender_url=url)
+        # Tender is in the Responses table (or its documents are already shown).
+        if in_responses or docs:
+            return LocateResult(
+                status=LocateStatus.found, tender_url=DELTA_URLS["response_manager"]
+            )
+        return LocateResult(
+            status=LocateStatus.not_found,
+            detail="Access code submitted but the tender did not appear in Responses.",
+        )
 
     async def register_interest(self, ctx: PortalContext) -> RegisterResult:
         """Click Express Interest. The orchestrator only calls this AFTER the
-        user explicitly confirms — never automatically."""
+        user explicitly confirms via the needs_user_confirmation pause — never
+        automatically."""
         bridge, slug = ctx.bridge, ctx.platform_slug
         if bridge is None or slug is None:
             return RegisterResult(status=RegisterStatus.error, detail="no bridge")
         try:
-            await bridge.click_download(slug, DELTA_SELECTORS["express_interest"])
-        except Exception:  # noqa: BLE001
-            # Express Interest may not trigger a download; a plain click via
-            # navigate-after isn't exposed, so treat a non-download click as
-            # success if the page advanced. Best-effort; VALIDATE ON FRIDAY.
-            try:
-                status = await bridge.session_status(slug)
-                if status.get("authenticated_guess"):
-                    return RegisterResult(status=RegisterStatus.success)
-            except Exception as exc:  # noqa: BLE001
-                return RegisterResult(status=RegisterStatus.error, detail=str(exc))
+            await bridge.click(slug, DELTA_SELECTORS["express_interest_button"])
+        except Exception as exc:  # noqa: BLE001
+            return RegisterResult(status=RegisterStatus.error, detail=str(exc))
+        logger.info("delta.express_interest_clicked", slug=slug)
         return RegisterResult(status=RegisterStatus.success)
 
     async def download_documents(
         self, ctx: PortalContext, dest_dir: str
     ) -> DownloadResult:
+        """Enumerate document links in the opened tender and download each via
+        the authenticated bridge session, applying the chunk-3 caps + sha256
+        dedup. (The exact documents screen is a DRY-RUN item; for now we
+        enumerate links on the current page.)"""
         bridge, slug = ctx.bridge, ctx.platform_slug
         if bridge is None or slug is None:
             return DownloadResult(
@@ -233,6 +349,7 @@ class DeltaEsourcingAdapter(PortalAdapter):
             )
 
         files: list[DownloadedFile] = []
+        seen_sha: set[str] = set()
         missing: list[str] = list(rejected) + list(allowed[MAX_DOCS:])
         for url in allowed[:MAX_DOCS]:
             try:
@@ -244,7 +361,11 @@ class DeltaEsourcingAdapter(PortalAdapter):
             df = _ingest_bridge_file(bf, url, ctx.tender_id)
             if df is None:
                 missing.append(url)
+            elif df.sha256 in seen_sha:
+                # sha256 dedup: skip a duplicate of a file already taken.
+                logger.info("delta.duplicate_skipped", url=url, sha256=df.sha256)
             else:
+                seen_sha.add(df.sha256)
                 files.append(df)
 
         if files and missing:
@@ -252,7 +373,9 @@ class DeltaEsourcingAdapter(PortalAdapter):
         elif files:
             status = DownloadStatus.complete
         else:
-            status = DownloadStatus.partial if missing else DownloadStatus.nothing_available
+            status = (
+                DownloadStatus.partial if missing else DownloadStatus.nothing_available
+            )
         return DownloadResult(status=status, files=files, missing=missing)
 
 

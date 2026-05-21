@@ -429,11 +429,31 @@ class PortalOrchestrator:
             platform_slug=slug,
             tender_ref=tender.source_ref,
             source_url=tender.source_url,
+            description=tender.description,
         )
         ref = tender.source_ref or str(tender.id)
 
         if not resume_from_confirm:
-            if not await adapter.is_authenticated(ctx):
+            if await adapter.is_authenticated(ctx):
+                # Session reused: the persistent bridge context for this platform
+                # is already authenticated, so we skip waiting_for_login entirely.
+                # This is the common case once the human has logged in once
+                # (critical for Delta, where login needs Microsoft Authenticator).
+                logger.info(
+                    "orchestrator.session_reused",
+                    platform=slug,
+                    tender_id=tender.id,
+                )
+            else:
+                # Fresh login needed: the persistent bridge session for this
+                # platform isn't authenticated (first use, or it expired). The
+                # human logs in once in the visible window; thereafter the
+                # session is reused and this branch is skipped.
+                logger.info(
+                    "orchestrator.fresh_login_required",
+                    platform=slug,
+                    tender_id=tender.id,
+                )
                 self._set_task(
                     db,
                     task_id,
