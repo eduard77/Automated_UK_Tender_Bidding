@@ -68,6 +68,10 @@ class PortalContext:
     # The tender's free-text description. Some portals (e.g. Delta) embed the
     # access code inside the notice text, so adapters parse this too.
     description: str | None = None
+    # The tender's title. Login adapters (e.g. Delta) match it against the
+    # opportunity names in the portal's own "my responses" listing to find an
+    # already-registered tender.
+    title: str | None = None
 
 
 class PortalAdapter(ABC):
@@ -99,6 +103,21 @@ class PortalAdapter(ABC):
         """Whether the bridge session is already logged in. Non-login adapters
         are trivially 'authenticated' (no login needed)."""
         return True
+
+    async def session_conflict(self, ctx: PortalContext) -> str | None:
+        """Return an actionable message if the portal reports a session
+        conflict that blocks this fetch (e.g. Delta's single-concurrent-login
+        lock), else None. Checked once at the start of a login-adapter fetch so
+        the orchestrator can fail fast with a clear message instead of hanging.
+        Default: no conflict."""
+        return None
+
+    async def logout(self, ctx: PortalContext) -> bool:
+        """Best-effort release of the portal's server-side session (log out).
+        Called when a login-adapter fetch reaches a terminal state. Adapters
+        with a single-concurrent-login constraint (Delta) override this so the
+        real user isn't locked out. Default: no-op."""
+        return False
 
     @abstractmethod
     def matches_url(self, url: str) -> bool:

@@ -93,6 +93,11 @@ DELTA_URLS = {
         "https://www.delta-esourcing.com/delta/suppliers/response/overview/"
         "documents/downloadDocument.html?respId=%s&supplierListId=%s&docId=%s"
     ),
+    # BEST-EFFORT — Delta supplier logout, used to release the single concurrent
+    # session so the human isn't locked out. Investigate/confirm the exact URL
+    # against the live logged-in menu; logout() also falls back to clicking the
+    # menu "Logout" control if this navigation doesn't end the session.
+    "logout": "https://www.delta-esourcing.com/delta/logout.html",
 }
 
 DELTA_SELECTORS = {
@@ -126,9 +131,28 @@ DELTA_SELECTORS = {
     "download_link_regex": (
         r"downloadDocument\.html\?respId=(\d+)&supplierListId=(\d+)&docId=(\d+)"
     ),
+    # CONFIRMED — the Response Manager "Responses" table lists the supplier's
+    # registered opportunities; each opportunity name is a link whose href
+    # already carries the Stage One ids (see STAGE_ONE_LINK_REGEX).
+    "responses_table": (
+        "table:has-text('Opportunity'), table#responses, table.responses"
+    ),
+    "responses_opportunity_link": "a[href*='suppRespStatus.html']",
+    # CONFIRMED — the opportunity link href holds BOTH Stage One ids, so an
+    # already-registered tender needs no Register-Interest click or redirect.
+    "STAGE_ONE_LINK_REGEX": r"suppRespStatus\.html\?id=(\d+)&listId=(\d+)",
+    # CONFIRMED — Delta blocks a second concurrent login with this banner.
+    "concurrent_login_text": "Concurrent Logins Are Not Enabled",
+    # BEST-EFFORT — the logged-in menu "Logout" control, used as a fallback when
+    # the logout URL doesn't end the session.
+    "logout_control": (
+        "a:has-text('Logout'), a:has-text('Log out'), a:has-text('Sign out'), "
+        "a:has-text('Log Off')"
+    ),
 }
 
 _DOWNLOAD_LINK_RE = re.compile(DELTA_SELECTORS["download_link_regex"], re.IGNORECASE)
+_STAGE_ONE_LINK_RE = re.compile(DELTA_SELECTORS["STAGE_ONE_LINK_REGEX"], re.IGNORECASE)
 
 # Login-success URL pattern for wait-for-login: after the human logs in (and
 # clears Microsoft Authenticator) Delta lands them in the supplier area. The
@@ -141,6 +165,29 @@ REGISTER_INTEREST_DETAIL = (
     "Delta requires you to Register Interest in this tender before documents are "
     "released. This tells the buyer you intend to bid. Confirm to proceed."
 )
+
+ALREADY_REGISTERED_DETAIL = (
+    "Your organisation has already registered interest in this tender on Delta. "
+    "Confirm to pull its documents — no further Register Interest is needed."
+)
+
+# Delta enforces a single concurrent login per account. If a second login is
+# active (e.g. the user is logged in elsewhere) Delta blocks us with this banner.
+CONCURRENT_LOGIN_DETAIL = (
+    "Delta session conflict — another Delta login is active for this account. "
+    "End your other Delta session (Delta's \"End Session\" email), then retry."
+)
+
+_CONCURRENT_LOGIN_MARKERS = (
+    DELTA_SELECTORS["concurrent_login_text"].lower(),
+    "currently in use",
+)
+
+
+def _has_concurrent_login(text: str | None) -> bool:
+    """True if the page shows Delta's single-session block."""
+    low = (text or "").lower()
+    return any(marker in low for marker in _CONCURRENT_LOGIN_MARKERS)
 
 # --- access-code extraction --------------------------------------------
 # The access code comes from the tender notice we already ingest from FTS/CF.
@@ -238,6 +285,69 @@ def _parse_document_rows(html: str) -> list[_DocRow]:
     return rows
 
 
+# --- Responses-table parsing (the already-registered path) --------------
+# The Response Manager lists the supplier's registered opportunities. Each
+# opportunity name is a link whose href already carries both Stage One ids — so
+# for an already-registered tender we read the ids straight off the link, with
+# no Register-Interest click and no redirect needed.
+
+
+@dataclass
+class _RespRow:
+    resp_id: str
+    list_id: str
+    title: str | None
+
+
+_RESP_ROW_ANCHOR_RE = re.compile(
+    r"(?is)<a\b[^>]*?href=[\"']"
+    r"([^\"']*suppRespStatus\.html\?id=\d+&listId=\d+[^\"']*)[\"']"
+    r"[^>]*>(.*?)</a>"
+)
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+# Below this Jaccard score a Responses row is not considered a match (only used
+# to disambiguate when the table has more than one row).
+MATCH_MIN_SCORE = 0.15
+
+
+def _parse_responses_rows(html: str) -> list[_RespRow]:
+    """Enumerate the supplier's registered opportunities from the Responses
+    table HTML by the opportunity-link pattern (which carries id/listId). One
+    row per distinct (id, listId); title is the link text."""
+    rows: list[_RespRow] = []
+    seen: set[tuple[str, str]] = set()
+    # Real Delta markup encodes the ampersand as &amp;; decode so the CONFIRMED
+    # link regex (which uses a literal &) matches both live HTML and fixtures.
+    decoded = (html or "").replace("&amp;", "&")
+    for m in _RESP_ROW_ANCHOR_RE.finditer(decoded):
+        href, inner = m.group(1), m.group(2)
+        ids = _STAGE_ONE_LINK_RE.search(href)
+        if not ids:
+            continue
+        rid, lid = ids.group(1), ids.group(2)
+        if (rid, lid) in seen:
+            continue
+        seen.add((rid, lid))
+        title = re.sub(r"\s+", " ", _TAG_RE.sub(" ", inner)).strip() or None
+        rows.append(_RespRow(rid, lid, title))
+    return rows
+
+
+def _title_tokens(value: str | None) -> set[str]:
+    """Significant (>=3 char) lowercased word tokens of a title."""
+    return {tok for tok in _TOKEN_RE.findall((value or "").lower()) if len(tok) >= 3}
+
+
+def _title_score(a: str | None, b: str | None) -> float:
+    """Jaccard overlap of two titles' significant tokens (0.0–1.0)."""
+    ta, tb = _title_tokens(a), _title_tokens(b)
+    if not ta or not tb:
+        return 0.0
+    union = len(ta | tb)
+    return len(ta & tb) / union if union else 0.0
+
+
 MAX_FILE_BYTES = 100 * 1024 * 1024
 MAX_DOCS = 50
 
@@ -308,12 +418,69 @@ class DeltaEsourcingAdapter(PortalAdapter):
 
     # --- locate / interest / download ----------------------------------
 
+    def _match_responses_row(
+        self, html: str, ctx: PortalContext
+    ) -> _RespRow | None:
+        """Find THIS tender in the Responses table. The table lists the
+        supplier's own registered opportunities and is typically short, so we
+        match by title (Jaccard token overlap against the tender title). A
+        single row is unambiguous; with several rows we pick the best match
+        above MATCH_MIN_SCORE. Logs what matched."""
+        rows = _parse_responses_rows(html)
+        if not rows:
+            return None
+        title = ctx.title
+        if not title:
+            # No tender title to compare against: only a single row is safe.
+            if len(rows) == 1:
+                logger.info(
+                    "delta.responses_match", reason="single_row_no_title",
+                    resp_id=rows[0].resp_id, list_id=rows[0].list_id,
+                    row_title=rows[0].title,
+                )
+                return rows[0]
+            logger.info(
+                "delta.responses_no_match", reason="no_title_multiple_rows",
+                rows=len(rows),
+            )
+            return None
+        scored = sorted(
+            ((row, _title_score(title, row.title)) for row in rows),
+            key=lambda pair: pair[1],
+            reverse=True,
+        )
+        best, score = scored[0]
+        # A lone row needs only some overlap; multiple rows must clear the
+        # threshold so we never grab a different registered opportunity.
+        threshold = 0.0 if len(rows) == 1 else MATCH_MIN_SCORE
+        if score > threshold:
+            logger.info(
+                "delta.responses_match", resp_id=best.resp_id,
+                list_id=best.list_id, row_title=best.title,
+                score=round(score, 3), rows=len(rows),
+            )
+            return best
+        logger.info(
+            "delta.responses_no_match", best_title=best.title,
+            best_score=round(score, 3), rows=len(rows),
+        )
+        return None
+
     async def locate_tender(
         self, ctx: PortalContext, tender_ref: str
     ) -> LocateResult:
-        """Open the notice page directly via the access-code URL. There is NO
-        search and NO access-code form on Delta — the code rides in the URL.
-        Detect open/closed and the REGISTER INTEREST gate."""
+        """Locate the tender, ALWAYS checking the Responses table first.
+
+        Delta does not redirect an already-registered tender from its notice
+        page to Stage One — instead the Response Manager's "Responses" table
+        lists it, and the opportunity link already carries both Stage One ids.
+        So we read the ids straight off that link (no Register Interest, no
+        redirect). Only when the tender is NOT in the table do we open the
+        notice page and gate on REGISTER INTEREST.
+
+        Either reachable case returns requires_interest_first so the orchestrator
+        pauses for confirmation before the FIRST fetch; the resume path then
+        skips Register Interest when the ids are already captured."""
         bridge, slug = ctx.bridge, ctx.platform_slug
         if bridge is None or slug is None:
             return LocateResult(status=LocateStatus.error, detail="no bridge session")
@@ -325,6 +492,33 @@ class DeltaEsourcingAdapter(PortalAdapter):
                 detail="No Delta access code found in the tender notice.",
             )
 
+        # 1. Always check the Responses table first (already-registered path).
+        try:
+            await bridge.navigate(slug, DELTA_URLS["response_manager"])
+            rm_text = await bridge.page_text(slug)
+        except Exception as exc:  # noqa: BLE001
+            return LocateResult(status=LocateStatus.error, detail=str(exc))
+        if _has_concurrent_login(rm_text):
+            logger.info("delta.concurrent_login", slug=slug, where="response_manager")
+            return LocateResult(status=LocateStatus.error, detail=CONCURRENT_LOGIN_DETAIL)
+        try:
+            rm_html = await bridge.page_html(slug)
+        except Exception:  # noqa: BLE001
+            rm_html = ""
+        match = self._match_responses_row(rm_html, ctx)
+        if match is not None:
+            self._resp_id, self._list_id = match.resp_id, match.list_id
+            logger.info(
+                "delta.already_registered", slug=slug, code=code,
+                resp_id=match.resp_id, list_id=match.list_id,
+            )
+            return LocateResult(
+                status=LocateStatus.requires_interest_first,
+                tender_url=DELTA_URLS["stage_one"] % (match.resp_id, match.list_id),
+                detail=ALREADY_REGISTERED_DETAIL,
+            )
+
+        # 2. Not registered yet → open the notice page; gate on REGISTER INTEREST.
         try:
             if code.isdigit():
                 url = DELTA_URLS["legacy_respond"] % code
@@ -336,6 +530,10 @@ class DeltaEsourcingAdapter(PortalAdapter):
             text = await bridge.page_text(slug)
         except Exception as exc:  # noqa: BLE001
             return LocateResult(status=LocateStatus.error, detail=str(exc))
+
+        if _has_concurrent_login(text):
+            logger.info("delta.concurrent_login", slug=slug, where="notice")
+            return LocateResult(status=LocateStatus.error, detail=CONCURRENT_LOGIN_DETAIL)
 
         low = (text or "").lower()
         # Closed tender — a common, expected state. Handle gracefully. (Check
@@ -364,51 +562,144 @@ class DeltaEsourcingAdapter(PortalAdapter):
                 detail=REGISTER_INTEREST_DETAIL,
             )
 
-        # No Register Interest button: either already registered (documents
-        # reachable) or simply open. An already-registered notice exposes a
-        # Stage One link — capture its ids so the download step can reach the
-        # documents without re-registering.
+        # No Register Interest button and not in the Responses table. Some
+        # already-registered notices still expose a Stage One link directly —
+        # capture its ids so the resume path skips Register Interest.
         try:
             for u in await bridge.find_links(slug, r"suppRespStatus\.html"):
                 rid, lid = _parse_stage_one_ids(u)
                 if rid and lid:
                     self._resp_id, self._list_id = rid, lid
-                    logger.info("delta.stage_one_ids", resp_id=rid, list_id=lid)
-                    break
+                    logger.info("delta.stage_one_ids_on_notice", resp_id=rid, list_id=lid)
+                    return LocateResult(
+                        status=LocateStatus.requires_interest_first,
+                        tender_url=DELTA_URLS["stage_one"] % (rid, lid),
+                        detail=ALREADY_REGISTERED_DETAIL,
+                    )
         except Exception:  # noqa: BLE001
             pass
-        if (self._resp_id and self._list_id) or (
-            DELTA_SELECTORS["open_marker_text"].lower() in low
-        ):
-            return LocateResult(status=LocateStatus.found, tender_url=url)
+        if DELTA_SELECTORS["open_marker_text"].lower() in low:
+            return LocateResult(
+                status=LocateStatus.requires_interest_first,
+                tender_url=url,
+                detail=REGISTER_INTEREST_DETAIL,
+            )
         return LocateResult(
             status=LocateStatus.not_found,
             detail="Notice loaded but no REGISTER INTEREST button or open marker found.",
         )
 
     async def register_interest(self, ctx: PortalContext) -> RegisterResult:
-        """Click REGISTER INTEREST. The orchestrator only calls this AFTER the
-        user explicitly confirms via the needs_user_confirmation pause — never
-        automatically. Captures the Stage One respId/listId from the resulting
-        URL for the download step."""
+        """Register interest, but ONLY if the tender isn't already registered.
+
+        The orchestrator calls this AFTER the user confirms via the
+        needs_user_confirmation pause — never automatically. If locate already
+        captured the Stage One ids (the tender is in the Responses table) we
+        must NOT re-register: return already_registered without clicking.
+        Otherwise click REGISTER INTEREST on the notice page and capture the
+        Stage One ids from the resulting Stage One page (or the Responses table
+        Delta adds the tender to)."""
         bridge, slug = ctx.bridge, ctx.platform_slug
         if bridge is None or slug is None:
             return RegisterResult(status=RegisterStatus.error, detail="no bridge")
+
+        # Already registered (ids captured during locate): never click again.
+        if self._resp_id and self._list_id:
+            logger.info(
+                "delta.register_interest_skipped", slug=slug,
+                reason="already_registered",
+                resp_id=self._resp_id, list_id=self._list_id,
+            )
+            return RegisterResult(status=RegisterStatus.already_registered)
+
+        # Not registered → open the notice page and click REGISTER INTEREST.
+        code = extract_access_code(*self._code_sources(ctx))
+        if code:
+            url = (
+                DELTA_URLS["legacy_respond"] % code
+                if code.isdigit()
+                else DELTA_URLS["respond_landing"] % code
+            )
+            try:
+                await bridge.navigate(slug, url)
+            except Exception as exc:  # noqa: BLE001
+                return RegisterResult(status=RegisterStatus.error, detail=str(exc))
         try:
             await bridge.click(slug, DELTA_SELECTORS["register_interest_button"])
         except Exception as exc:  # noqa: BLE001
             return RegisterResult(status=RegisterStatus.error, detail=str(exc))
-        # After the click Delta lands on Stage One: capture the two ids.
+        logger.info("delta.register_interest_clicked", slug=slug)
+
+        # Capture the Stage One ids: first from the resulting URL (Delta usually
+        # redirects to Stage One), else from the Responses table it now lists.
+        rid, lid = None, None
         try:
             status = await bridge.session_status(slug)
             rid, lid = _parse_stage_one_ids(status.get("current_url"))
-            if rid and lid:
-                self._resp_id, self._list_id = rid, lid
-                logger.info("delta.stage_one_ids", resp_id=rid, list_id=lid)
         except Exception:  # noqa: BLE001
             pass
-        logger.info("delta.register_interest_clicked", slug=slug)
-        return RegisterResult(status=RegisterStatus.success)
+        if not (rid and lid):
+            try:
+                await bridge.navigate(slug, DELTA_URLS["response_manager"])
+                rm_html = await bridge.page_html(slug)
+                match = self._match_responses_row(rm_html, ctx)
+                if match is not None:
+                    rid, lid = match.resp_id, match.list_id
+            except Exception:  # noqa: BLE001
+                pass
+        if rid and lid:
+            self._resp_id, self._list_id = rid, lid
+            logger.info("delta.stage_one_ids", resp_id=rid, list_id=lid)
+            return RegisterResult(status=RegisterStatus.success)
+        return RegisterResult(
+            status=RegisterStatus.error,
+            detail=(
+                "Registered interest but could not locate Stage One page — "
+                "Delta may require a moment; retry."
+            ),
+        )
+
+    async def session_conflict(self, ctx: PortalContext) -> str | None:
+        """Probe an authenticated Delta page for the single-concurrent-login
+        block. Returns an actionable message if Delta is blocking us because a
+        second login is active, else None. Called once at fetch start so the
+        orchestrator fails fast instead of looping on waiting_for_login."""
+        bridge, slug = ctx.bridge, ctx.platform_slug
+        if bridge is None or slug is None:
+            return None
+        try:
+            await bridge.navigate(slug, DELTA_URLS["response_manager"])
+            text = await bridge.page_text(slug)
+        except Exception:  # noqa: BLE001
+            return None
+        if _has_concurrent_login(text):
+            logger.info("delta.concurrent_login", slug=slug, where="session_conflict")
+            return CONCURRENT_LOGIN_DETAIL
+        return None
+
+    async def logout(self, ctx: PortalContext) -> bool:
+        """Best-effort logout to release Delta's single concurrent session so
+        the real user isn't locked out. Tries the logout URL first, then the
+        logged-in menu "Logout" control. Non-fatal — if it can't end the
+        session, the user can recover via Delta's "End Session" email."""
+        bridge, slug = ctx.bridge, ctx.platform_slug
+        if bridge is None or slug is None:
+            return False
+        ok = False
+        try:
+            await bridge.navigate(slug, DELTA_URLS["logout"])
+            ok = True
+        except Exception as exc:  # noqa: BLE001
+            logger.info("delta.logout_url_failed", error=str(exc))
+        if not ok:
+            try:
+                if await bridge.element_exists(slug, DELTA_SELECTORS["logout_control"]):
+                    await bridge.click(slug, DELTA_SELECTORS["logout_control"])
+                    ok = True
+            except Exception as exc:  # noqa: BLE001
+                logger.info("delta.logout_control_failed", error=str(exc))
+        logger.info("delta.logout", slug=slug, ok=ok)
+        return ok
 
     async def _resolve_stage_one(
         self, bridge, slug: str
