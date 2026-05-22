@@ -30,7 +30,7 @@ from tender_agent.models import (
     Tender,
     TenderDocumentFile,
 )
-from tender_agent.services import push
+from tender_agent.services import preflight, push
 from tender_agent.services.bridge_client import BridgeClient
 from tender_agent.services.credentials import CredentialsStore
 from tender_agent.services.portals.base import (
@@ -93,10 +93,13 @@ class OrchestrationResult:
 
 
 def _dest_dir(tender_id: int) -> str:
+    """Per-run staging directory for adapters that download straight to a folder
+    (the public-HTTP fallback / Contracts Finder path). Always rooted at the
+    configured, absolute DOCUMENT_STORAGE_DIR — never a bare relative 'data'
+    path, which fails the instant the working directory isn't writable (the
+    PermissionError: 'data' seen in live testing — issue 4d-1)."""
     ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    base = os.environ.get("TENDER_AGENT_DOC_ROOT") or os.path.join(
-        "data", "tender-documents"
-    )
+    base = os.environ.get("TENDER_AGENT_DOC_ROOT") or settings.document_storage_dir
     return str(Path(base) / str(tender_id) / ts)
 
 
@@ -397,6 +400,35 @@ class PortalOrchestrator:
             platform_slug=platform_slug,
             adapter=adapter_name,
         )
+
+        # Self-diagnosing preflight (issue 4d): on a real run — where the
+        # orchestrator builds its own bridge — fail fast with an actionable
+        # message instead of a raw PermissionError after the human has already
+        # logged in, or a silent 401 from an unconfigured bridge token. Callers
+        # that inject a bridge (unit tests) own their environment, so the guard
+        # is skipped for them.
+        if self._bridge is None:
+            docs_ok, docs_detail = preflight.check_documents_dir_writable()
+            if not docs_ok:
+                logger.warning(
+                    "orchestrator.preflight_failed",
+                    check="documents_dir",
+                    detail=docs_detail,
+                )
+                base.status = OrchestrationStatus.error
+                base.detail = docs_detail
+                return base
+            token_ok, token_detail = preflight.check_bridge_token()
+            if not token_ok:
+                logger.warning(
+                    "orchestrator.preflight_failed",
+                    check="bridge_token",
+                    detail=token_detail,
+                )
+                base.status = OrchestrationStatus.error
+                base.detail = token_detail
+                return base
+
         bridge = self._get_bridge()
         if not await bridge.bridge_available():
             base.status = OrchestrationStatus.bridge_unavailable

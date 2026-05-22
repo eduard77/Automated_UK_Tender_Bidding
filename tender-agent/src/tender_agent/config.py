@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,8 +25,10 @@ class Settings(BaseSettings):
     sell2wales_api_base: str = "https://api.sell2wales.gov.wales/v1"
     etendersni_feed_url: str = "https://etendersni.gov.uk/epps/cft/listContractNotices.do?type=atom"
 
-    # Document downloader
-    document_storage_dir: str = "/var/tender-agent/documents"
+    # Document downloader. A single, writable, host-mounted location under
+    # /app/data (see docker-compose.yml). Every document/staging path derives
+    # from this — never a bare relative 'data' path.
+    document_storage_dir: str = "/app/data/documents"
     document_max_bytes: int = 50 * 1024 * 1024  # 50 MB
 
     http_timeout_seconds: int = 30
@@ -46,11 +49,19 @@ class Settings(BaseSettings):
     dashboard_base_url: str = "http://localhost:3000"
 
     # Browser bridge (native Windows helper, outside Docker). The container
-    # reaches the host at host.docker.internal. The token must match the
-    # bridge's TENDER_AGENT_BRIDGE_TOKEN. The download dir is the in-container
-    # mount of the host folder the bridge writes to.
-    bridge_url: str = "http://host.docker.internal:8765"
-    bridge_token: str = ""
+    # reaches the host at host.docker.internal. The token MUST match the
+    # bridge's TENDER_AGENT_BRIDGE_TOKEN (browser-bridge/.env) — that is the
+    # canonical env name shared by both sides, so we read it here too (the bare
+    # BRIDGE_URL/BRIDGE_TOKEN names stay accepted as a fallback). The download
+    # dir is the in-container mount of the host folder the bridge writes to.
+    bridge_url: str = Field(
+        default="http://host.docker.internal:8765",
+        validation_alias=AliasChoices("TENDER_AGENT_BRIDGE_URL", "BRIDGE_URL"),
+    )
+    bridge_token: str = Field(
+        default="",
+        validation_alias=AliasChoices("TENDER_AGENT_BRIDGE_TOKEN", "BRIDGE_TOKEN"),
+    )
     bridge_download_dir: str = "/app/data/bridge-downloads"
 
 
