@@ -21,8 +21,18 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql+psycopg://tender:tender@db:5432/tender_agent
-      # Reach the native Windows browser bridge on the host.
-      BRIDGE_URL: ${BRIDGE_URL:-http://host.docker.internal:8765}
+      # Single, writable, host-mounted documents location (issue 4d-2). Must
+      # match the /app/data/documents volume mount below so fetched files persist
+      # on the host where the user can see them.
+      DOCUMENT_STORAGE_DIR: /app/data/documents
+      # Browser bridge (native Windows helper running OUTSIDE Docker). The
+      # container reaches the host at host.docker.internal; extra_hosts makes
+      # that work on Linux engines too. TENDER_AGENT_BRIDGE_TOKEN MUST match
+      # browser-bridge/.env — without it the backend can't drive the bridge
+      # (issue 4d-3). Both come from .env (loaded below) but are passed
+      # explicitly so they're also overridable from the host shell.
+      TENDER_AGENT_BRIDGE_URL: ${TENDER_AGENT_BRIDGE_URL:-http://host.docker.internal:8765}
+      TENDER_AGENT_BRIDGE_TOKEN: ${TENDER_AGENT_BRIDGE_TOKEN}
     env_file: .env
     # host.docker.internal lets the container reach a service on the host
     # (the browser bridge). host-gateway is required on Linux engines.
@@ -31,6 +41,10 @@ services:
     ports:
       - "8000:8000"
     volumes:
+      # Documents folder: the backend writes fetched ITT files here; the host
+      # path persists them so the user can open them. Mounted writable, so the
+      # app user can create the sha-sharded layout under it (issue 4d-2).
+      - "${USERPROFILE:-${HOME}}/.tender-agent/documents:/app/data/documents"
       # Shared download folder: the bridge (on Windows) writes fetched files
       # here; the backend reads them back. The host path defaults to the user's
       # profile; on Windows Docker Desktop passes USERPROFILE through. If the

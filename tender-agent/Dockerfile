@@ -62,6 +62,14 @@ COPY --chown=app:app src ./src
 # without a manual `docker cp`.
 COPY --chown=app:app scripts ./scripts
 
+# Pre-create the data dirs the app writes to (documents + bridge downloads) and
+# own them as the app user. docker-compose bind-mounts the host folders over
+# these subdirs at runtime; pre-creating /app/data app-owned means /app/data is
+# never left root-owned (which is what made the old relative 'data' write fail
+# with PermissionError) and writes succeed whether or not the mounts are present.
+RUN mkdir -p /app/data/documents /app/data/bridge-downloads \
+    && chown -R app:app /app/data
+
 USER app
 
 EXPOSE 8000
