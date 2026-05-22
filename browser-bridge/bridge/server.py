@@ -366,6 +366,14 @@ async def screenshot(
 
 @app.post("/session/{slug}/close")
 async def close_session(slug: str, _: None = Depends(require_token)) -> dict:
+    """End a session: close its pages and the persistent browser context.
+
+    This is the local half of releasing a session. For portals with a single
+    concurrent-login constraint (Delta eSourcing), the adapter first navigates
+    the live session to the portal's logout URL (via /navigate) so the *server*
+    frees the login too — closing the context alone would leave Delta's session
+    active until it times out, locking the real user out. The orchestrator does
+    logout-then-close on every terminal state."""
     closed = await manager.close(slug)
     return {"closed": closed}
 
