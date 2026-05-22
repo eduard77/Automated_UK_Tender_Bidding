@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from tender_agent.services.bridge_client import BridgeFile
+from tender_agent.services.bridge_client import BridgeFile, RenderedPage
 from tender_agent.services.portals.adapters.delta_esourcing import (
     ALREADY_REGISTERED_DETAIL,
     CONCURRENT_LOGIN_DETAIL,
@@ -61,9 +61,11 @@ def _responses_table_html(rows):
     )
 
 
-def _docs_table_html(resp_id="555", list_id="777", n=3, titles=None):
+def _docs_table_html(resp_id="555", list_id="777", n=3, titles=None, items=None):
     """Build a Stage One documents table with n rows, each carrying a direct
-    downloadDocument link (the real download mechanism)."""
+    downloadDocument link (the real download mechanism). When `items` is given,
+    append Delta's "Displaying 1 - n of <items> items" footer so partial-render
+    detection (rows-found vs items-displayed) can be exercised."""
     rows = []
     for i in range(n):
         doc_id = 1000 + i
@@ -76,9 +78,10 @@ def _docs_table_html(resp_id="555", list_id="777", n=3, titles=None):
             f"<tr><td>{title}</td><td>1 MB</td><td>PDF</td><td>01/05/2026</td>"
             f"<td><a href='{href}'>Download File</a></td></tr>"
         )
+    footer = f"<div>Displaying 1 - {n} of {items} items</div>" if items else ""
     return (
         "<table><tr><th>Document Title</th><th>Size</th><th>File Type</th>"
-        "<th>Uploaded</th><th>Action</th></tr>" + "".join(rows) + "</table>"
+        "<th>Uploaded</th><th>Action</th></tr>" + "".join(rows) + "</table>" + footer
     )
 
 
@@ -108,6 +111,8 @@ class FakeBridge:
         self.clicks: list[str] = []
         self.selects: list[tuple[str, dict]] = []
         self.click_downloads: list[str] = []
+        self.rendered_calls: list[dict] = []
+        self.page_html_calls = 0
 
     async def bridge_available(self):
         return True
@@ -126,7 +131,31 @@ class FakeBridge:
         return self.text
 
     async def page_html(self, slug):
+        # The adapter no longer reads the JS-rendered tables via page_html;
+        # tracked so tests can assert the rendered-DOM path is used instead.
+        self.page_html_calls += 1
         return self.html
+
+    async def rendered_html(
+        self, slug, *, wait_for_selector=None, wait_for_text=None, timeout_ms=15000
+    ):
+        """Return self.html as the "rendered DOM". wait_satisfied mirrors whether
+        the requested marker is present — wait_for_text in the html, or
+        wait_for_selector in present_selectors — so the adapter's fallback logic
+        is exercised exactly as against the live bridge."""
+        self.rendered_calls.append(
+            {"selector": wait_for_selector, "text": wait_for_text,
+             "timeout_ms": timeout_ms}
+        )
+        if wait_for_text is not None:
+            satisfied = wait_for_text in (self.html or "")
+        elif wait_for_selector is not None:
+            satisfied = wait_for_selector in self.present_selectors
+        else:
+            satisfied = True
+        return RenderedPage(
+            html=self.html, wait_satisfied=satisfied, current_url=self.current_url
+        )
 
     async def fill(self, slug, selector, value):
         self.fills.append((selector, value))
@@ -366,6 +395,31 @@ async def test_locate_already_registered_reads_ids_from_responses_table():
     # Only the Response Manager was visited — no notice page, no re-registration.
     assert any("addToList.html" in u for u in bridge.navigated)
     assert not any("respondToList.html" in u for u in bridge.navigated)
+
+
+@pytest.mark.asyncio
+async def test_locate_already_registered_reads_rendered_dom_not_page_html():
+    # The Responses table is a JS-rendered bip-table too — locate must read it
+    # via rendered_html (waiting for the opportunity links), not the raw shell.
+    rm_html = _responses_table_html(
+        [("1038167190", "1036629453", "Provision of Cleaning Services")]
+    )
+    bridge = FakeBridge(html=rm_html, text="My Responses")
+    adapter = DeltaEsourcingAdapter()
+    res = await adapter.locate_tender(
+        _ctx(
+            bridge,
+            source_url="https://www.delta-esourcing.com/respond/286EVX23TV",
+            title="Provision of Cleaning Services for Council",
+        ),
+        "REF-123",
+    )
+    assert res.status == LocateStatus.requires_interest_first
+    assert (adapter._resp_id, adapter._list_id) == ("1038167190", "1036629453")
+    # Read the rendered DOM (waiting for the opportunity-link marker); never the
+    # raw page-html shell.
+    assert any(c["text"] == "suppRespStatus.html" for c in bridge.rendered_calls)
+    assert bridge.page_html_calls == 0
 
 
 @pytest.mark.asyncio
@@ -646,6 +700,99 @@ async def test_download_nothing_available_when_table_empty(tmp_path, monkeypatch
     )
     res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
     assert res.status == DownloadStatus.nothing_available
+    # Not a silent empty result — a clear detail naming the likely cause.
+    assert "did not render" in res.detail
+
+
+@pytest.mark.asyncio
+async def test_download_reads_rendered_dom_not_page_html(tmp_path, monkeypatch):
+    # The download links live only in the RENDERED DOM (bip-table JS render), so
+    # the adapter must read via rendered_html — never the raw page-html shell.
+    bridge_dl, storage = _patch_storage(monkeypatch, tmp_path)
+    bridge = FakeBridge(
+        html=_docs_table_html(n=3),
+        current_url=STAGE_ONE_URL,
+        download_dir=str(bridge_dl),
+    )
+    res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
+    assert res.status == DownloadStatus.complete
+    assert len(res.files) == 3
+    # Rendered DOM read with a wait for the download-link marker; page_html unused.
+    assert bridge.rendered_calls
+    assert bridge.rendered_calls[0]["text"] == "downloadDocument"
+    assert bridge.page_html_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_download_builds_urls_from_known_ids_and_docid(tmp_path, monkeypatch):
+    # Deterministic URL build: respId/listId come from the captured Stage One ids
+    # and only docId varies per row — independent of the rendered href.
+    bridge_dl, _ = _patch_storage(monkeypatch, tmp_path)
+    bridge = FakeBridge(
+        html=_docs_table_html(resp_id="555", list_id="777", n=3),
+        current_url=STAGE_ONE_URL,
+        download_dir=str(bridge_dl),
+    )
+    res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
+    assert {f.url for f in res.files} == {
+        DELTA_URLS["document_download"] % ("555", "777", str(1000 + i))
+        for i in range(3)
+    }
+
+
+@pytest.mark.asyncio
+async def test_download_nothing_available_on_empty_bip_table_shell(
+    tmp_path, monkeypatch
+):
+    # Even after the render wait, the table is just the empty bip-table shell
+    # (no download links) → nothing_available WITH the clear detail, not silent.
+    bridge_dl, _ = _patch_storage(monkeypatch, tmp_path)
+    shell = (
+        "<bip-table s:id='docs'><bip-table-search></bip-table-search>"
+        "<table><tr><th>Document Title</th><th>Size</th><th>File Type</th>"
+        "<th>Action</th></tr></table></bip-table>"
+    )
+    bridge = FakeBridge(
+        html=shell, current_url=STAGE_ONE_URL, download_dir=str(bridge_dl)
+    )
+    res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
+    assert res.status == DownloadStatus.nothing_available
+    assert "did not render" in res.detail
+    # It DID wait for the render signal (and the fallbacks) before giving up.
+    assert any(c["text"] == "downloadDocument" for c in bridge.rendered_calls)
+
+
+@pytest.mark.asyncio
+async def test_download_partial_render_downloads_found_rows(tmp_path, monkeypatch):
+    # Only 10 of 22 rows rendered (Delta still shows "of 22 items"): download the
+    # 10 found, mark partial, and do NOT return nothing_available.
+    bridge_dl, _ = _patch_storage(monkeypatch, tmp_path)
+    bridge = FakeBridge(
+        html=_docs_table_html(n=10, items=22),
+        current_url=STAGE_ONE_URL,
+        download_dir=str(bridge_dl),
+    )
+    res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
+    assert res.status == DownloadStatus.partial
+    assert len(res.files) == 10
+    assert res.status != DownloadStatus.nothing_available
+    assert res.detail and "10 of 22" in res.detail
+
+
+@pytest.mark.asyncio
+async def test_download_full_render_matches_items_count_is_complete(
+    tmp_path, monkeypatch
+):
+    # All 22 rendered and "of 22 items" → complete, no partial flag.
+    bridge_dl, _ = _patch_storage(monkeypatch, tmp_path)
+    bridge = FakeBridge(
+        html=_docs_table_html(n=22, items=22),
+        current_url=STAGE_ONE_URL,
+        download_dir=str(bridge_dl),
+    )
+    res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
+    assert res.status == DownloadStatus.complete
+    assert len(res.files) == 22
 
 
 def test_stage_one_and_download_urls_are_well_formed():

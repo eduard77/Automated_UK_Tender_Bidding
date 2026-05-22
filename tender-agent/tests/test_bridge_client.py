@@ -112,6 +112,41 @@ async def test_navigate_and_page_text_and_find_links():
 
 
 @pytest.mark.asyncio
+async def test_rendered_html_endpoint_and_payload():
+    _FakeClient.next_response = _FakeResponse(
+        200,
+        {"current_url": "u", "html": "<html>rows</html>", "wait_satisfied": True},
+    )
+    out = await BridgeClient().rendered_html(
+        "delta", wait_for_text="downloadDocument", timeout_ms=15000
+    )
+    call = _last()
+    assert call["url"].endswith("/session/delta/rendered-html")
+    assert call["json"] == {"timeout_ms": 15000, "wait_for_text": "downloadDocument"}
+    assert call["headers"]["X-Bridge-Token"] == "secret-token"
+    assert out.html == "<html>rows</html>"
+    assert out.wait_satisfied is True
+    assert out.current_url == "u"
+
+
+@pytest.mark.asyncio
+async def test_rendered_html_selector_and_unsatisfied_wait():
+    # Selector-based wait, and a timed-out wait degrades to wait_satisfied=False
+    # (missing key also degrades to False) while still returning the html.
+    _FakeClient.next_response = _FakeResponse(
+        200, {"html": "<html>shell</html>"}
+    )
+    out = await BridgeClient().rendered_html(
+        "delta", wait_for_selector="table#documents", timeout_ms=8000
+    )
+    assert _last()["json"] == {
+        "timeout_ms": 8000, "wait_for_selector": "table#documents"
+    }
+    assert out.html == "<html>shell</html>"
+    assert out.wait_satisfied is False
+
+
+@pytest.mark.asyncio
 async def test_fill_endpoint_and_payload():
     _FakeClient.next_response = _FakeResponse(200, {"ok": True, "current_url": "u"})
     await BridgeClient().fill("delta", "input#accessCode", "286EVX23TV")
