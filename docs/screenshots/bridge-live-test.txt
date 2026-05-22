@@ -1,0 +1,19 @@
+============================= test session starts =============================
+platform win32 -- Python 3.12.7, pytest-9.0.3, pluggy-1.6.0
+rootdir: C:\Code\PublicTender\browser-bridge
+configfile: pyproject.toml
+plugins: anyio-4.13.0, asyncio-1.3.0
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 2 items
+
+tests\test_bridge_live.py health: {'status': 'ok', 'service': 'browser-bridge', 'version': '0.1.0'}
+open: {'session_id': 'practice', 'current_url': 'https://the-internet.herokuapp.com/login', 'authenticated_guess': False}
+wait-for-login: {'status': 'logged_in', 'current_url': 'https://the-internet.herokuapp.com/secure'}
+secure page text ok
+reopen: {'session_id': 'practice', 'current_url': 'https://the-internet.herokuapp.com/login', 'authenticated_guess': False}
+session persisted: /secure reachable without re-login
+download: {'path': 'avatar.jpg', 'size_bytes': 2464, 'mime_type': 'image/jpeg'}
+LIVE BRIDGE PIPELINE: PASS
+..
+
+============================== 2 passed in 7.93s ==============================

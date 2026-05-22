@@ -210,6 +210,9 @@ export interface FetchTask {
   files_count: number;
   missing_count: number;
   detail: string | null;
+  login_url: string | null;
+  bridge_session_slug: string | null;
+  waiting_since: string | null;
   created_at: string;
   updated_at: string;
   finished_at: string | null;
@@ -221,15 +224,34 @@ export const startFetchDocuments = (tenderId: number) =>
 export const getFetchStatus = (tenderId: number, taskId: string) =>
   request<FetchTask>(`/tenders/${tenderId}/fetch-documents/${taskId}`);
 
+export const confirmFetch = (tenderId: number, taskId: string) =>
+  request<FetchTask>(
+    `/tenders/${tenderId}/fetch-documents/${taskId}/confirm`,
+    { method: "POST" },
+  );
+
+export const cancelFetch = (tenderId: number, taskId: string) =>
+  request<FetchTask>(
+    `/tenders/${tenderId}/fetch-documents/${taskId}/cancel`,
+    { method: "POST" },
+  );
+
+export const getBridgeHealth = () =>
+  request<{ available: boolean }>("/system/bridge-health");
+
 // Direct link to a stored document's bytes (served by the backend with a
 // sanitised download filename). Goes through the same /__api proxy.
 export function documentFileUrl(tenderId: number, docId: number): string {
   return `${API_BASE}/tenders/${tenderId}/documents/${docId}/file`;
 }
 
-// A fetch task is finished once it leaves the queued/running states.
+// A fetch task is still progressing on its own while queued/running, and while
+// waiting for the user to log in (it auto-continues once they do). It pauses
+// (awaiting an explicit user action) at needs_user_confirmation.
 export function isFetchTaskActive(status: string): boolean {
-  return status === "queued" || status === "running";
+  return (
+    status === "queued" || status === "running" || status === "waiting_for_login"
+  );
 }
 
 export const listFilters = () => request<FilterProfile[]>("/filters");

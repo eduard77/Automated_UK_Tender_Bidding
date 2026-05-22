@@ -15,6 +15,7 @@ from tender_agent.api import filters as filters_api
 from tender_agent.api import platforms as platforms_api
 from tender_agent.api import portals as portals_api
 from tender_agent.api import push as push_api
+from tender_agent.api import system as system_api
 from tender_agent.api import tender_fetch as tender_fetch_api
 from tender_agent.api import tenders as tenders_api
 from tender_agent.api import vault as vault_api
@@ -68,3 +69,4 @@ app.include_router(portals_api.router)
 app.include_router(platforms_api.router)
 app.include_router(credentials_api.router)
 app.include_router(tender_fetch_api.router)
+app.include_router(system_api.router)

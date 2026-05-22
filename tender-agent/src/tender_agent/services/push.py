@@ -134,6 +134,22 @@ def send_to_subscribers(
     return (sent, failed)
 
 
+def send_system_notification(
+    db: Session, title: str, body: str, url: str, tag: str | None = None
+) -> None:
+    """Dispatch a system notification (e.g. 'log in to fetch documents') to all
+    catch-all subscribers. Best-effort; never raises. Caller commits.
+
+    Catch-all subscribers are those with filter_profile_id IS NULL; passing a
+    sentinel profile id that matches no real profile reaches exactly them.
+    """
+    payload = {"title": title, "body": body, "url": url, "tag": tag or "system"}
+    try:
+        send_to_subscribers(db, -1, payload)
+    except Exception:  # noqa: BLE001
+        logger.exception("push.system_notification_failed", title=title)
+
+
 def send_match_notifications(
     db: Session, tender: Tender, matched_profile_ids: list[int]
 ) -> None:

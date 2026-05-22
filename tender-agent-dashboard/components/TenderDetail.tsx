@@ -7,6 +7,8 @@ import useSWR from "swr";
 import PillKicker from "./PillKicker";
 import {
   ApiError,
+  cancelFetch,
+  confirmFetch,
   documentFileUrl,
   fetcher,
   getFetchStatus,
@@ -85,6 +87,30 @@ export default function TenderDetail({ id }: { id: number }) {
     }
   }, [id, pollTask]);
 
+  const confirmExpressInterest = useCallback(async () => {
+    if (!fetchTask) return;
+    setFetchError(null);
+    if (pollRef.current) clearTimeout(pollRef.current);
+    try {
+      const task = await confirmFetch(id, fetchTask.task_id);
+      setFetchTask(task);
+      pollTask(task.task_id);
+    } catch {
+      setFetchError("Couldn't confirm — try again.");
+    }
+  }, [id, fetchTask, pollTask]);
+
+  const cancelTask = useCallback(async () => {
+    if (!fetchTask) return;
+    if (pollRef.current) clearTimeout(pollRef.current);
+    try {
+      const task = await cancelFetch(id, fetchTask.task_id);
+      setFetchTask(task);
+    } catch {
+      setFetchError("Couldn't cancel — try again.");
+    }
+  }, [id, fetchTask]);
+
   if (tender.error instanceof ApiError && tender.error.status === 404) {
     return <NotFound />;
   }
@@ -118,6 +144,8 @@ export default function TenderDetail({ id }: { id: number }) {
         error={documents.error}
         onRetry={() => documents.mutate()}
         onFetch={startFetch}
+        onConfirm={confirmExpressInterest}
+        onCancel={cancelTask}
         task={fetchTask}
         fetchError={fetchError}
       />
@@ -835,6 +863,8 @@ function DocumentsSection({
   error,
   onRetry,
   onFetch,
+  onConfirm,
+  onCancel,
   task,
   fetchError,
 }: {
@@ -844,6 +874,8 @@ function DocumentsSection({
   error: unknown;
   onRetry: () => void;
   onFetch: () => void;
+  onConfirm: () => void;
+  onCancel: () => void;
   task: FetchTask | null;
   fetchError: string | null;
 }) {
@@ -868,7 +900,14 @@ function DocumentsSection({
           {fetchError}
         </p>
       )}
-      {task && <FetchStatusBanner task={task} />}
+      {task && (
+        <FetchStatusBanner
+          task={task}
+          onConfirm={onConfirm}
+          onCancel={onCancel}
+          onRetry={onFetch}
+        />
+      )}
 
       {error ? (
         <div
@@ -912,50 +951,142 @@ function DocumentsSection({
   );
 }
 
-function FetchStatusBanner({ task }: { task: FetchTask }) {
-  const active = isFetchTaskActive(task.status);
-  const tone =
-    task.status === "complete"
-      ? { border: "rgba(151,213,188,0.3)", bg: "rgba(151,213,188,0.06)" }
-      : task.status === "partial"
-        ? { border: "rgba(245,166,35,0.3)", bg: "rgba(245,166,35,0.06)" }
-        : task.status === "error"
-          ? { border: "rgba(248,113,113,0.3)", bg: "rgba(248,113,113,0.06)" }
-          : { border: "rgba(255,255,255,0.12)", bg: "rgba(255,255,255,0.03)" };
+const AMBER = { border: "rgba(245,166,35,0.35)", bg: "rgba(245,166,35,0.07)" };
+const GREEN = { border: "rgba(151,213,188,0.3)", bg: "rgba(151,213,188,0.06)" };
+const RED = { border: "rgba(248,113,113,0.35)", bg: "rgba(248,113,113,0.07)" };
+const NEUTRAL = { border: "rgba(255,255,255,0.12)", bg: "rgba(255,255,255,0.03)" };
 
+function FetchStatusBanner({
+  task,
+  onConfirm,
+  onCancel,
+  onRetry,
+}: {
+  task: FetchTask;
+  onConfirm: () => void;
+  onCancel: () => void;
+  onRetry: () => void;
+}) {
+  const active = isFetchTaskActive(task.status);
+  const platform = task.platform_slug ?? "the portal";
+
+  // --- interpretive / login states get their own action UI ---
+  if (task.status === "waiting_for_login") {
+    return (
+      <BannerShell tone={AMBER}>
+        <p className="text-text" style={{ fontSize: "13px" }}>
+          <span className="mr-2 inline-block animate-pulse">●</span>
+          Waiting for you to log in to <strong>{platform}</strong>. A browser
+          window should be open on your PC — log in there and this continues
+          automatically.
+        </p>
+        <BannerActions>
+          <button type="button" onClick={onRetry} className="btn-ghost">
+            I&apos;ve logged in / Retry
+          </button>
+          <button type="button" onClick={onCancel} className="btn-ghost">
+            Cancel
+          </button>
+        </BannerActions>
+      </BannerShell>
+    );
+  }
+
+  if (task.status === "needs_user_confirmation") {
+    return (
+      <BannerShell tone={AMBER}>
+        <p className="text-text" style={{ fontSize: "13px" }}>
+          {task.detail ??
+            `${platform} requires you to Express Interest before documents are released.`}{" "}
+          This signals to the buyer that you intend to bid.
+        </p>
+        <BannerActions>
+          <button type="button" onClick={onConfirm} className="btn-primary">
+            Confirm &amp; continue <span className="arrow">→</span>
+          </button>
+          <button type="button" onClick={onCancel} className="btn-ghost">
+            Not now
+          </button>
+        </BannerActions>
+      </BannerShell>
+    );
+  }
+
+  if (task.status === "bridge_unavailable") {
+    return (
+      <BannerShell tone={RED}>
+        <p className="text-text" style={{ fontSize: "13px" }}>
+          Browser bridge isn&apos;t running. Open <code>start-bridge.ps1</code> on
+          your PC, then retry.
+        </p>
+        <BannerActions>
+          <button type="button" onClick={onRetry} className="btn-ghost">
+            ↻ Retry
+          </button>
+        </BannerActions>
+      </BannerShell>
+    );
+  }
+
+  // --- plain status messages ---
+  let tone = NEUTRAL;
   let message: string;
   if (active) {
+    tone = NEUTRAL;
     message = "Fetching documents from the source…";
   } else if (task.status === "complete" && task.files_count === 0) {
+    tone = GREEN;
     message = `No documents available for this tender${
       task.adapter === "ContractsFinderDirectAdapter" ? " from CF" : ""
     }.`;
   } else if (task.status === "complete") {
+    tone = GREEN;
     message = `Fetched ${task.files_count} document${task.files_count === 1 ? "" : "s"}.`;
   } else if (task.status === "partial") {
+    tone = AMBER;
     message = `Limited documents available — ${task.files_count} fetched, ${task.missing_count} require login${
       task.platform_slug ? ` to ${task.platform_slug}` : ""
     }.`;
   } else if (task.status === "no_portal") {
+    tone = NEUTRAL;
     message = "No known portal hosts this tender's documents.";
-  } else if (task.status === "error") {
+  } else if (task.status === "failed" || task.status === "error") {
+    tone = RED;
     message = `Fetch failed${task.detail ? `: ${task.detail}` : ""}.`;
   } else {
     message = `Status: ${task.status}.`;
   }
 
   return (
-    <div
-      role="status"
-      className="rounded-xl border p-4"
-      style={{ borderRadius: "14px", border: `1px solid ${tone.border}`, background: tone.bg }}
-    >
+    <BannerShell tone={tone}>
       <span className="text-text" style={{ fontSize: "13px" }}>
         {active && <span className="mr-2 inline-block animate-pulse">●</span>}
         {message}
       </span>
+    </BannerShell>
+  );
+}
+
+function BannerShell({
+  tone,
+  children,
+}: {
+  tone: { border: string; bg: string };
+  children: React.ReactNode;
+}) {
+  return (
+    <div
+      role="status"
+      className="rounded-xl border p-4 space-y-3"
+      style={{ borderRadius: "14px", border: `1px solid ${tone.border}`, background: tone.bg }}
+    >
+      {children}
     </div>
   );
+}
+
+function BannerActions({ children }: { children: React.ReactNode }) {
+  return <div className="flex flex-wrap items-center gap-3">{children}</div>;
 }
 
 function DocumentRow({ tenderId, file }: { tenderId: number; file: TenderDocumentFile }) {

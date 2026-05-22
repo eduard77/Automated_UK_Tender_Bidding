@@ -57,6 +57,14 @@ class PortalContext:
     candidate_urls: list[str] = field(default_factory=list)
     # Tender scope for on-disk storage layout. 0 when not run per-tender.
     tender_id: int = 0
+    # Login-via-human flow (chunk 4): the browser bridge client + the bridge
+    # session slug. Set for adapters with requires_login=True (e.g. Delta).
+    bridge: Any | None = None
+    platform_slug: str | None = None
+    # The tender's source reference / direct portal URL, used by login adapters
+    # to locate the tender page.
+    tender_ref: str | None = None
+    source_url: str | None = None
 
 
 class PortalAdapter(ABC):
@@ -68,6 +76,26 @@ class PortalAdapter(ABC):
     # calling the adapter. FallbackAdapter sets this False so the HTTP-only
     # path runs without Playwright installed (CI-safe).
     requires_browser: bool = True
+    # When True the adapter needs an authenticated browser session via the
+    # Windows bridge: the orchestrator opens a session, waits for the human to
+    # log in, then drives the adapter. Login adapters never store passwords.
+    requires_login: bool = False
+
+    def login_url(self) -> str | None:
+        """The portal's login page URL (for the wait-for-login step). Login
+        adapters override this; others return None."""
+        return None
+
+    def login_success_pattern(self) -> str:
+        """Regex matched against the page URL to detect a completed login.
+        Default never matches, so the orchestrator falls back to polling
+        is_authenticated; login adapters override with a real pattern."""
+        return r"(?!)"
+
+    async def is_authenticated(self, ctx: PortalContext) -> bool:
+        """Whether the bridge session is already logged in. Non-login adapters
+        are trivially 'authenticated' (no login needed)."""
+        return True
 
     @abstractmethod
     def matches_url(self, url: str) -> bool:

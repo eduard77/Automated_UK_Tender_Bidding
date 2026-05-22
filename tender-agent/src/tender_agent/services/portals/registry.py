@@ -6,6 +6,9 @@ None so the orchestrator can fall back to FallbackAdapter.
 """
 from __future__ import annotations
 
+from tender_agent.services.portals.adapters.delta_esourcing import (
+    DeltaEsourcingAdapter,
+)
 from tender_agent.services.portals.base import PortalAdapter
 from tender_agent.services.portals.contracts_finder import (
     ContractsFinderDirectAdapter,
@@ -15,6 +18,7 @@ from tender_agent.services.portals.fallback import FallbackAdapter
 # slug -> adapter class. Populated as real adapters land (prompts 3-9).
 ADAPTERS: dict[str, type[PortalAdapter]] = {
     "contracts_finder_direct": ContractsFinderDirectAdapter,
+    "delta_esourcing": DeltaEsourcingAdapter,
 }
 
 
