@@ -15,6 +15,8 @@ import pytest
 
 from tender_agent.services.bridge_client import BridgeFile
 from tender_agent.services.portals.adapters.delta_esourcing import (
+    ALREADY_REGISTERED_DETAIL,
+    CONCURRENT_LOGIN_DETAIL,
     DELTA_SELECTORS,
     DELTA_URLS,
     DeltaEsourcingAdapter,
@@ -29,10 +31,34 @@ from tender_agent.services.portals.results import (
 )
 
 CLOSED_BANNER = "This opportunity is not currently open."
+CONCURRENT_BANNER = "Concurrent Logins Are Not Enabled — currently in use."
 STAGE_ONE_URL = (
     "https://www.delta-esourcing.com/delta/suppliers/select/"
     "suppRespStatus.html?id=555&listId=777"
 )
+
+
+def _responses_table_html(rows):
+    """Build a Response Manager "Responses" table. Each row is
+    (resp_id, list_id, opportunity_title); the title is a link whose href
+    carries both Stage One ids (the real already-registered mechanism)."""
+    trs = []
+    for resp_id, list_id, title in rows:
+        href = (
+            "https://www.delta-esourcing.com/delta/suppliers/select/"
+            f"suppRespStatus.html?id={resp_id}&amp;listId={list_id}"
+        )
+        trs.append(
+            f"<tr><td><a href='{href}'>{title}</a></td><td>ITT</td>"
+            "<td>No</td><td>01/05/2026</td><td>In Progress</td>"
+            "<td>12/06/2026</td><td>Buyer</td></tr>"
+        )
+    return (
+        "<table class='responses'><tr><th>Opportunity</th>"
+        "<th>Opportunity Type</th><th>Submitted</th><th>Submitted Date</th>"
+        "<th>Status</th><th>Closing Date</th><th>Owner</th></tr>"
+        + "".join(trs) + "</table>"
+    )
 
 
 def _docs_table_html(resp_id="555", list_id="777", n=3, titles=None):
@@ -141,7 +167,7 @@ class FakeBridge:
 
 
 def _ctx(bridge, *, tender_id=900100, candidate_urls=None, source_url=None,
-         description=None, tender_ref="REF-123"):
+         description=None, tender_ref="REF-123", title=None):
     return PortalContext(
         portal_id=1,
         user_id="tester",
@@ -153,6 +179,7 @@ def _ctx(bridge, *, tender_id=900100, candidate_urls=None, source_url=None,
         source_url=source_url,
         description=description,
         tender_ref=tender_ref,
+        title=title,
     )
 
 
@@ -314,19 +341,95 @@ async def test_locate_closed_tender_returns_not_found_gracefully():
 
 
 @pytest.mark.asyncio
-async def test_locate_already_registered_found_and_captures_ids():
-    # No REGISTER INTEREST button; an existing Stage One link is present.
-    bridge = FakeBridge(
-        text="Your response is in progress. View documents.",
-        links=[STAGE_ONE_URL],
+async def test_locate_already_registered_reads_ids_from_responses_table():
+    # The tender is already in the Responses table; its opportunity link carries
+    # the Stage One ids (note &amp; encoding, like real Delta markup).
+    rm_html = _responses_table_html(
+        [("1038167190", "1036629453", "Provision of Cleaning Services")]
     )
+    bridge = FakeBridge(html=rm_html, text="My Responses")
+    adapter = DeltaEsourcingAdapter()
+    res = await adapter.locate_tender(
+        _ctx(
+            bridge,
+            source_url="https://www.delta-esourcing.com/respond/286EVX23TV",
+            title="Provision of Cleaning Services for Council",
+        ),
+        "REF-123",
+    )
+    # Still pauses for confirmation before the FIRST fetch, but with the ids
+    # captured straight from the link and NO Register Interest click.
+    assert res.status == LocateStatus.requires_interest_first
+    assert res.detail == ALREADY_REGISTERED_DETAIL
+    assert (adapter._resp_id, adapter._list_id) == ("1038167190", "1036629453")
+    assert bridge.clicks == []
+    # Only the Response Manager was visited — no notice page, no re-registration.
+    assert any("addToList.html" in u for u in bridge.navigated)
+    assert not any("respondToList.html" in u for u in bridge.navigated)
+
+
+@pytest.mark.asyncio
+async def test_locate_already_registered_picks_best_title_match():
+    # Several registered opportunities — match THIS tender by title.
+    rm_html = _responses_table_html([
+        ("111", "222", "Grounds Maintenance Framework"),
+        ("1038167190", "1036629453", "Provision of Cleaning Services"),
+        ("333", "444", "IT Support Services"),
+    ])
+    bridge = FakeBridge(html=rm_html, text="My Responses")
+    adapter = DeltaEsourcingAdapter()
+    res = await adapter.locate_tender(
+        _ctx(
+            bridge,
+            source_url="https://www.delta-esourcing.com/respond/286EVX23TV",
+            title="Provision of Cleaning Services",
+        ),
+        "REF-123",
+    )
+    assert res.status == LocateStatus.requires_interest_first
+    assert (adapter._resp_id, adapter._list_id) == ("1038167190", "1036629453")
+    assert bridge.clicks == []
+
+
+@pytest.mark.asyncio
+async def test_locate_not_registered_gates_on_register_after_responses_check():
+    # Empty Responses table → not registered → notice page → REGISTER INTEREST.
+    bridge = FakeBridge(
+        html=_responses_table_html([]),
+        text="This tender is currently OPEN. REGISTER INTEREST to bid.",
+    )
+    adapter = DeltaEsourcingAdapter()
+    res = await adapter.locate_tender(
+        _ctx(
+            bridge,
+            source_url="https://www.delta-esourcing.com/respond/286EVX23TV",
+            title="Some Other Tender",
+        ),
+        "REF-123",
+    )
+    assert res.status == LocateStatus.requires_interest_first
+    assert res.detail != ALREADY_REGISTERED_DETAIL
+    assert (adapter._resp_id, adapter._list_id) == (None, None)
+    # Checked the Responses table FIRST, then opened the notice page.
+    assert any("addToList.html" in u for u in bridge.navigated)
+    assert any(
+        "respondToList.html?accessCode=286EVX23TV" in u for u in bridge.navigated
+    )
+    assert bridge.clicks == []
+
+
+@pytest.mark.asyncio
+async def test_locate_concurrent_login_returns_clear_error():
+    bridge = FakeBridge(text=CONCURRENT_BANNER)
     adapter = DeltaEsourcingAdapter()
     res = await adapter.locate_tender(
         _ctx(bridge, source_url="https://www.delta-esourcing.com/respond/286EVX23TV"),
         "REF-123",
     )
-    assert res.status == LocateStatus.found
-    assert (adapter._resp_id, adapter._list_id) == ("555", "777")
+    assert res.status == LocateStatus.error
+    assert res.detail == CONCURRENT_LOGIN_DETAIL
+    # Bailed at the Response Manager — never opened the notice page.
+    assert not any("respondToList.html" in u for u in bridge.navigated)
 
 
 @pytest.mark.asyncio
@@ -367,6 +470,59 @@ async def test_register_interest_clicks_and_captures_stage_one_ids():
     assert res.status == RegisterStatus.success
     assert DELTA_SELECTORS["register_interest_button"] in bridge.clicks
     assert (adapter._resp_id, adapter._list_id) == ("555", "777")
+
+
+@pytest.mark.asyncio
+async def test_register_interest_skips_click_when_already_registered():
+    # locate already captured the ids → never re-register (never click).
+    bridge = FakeBridge(current_url=STAGE_ONE_URL)
+    adapter = DeltaEsourcingAdapter()
+    adapter._resp_id, adapter._list_id = "555", "777"
+    res = await adapter.register_interest(_ctx(bridge))
+    assert res.status == RegisterStatus.already_registered
+    assert bridge.clicks == []
+    assert bridge.navigated == []
+
+
+@pytest.mark.asyncio
+async def test_register_interest_errors_when_no_stage_one_after_click():
+    # Click happens but Delta neither redirects to Stage One nor lists the row.
+    bridge = FakeBridge(
+        current_url="https://www.delta-esourcing.com/delta/respondToList.html?x=1",
+        html=_responses_table_html([]),
+    )
+    adapter = DeltaEsourcingAdapter()
+    res = await adapter.register_interest(
+        _ctx(bridge, source_url="https://www.delta-esourcing.com/respond/286EVX23TV")
+    )
+    assert res.status == RegisterStatus.error
+    assert "could not locate Stage One" in res.detail
+    assert DELTA_SELECTORS["register_interest_button"] in bridge.clicks
+
+
+# --- session conflict + logout (single-session constraint) -------------
+
+
+@pytest.mark.asyncio
+async def test_session_conflict_detects_concurrent_login():
+    bridge = FakeBridge(text=CONCURRENT_BANNER)
+    msg = await DeltaEsourcingAdapter().session_conflict(_ctx(bridge))
+    assert msg == CONCURRENT_LOGIN_DETAIL
+    assert any("addToList.html" in u for u in bridge.navigated)
+
+
+@pytest.mark.asyncio
+async def test_session_conflict_none_when_no_conflict():
+    bridge = FakeBridge(text="My Responses — all good")
+    assert await DeltaEsourcingAdapter().session_conflict(_ctx(bridge)) is None
+
+
+@pytest.mark.asyncio
+async def test_logout_navigates_to_logout_url():
+    bridge = FakeBridge()
+    ok = await DeltaEsourcingAdapter().logout(_ctx(bridge))
+    assert ok is True
+    assert DELTA_URLS["logout"] in bridge.navigated
 
 
 # --- download: direct downloadDocument GET (no menu clicks) ------------
