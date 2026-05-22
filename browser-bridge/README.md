@@ -55,6 +55,25 @@ If a portal requires you to **"Express Interest"** before releasing documents,
 the dashboard will pause and ask you to confirm first — because that tells the
 buyer you intend to bid. Nothing is clicked on your behalf without that confirm.
 
+## Delta eSourcing: one login at a time
+
+Delta only allows **one active login per account at a time** ("Concurrent Logins
+Are Not Enabled"). While the bridge is using your Delta session, you can't also
+be logged into Delta in your own browser, and vice-versa.
+
+To avoid locking you out, the bridge now **logs out of Delta and releases the
+session automatically** when a fetch finishes (whether it succeeded or failed).
+So once a fetch completes, you're free to use Delta yourself.
+
+Two things to know:
+
+- If you start a fetch while you're **already logged into Delta** elsewhere, the
+  fetch fails fast with a clear message ("Delta session conflict…"). End your
+  other Delta session, then retry.
+- If you ever still see "the login details provided are currently in use", use
+  Delta's **"End Session"** email link to force-release the stuck session, then
+  retry.
+
 ## Stopping it
 
 Press **Ctrl+C** in the bridge window, or just close it. Your saved logins stay
