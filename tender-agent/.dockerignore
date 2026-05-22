@@ -19,7 +19,9 @@ ENV/
 
 # Tests + fixtures (not run inside the runtime image)
 tests/
-scripts/
+# NOTE: scripts/ is intentionally NOT ignored — operator scripts
+# (backfill_portal_discovery.py et al.) ship in the image and are run via
+# `docker compose exec app python scripts/<name>.py`.
 
 # Caches
 .pytest_cache/

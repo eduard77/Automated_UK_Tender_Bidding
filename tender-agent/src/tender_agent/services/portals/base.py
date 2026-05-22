@@ -65,6 +65,9 @@ class PortalContext:
     # to locate the tender page.
     tender_ref: str | None = None
     source_url: str | None = None
+    # The tender's free-text description. Some portals (e.g. Delta) embed the
+    # access code inside the notice text, so adapters parse this too.
+    description: str | None = None
 
 
 class PortalAdapter(ABC):

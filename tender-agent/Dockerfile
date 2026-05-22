@@ -57,6 +57,10 @@ COPY --from=builder /opt/venv /opt/venv
 COPY --chown=app:app alembic ./alembic
 COPY --chown=app:app alembic.ini ./
 COPY --chown=app:app src ./src
+# Operator scripts (backfill_portal_discovery.py et al.) must ship in the image
+# so they're runnable via `docker compose exec app python scripts/<name>.py`
+# without a manual `docker cp`.
+COPY --chown=app:app scripts ./scripts
 
 USER app
 

@@ -112,6 +112,39 @@ async def test_navigate_and_page_text_and_find_links():
 
 
 @pytest.mark.asyncio
+async def test_fill_endpoint_and_payload():
+    _FakeClient.next_response = _FakeResponse(200, {"ok": True, "current_url": "u"})
+    await BridgeClient().fill("delta", "input#accessCode", "286EVX23TV")
+    call = _last()
+    assert call["url"].endswith("/session/delta/fill")
+    assert call["json"] == {"selector": "input#accessCode", "value": "286EVX23TV"}
+    assert call["headers"]["X-Bridge-Token"] == "secret-token"
+
+
+@pytest.mark.asyncio
+async def test_click_endpoint_and_payload():
+    _FakeClient.next_response = _FakeResponse(200, {"ok": True, "current_url": "u"})
+    await BridgeClient().click("delta", "button[type='submit']")
+    call = _last()
+    assert call["url"].endswith("/session/delta/click")
+    assert call["json"] == {"selector": "button[type='submit']"}
+
+
+@pytest.mark.asyncio
+async def test_element_exists_returns_bool():
+    _FakeClient.next_response = _FakeResponse(200, {"exists": True})
+    assert await BridgeClient().element_exists("delta", "table#responses") is True
+    assert _last()["url"].endswith("/session/delta/element-exists")
+
+    _FakeClient.next_response = _FakeResponse(200, {"exists": False})
+    assert await BridgeClient().element_exists("delta", "table#responses") is False
+
+    # Missing key degrades to False rather than raising.
+    _FakeClient.next_response = _FakeResponse(200, {})
+    assert await BridgeClient().element_exists("delta", "x") is False
+
+
+@pytest.mark.asyncio
 async def test_download_returns_bridge_file():
     _FakeClient.next_response = _FakeResponse(
         200, {"path": "abc.pdf", "size_bytes": 123, "mime_type": "application/pdf"}

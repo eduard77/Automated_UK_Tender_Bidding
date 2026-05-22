@@ -76,6 +76,19 @@ class ClickDownloadBody(BaseModel):
     dest_filename: str | None = None
 
 
+class FillBody(BaseModel):
+    selector: str
+    value: str
+
+
+class ClickBody(BaseModel):
+    selector: str
+
+
+class SelectorBody(BaseModel):
+    selector: str
+
+
 class ScreenshotBody(BaseModel):
     label: str = "screenshot"
 
@@ -249,6 +262,50 @@ async def click_download(
     await dl.save_as(str(path))
     size = path.stat().st_size if path.exists() else 0
     return {"path": filename, "size_bytes": size, "mime_type": _guess_mime(filename)}
+
+
+@app.post("/session/{slug}/fill")
+async def fill(slug: str, body: FillBody, _: None = Depends(require_token)) -> dict:
+    """Type a value into a text input (e.g. Delta's Access Code box). The human
+    still does the login; this only drives post-login form fields."""
+    session = _require_session(slug)
+    try:
+        await session.page.fill(body.selector, body.value)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"fill failed: {exc}") from exc
+    return {"ok": True, "current_url": session.page.url}
+
+
+@app.post("/session/{slug}/click")
+async def click(slug: str, body: ClickBody, _: None = Depends(require_token)) -> dict:
+    """Click an element that does NOT trigger a download (e.g. a Submit button).
+    For download-triggering clicks use /click-download instead."""
+    session = _require_session(slug)
+    try:
+        await session.page.click(body.selector)
+        with contextlib.suppress(Exception):
+            await session.page.wait_for_load_state("domcontentloaded")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"click failed: {exc}") from exc
+    title = ""
+    with contextlib.suppress(Exception):
+        title = await session.page.title()
+    return {"ok": True, "current_url": session.page.url, "title": title}
+
+
+@app.post("/session/{slug}/element-exists")
+async def element_exists(
+    slug: str, body: SelectorBody, _: None = Depends(require_token)
+) -> dict:
+    """Whether a selector matches anything on the current page. Lets adapters
+    detect state (e.g. the Responses table, an Express Interest button) without
+    parsing raw HTML."""
+    session = _require_session(slug)
+    try:
+        el = await session.page.query_selector(body.selector)
+    except Exception:  # noqa: BLE001
+        el = None
+    return {"exists": el is not None}
 
 
 @app.post("/session/{slug}/screenshot")
