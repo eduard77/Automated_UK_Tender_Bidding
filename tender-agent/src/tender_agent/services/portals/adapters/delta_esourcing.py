@@ -7,18 +7,23 @@ sees the password. Because of the authenticator, the persistent bridge session
 is reused across fetches so the human re-authenticates as rarely as possible.
 
 ╔══════════════════════════════════════════════════════════════════════════╗
-║  REAL-FLOW NOTE (corrected from chunk 4 after live reconnaissance).        ║
-║  Delta has NO supplier-side tender search. The entry path is the           ║
-║  Response Manager: the supplier types the tender's *access code* (which     ║
-║  comes from the FTS/CF notice we already ingest) into the "Access Code"     ║
-║  box and clicks Submit. If the tender is open it lands in the supplier's    ║
-║  "Responses" table and documents become reachable; if closed Delta shows   ║
-║  the literal banner "This opportunity is not currently open."              ║
+║  REAL-FLOW NOTE (corrected from chunk 4b after live recon + screenshots).  ║
+║  1. The access code rides in the URL. /respond/{CODE} redirects to         ║
+║     respondToList.html?accessCode={CODE}, which loads the NOTICE page       ║
+║     directly — there is NO access-code box to fill.                         ║
+║  2. The notice gates documents behind a "REGISTER INTEREST" button. That    ║
+║     click signals intent to bid, so the orchestrator pauses                 ║
+║     (needs_user_confirmation) and only clicks it on explicit user confirm.  ║
+║  3. After Register Interest + login, Delta lands on the Stage One Overview  ║
+║     (suppRespStatus.html?id={RESP_ID}&listId={LIST_ID}); those two ids      ║
+║     build the document download URLs.                                       ║
+║  4. Each document is a direct GET link                                      ║
+║     (downloadDocument.html?respId=&supplierListId=&docId=) — we GET each    ║
+║     through the authenticated session; we do NOT click per-row menus.       ║
 ║                                                                            ║
-║  CONFIRMED constants below are validated against the live site. Selectors  ║
-║  marked "CONFIRM SELECTOR" / "DRY-RUN" are best-effort and get corrected    ║
-║  by the user's manual validation — the flow around them is real and tested ║
-║  with a mocked bridge.                                                      ║
+║  CONFIRMED constants are validated against the live site. Selectors marked  ║
+║  "CONFIRM SELECTOR" / "DRY-RUN" are best-effort; the flow around them is    ║
+║  real and tested with a mocked bridge.                                      ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 """
 from __future__ import annotations
@@ -27,8 +32,9 @@ import hashlib
 import os
 import re
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import structlog
 
@@ -54,67 +60,75 @@ logger = structlog.get_logger(__name__)
 
 
 # --- Delta-specific constants — from live reconnaissance ----------------
-# CONFIRMED = verified against the live site. CONFIRM SELECTOR / DRY-RUN =
-# best-effort, to be corrected by the user's manual validation. Correcting
-# these is the whole of the remaining fix-up; the logic is platform-agnostic.
+# CONFIRMED = verified against the live site (with a real account + screenshots).
+# CONFIRM SELECTOR / DRY-RUN = best-effort, corrected by the user's manual
+# validation. Correcting these is the whole of the remaining fix-up; the logic
+# around them is platform-agnostic.
 
 DELTA_URLS = {
     # CONFIRMED — supplier login starts from the homepage; Delta redirects an
-    # unauthenticated user to its login page automatically when they hit a
-    # supplier page (so login_url points at the Response Manager below).
+    # unauthenticated user to login when they hit a supplier page.
     "login": "https://www.delta-esourcing.com/",
-    # CONFIRMED — the Response Manager. Logged-in suppliers enter a tender
-    # access code here; unauthenticated users are bounced to login.
+    # CONFIRMED — Response Manager, used only as an authenticated-session probe.
     "response_manager": (
         "https://www.delta-esourcing.com/delta/suppliers/select/addToList.html"
     ),
-    # CONFIRMED — legacy direct-respond URL for numeric notice ids (the third
-    # URL pattern); %s is the noticeId. No access-code box is involved.
+    # CONFIRMED — the notice page. /respond/{CODE} redirects here; loading it
+    # directly with the access code shows the tender notice (no form to fill).
+    "respond_landing": (
+        "https://www.delta-esourcing.com/delta/respondToList.html?accessCode=%s"
+    ),
+    # CONFIRMED — legacy direct-respond URL for numeric notice ids.
     "legacy_respond": (
         "https://www.delta-esourcing.com/delta/respondToList.html?noticeId=%s"
+    ),
+    # CONFIRMED — Stage One: Overview, reached after Register Interest + login.
+    # %s, %s = respId (id), listId. The documents table lives here.
+    "stage_one": (
+        "https://www.delta-esourcing.com/delta/suppliers/select/"
+        "suppRespStatus.html?id=%s&listId=%s"
+    ),
+    # CONFIRMED — direct document download. %s, %s, %s = respId, listId, docId.
+    "document_download": (
+        "https://www.delta-esourcing.com/delta/suppliers/response/overview/"
+        "documents/downloadDocument.html?respId=%s&supplierListId=%s&docId=%s"
     ),
 }
 
 DELTA_SELECTORS = {
-    # CONFIRM SELECTOR (placeholder #1) — the "Access Code" text input.
-    "access_code_input": (
-        "input#accessCode, input[name='accessCode'], input[name*='access']"
+    # CONFIRMED — the notice page button label is exactly "REGISTER INTEREST".
+    # Playwright :has-text is case-insensitive substring, so this matches it.
+    "register_interest_button": (
+        "a:has-text('Register Interest'), button:has-text('Register Interest'), "
+        "input[type='submit'][value*='Register Interest' i]"
     ),
-    # CONFIRM SELECTOR (placeholder #2) — the "Submit" button next to it.
-    "submit_button": (
-        "button[type='submit'], input[type='submit'], button:has-text('Submit')"
-    ),
-    # CONFIRMED — the literal error banner shown for a closed opportunity.
-    # Matched as plain text against the rendered page (not a CSS selector).
-    "not_open_error_text": "This opportunity is not currently open.",
+    "register_interest_button_text": "REGISTER INTEREST",
+    # CONFIRMED — open/closed banner text on the notice page.
+    "open_marker_text": "currently OPEN",
+    "closed_marker_text": "not currently open",
     # CONFIRM SELECTOR — a stable left-menu item that only renders for an
     # authenticated supplier (Profile Manager / Response Manager / etc.).
     "logged_in_marker": (
         "a:has-text('Response Manager'), a:has-text('Profile Manager'), "
-        "#supplierMenu, nav a:has-text('Resources')"
+        "a:has-text('Select Accredit'), #supplierMenu, nav a:has-text('Resources')"
     ),
-    # CONFIRM SELECTOR (placeholder #3) — the "Responses" table that lists the
-    # opportunities added via access code.
-    "responses_table": (
-        "table#responses, table.responses, table:has-text('Responses')"
+    # CONFIRM SELECTOR — the Stage One documents table (columns
+    # Document Title / Size / File Type / Uploaded / Action).
+    "documents_table": (
+        "table:has-text('Document Title'), table#documents, table.documents"
     ),
-    # DRY-RUN (placeholder #3, the one screen not yet seen) — documents area.
-    "documents_area": (
-        "#documents, .tender-documents, section:has-text('Documents')"
+    # CONFIRM SELECTOR — the "Display N items per page" dropdown.
+    "page_size_select": (
+        "select[name*='perPage' i], select[name*='pageSize' i], "
+        "select[aria-label*='per page' i], select.page-size"
     ),
-    # DRY-RUN — individual document download anchors.
-    "document_links": "a[href*='download'], a[href$='.pdf'], a[href$='.docx']",
-    # DRY-RUN — the Express/Register Interest control that signals intent to
-    # bid. Never auto-clicked: it goes through the needs_user_confirmation pause.
-    "express_interest_button": (
-        "a:has-text('Express Interest'), button:has-text('Express Interest'), "
-        "a:has-text('Register Interest'), button:has-text('Register Interest')"
+    # CONFIRMED — extract respId, supplierListId, docId from a download link.
+    "download_link_regex": (
+        r"downloadDocument\.html\?respId=(\d+)&supplierListId=(\d+)&docId=(\d+)"
     ),
 }
 
-# href pattern used with the bridge's find-links to enumerate document URLs.
-# DRY-RUN — confirm once the documents screen is seen.
-DELTA_DOCUMENT_HREF_PATTERN = r"(download|\.pdf|\.docx|\.doc|\.xls|\.xlsx|\.zip)"
+_DOWNLOAD_LINK_RE = re.compile(DELTA_SELECTORS["download_link_regex"], re.IGNORECASE)
 
 # Login-success URL pattern for wait-for-login: after the human logs in (and
 # clears Microsoft Authenticator) Delta lands them in the supplier area. The
@@ -122,6 +136,11 @@ DELTA_DOCUMENT_HREF_PATTERN = r"(download|\.pdf|\.docx|\.doc|\.xls|\.xlsx|\.zip)
 DELTA_LOGIN_SUCCESS_PATTERN = r"delta-esourcing\.com/delta/suppliers/"
 
 DELTA_DOMAIN_RE = re.compile(r"(^|\.)delta-esourcing\.com$", re.IGNORECASE)
+
+REGISTER_INTEREST_DETAIL = (
+    "Delta requires you to Register Interest in this tender before documents are "
+    "released. This tells the buyer you intend to bid. Confirm to proceed."
+)
 
 # --- access-code extraction --------------------------------------------
 # The access code comes from the tender notice we already ingest from FTS/CF.
@@ -166,6 +185,59 @@ def extract_access_code(*sources: str | None) -> str | None:
     return None
 
 
+def _parse_stage_one_ids(url: str | None) -> tuple[str | None, str | None]:
+    """Pull (respId, listId) from a Stage One URL's `id`/`listId` query params."""
+    if not url:
+        return None, None
+    q = parse_qs(urlparse(url).query)
+    return (
+        (q.get("id") or [None])[0],
+        (q.get("listId") or [None])[0],
+    )
+
+
+@dataclass
+class _DocRow:
+    resp_id: str
+    list_id: str
+    doc_id: str
+    title: str | None
+
+
+_TR_SPLIT_RE = re.compile(r"(?i)<tr\b")
+_FIRST_CELL_RE = re.compile(r"(?is)<t[dh][^>]*>(.*?)</t[dh]>")
+_TAG_RE = re.compile(r"(?s)<[^>]+>")
+
+
+def _first_cell_text(row_html: str) -> str | None:
+    """Best-effort document title = text of the row's first cell (Document
+    Title is column one). DRY-RUN: confirm the column order on the live site."""
+    m = _FIRST_CELL_RE.search(row_html)
+    if not m:
+        return None
+    text = _TAG_RE.sub(" ", m.group(1))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or None
+
+
+def _parse_document_rows(html: str) -> list[_DocRow]:
+    """Enumerate document rows from the Stage One documents table HTML by the
+    download-link pattern (which carries respId/listId/docId). One row per
+    distinct docId; title is best-effort from the first cell."""
+    rows: list[_DocRow] = []
+    seen: set[str] = set()
+    for seg in _TR_SPLIT_RE.split(html or ""):
+        m = _DOWNLOAD_LINK_RE.search(seg)
+        if not m:
+            continue
+        resp_id, list_id, doc_id = m.group(1), m.group(2), m.group(3)
+        if doc_id in seen:
+            continue
+        seen.add(doc_id)
+        rows.append(_DocRow(resp_id, list_id, doc_id, _first_cell_text(seg)))
+    return rows
+
+
 MAX_FILE_BYTES = 100 * 1024 * 1024
 MAX_DOCS = 50
 
@@ -174,6 +246,10 @@ class DeltaEsourcingAdapter(PortalAdapter):
     platform_slug = "delta_esourcing"
     requires_browser = False  # uses the Windows bridge, not an in-process page
     requires_login = True
+
+    # Stage One ids captured after Register Interest; reused by download step.
+    _resp_id: str | None = None
+    _list_id: str | None = None
 
     # --- classification / login ----------------------------------------
 
@@ -235,8 +311,9 @@ class DeltaEsourcingAdapter(PortalAdapter):
     async def locate_tender(
         self, ctx: PortalContext, tender_ref: str
     ) -> LocateResult:
-        """Submit the tender's access code on the Response Manager. There is NO
-        search on Delta — the code comes from the notice we already ingest."""
+        """Open the notice page directly via the access-code URL. There is NO
+        search and NO access-code form on Delta — the code rides in the URL.
+        Detect open/closed and the REGISTER INTEREST gate."""
         bridge, slug = ctx.bridge, ctx.platform_slug
         if bridge is None or slug is None:
             return LocateResult(status=LocateStatus.error, detail="no bridge session")
@@ -250,123 +327,192 @@ class DeltaEsourcingAdapter(PortalAdapter):
 
         try:
             if code.isdigit():
-                # Legacy numeric notice: direct respond URL, no access-code box.
                 url = DELTA_URLS["legacy_respond"] % code
                 logger.info("delta.locate_legacy", slug=slug, notice_id=code)
-                await bridge.navigate(slug, url)
             else:
+                url = DELTA_URLS["respond_landing"] % code
                 logger.info("delta.locate_access_code", slug=slug, code=code)
-                await bridge.navigate(slug, DELTA_URLS["response_manager"])
-                await bridge.fill(
-                    slug, DELTA_SELECTORS["access_code_input"], code
-                )
-                await bridge.click(slug, DELTA_SELECTORS["submit_button"])
+            await bridge.navigate(slug, url)
             text = await bridge.page_text(slug)
         except Exception as exc:  # noqa: BLE001
             return LocateResult(status=LocateStatus.error, detail=str(exc))
 
-        # Closed tender — a common, expected state. Handle gracefully.
-        if DELTA_SELECTORS["not_open_error_text"].lower() in (text or "").lower():
+        low = (text or "").lower()
+        # Closed tender — a common, expected state. Handle gracefully. (Check
+        # before the open marker: "not currently open" contains "currently open".)
+        if DELTA_SELECTORS["closed_marker_text"].lower() in low:
             logger.info("delta.tender_closed", slug=slug, code=code)
             return LocateResult(
                 status=LocateStatus.not_found,
                 detail='Tender is closed on Delta ("not currently open").',
             )
 
-        try:
-            docs = await bridge.element_exists(
-                slug, DELTA_SELECTORS["documents_area"]
-            )
-            interest = await bridge.element_exists(
-                slug, DELTA_SELECTORS["express_interest_button"]
-            )
-            in_responses = await bridge.element_exists(
-                slug, DELTA_SELECTORS["responses_table"]
-            )
-        except Exception as exc:  # noqa: BLE001
-            return LocateResult(status=LocateStatus.error, detail=str(exc))
-
-        # Documents gated behind Express Interest → pause for the user. The
-        # orchestrator must NOT auto-click it (signals intent to bid).
-        if interest and not docs:
+        # REGISTER INTEREST gate → pause for explicit user confirmation. The
+        # orchestrator must NOT auto-click it (it signals intent to bid).
+        has_register = DELTA_SELECTORS["register_interest_button_text"].lower() in low
+        if not has_register:
+            try:
+                has_register = await bridge.element_exists(
+                    slug, DELTA_SELECTORS["register_interest_button"]
+                )
+            except Exception:  # noqa: BLE001
+                has_register = False
+        if has_register:
             return LocateResult(
                 status=LocateStatus.requires_interest_first,
-                tender_url=DELTA_URLS["response_manager"],
-                detail=(
-                    "Delta requires you to Express Interest before documents are "
-                    "released. This signals intent to bid. Confirm to proceed."
-                ),
+                tender_url=url,
+                detail=REGISTER_INTEREST_DETAIL,
             )
-        # Tender is in the Responses table (or its documents are already shown).
-        if in_responses or docs:
-            return LocateResult(
-                status=LocateStatus.found, tender_url=DELTA_URLS["response_manager"]
-            )
+
+        # No Register Interest button: either already registered (documents
+        # reachable) or simply open. An already-registered notice exposes a
+        # Stage One link — capture its ids so the download step can reach the
+        # documents without re-registering.
+        try:
+            for u in await bridge.find_links(slug, r"suppRespStatus\.html"):
+                rid, lid = _parse_stage_one_ids(u)
+                if rid and lid:
+                    self._resp_id, self._list_id = rid, lid
+                    logger.info("delta.stage_one_ids", resp_id=rid, list_id=lid)
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+        if (self._resp_id and self._list_id) or (
+            DELTA_SELECTORS["open_marker_text"].lower() in low
+        ):
+            return LocateResult(status=LocateStatus.found, tender_url=url)
         return LocateResult(
             status=LocateStatus.not_found,
-            detail="Access code submitted but the tender did not appear in Responses.",
+            detail="Notice loaded but no REGISTER INTEREST button or open marker found.",
         )
 
     async def register_interest(self, ctx: PortalContext) -> RegisterResult:
-        """Click Express Interest. The orchestrator only calls this AFTER the
+        """Click REGISTER INTEREST. The orchestrator only calls this AFTER the
         user explicitly confirms via the needs_user_confirmation pause — never
-        automatically."""
+        automatically. Captures the Stage One respId/listId from the resulting
+        URL for the download step."""
         bridge, slug = ctx.bridge, ctx.platform_slug
         if bridge is None or slug is None:
             return RegisterResult(status=RegisterStatus.error, detail="no bridge")
         try:
-            await bridge.click(slug, DELTA_SELECTORS["express_interest_button"])
+            await bridge.click(slug, DELTA_SELECTORS["register_interest_button"])
         except Exception as exc:  # noqa: BLE001
             return RegisterResult(status=RegisterStatus.error, detail=str(exc))
-        logger.info("delta.express_interest_clicked", slug=slug)
+        # After the click Delta lands on Stage One: capture the two ids.
+        try:
+            status = await bridge.session_status(slug)
+            rid, lid = _parse_stage_one_ids(status.get("current_url"))
+            if rid and lid:
+                self._resp_id, self._list_id = rid, lid
+                logger.info("delta.stage_one_ids", resp_id=rid, list_id=lid)
+        except Exception:  # noqa: BLE001
+            pass
+        logger.info("delta.register_interest_clicked", slug=slug)
         return RegisterResult(status=RegisterStatus.success)
+
+    async def _resolve_stage_one(
+        self, bridge, slug: str
+    ) -> tuple[str | None, str | None]:
+        """Find the Stage One respId/listId: from the ids captured at Register
+        Interest, else the current URL, else a Stage One link on the page."""
+        if self._resp_id and self._list_id:
+            return self._resp_id, self._list_id
+        try:
+            status = await bridge.session_status(slug)
+            rid, lid = _parse_stage_one_ids(status.get("current_url"))
+            if rid and lid:
+                return rid, lid
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            for u in await bridge.find_links(slug, r"suppRespStatus\.html"):
+                rid, lid = _parse_stage_one_ids(u)
+                if rid and lid:
+                    return rid, lid
+        except Exception:  # noqa: BLE001
+            pass
+        return None, None
+
+    async def _maximise_page_size(self, bridge, slug: str) -> None:
+        """Best-effort: set the documents page-size dropdown to its largest
+        option so every row renders on one page. Non-fatal — if it fails we
+        enumerate whatever rows are present. DRY-RUN: confirm the select markup."""
+        try:
+            if await bridge.element_exists(slug, DELTA_SELECTORS["page_size_select"]):
+                await bridge.select_option(
+                    slug, DELTA_SELECTORS["page_size_select"], index=-1
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.info("delta.page_size_max_skipped", error=str(exc))
 
     async def download_documents(
         self, ctx: PortalContext, dest_dir: str
     ) -> DownloadResult:
-        """Enumerate document links in the opened tender and download each via
-        the authenticated bridge session, applying the chunk-3 caps + sha256
-        dedup. (The exact documents screen is a DRY-RUN item; for now we
-        enumerate links on the current page.)"""
+        """Download every Stage One document via a direct GET to
+        downloadDocument.html (using the captured respId/listId + each row's
+        docId) through the authenticated session. We do NOT click per-row menus.
+        Applies the chunk-3 caps (100MB/doc, 50 docs), sanitised filenames, and
+        sha256 dedup."""
         bridge, slug = ctx.bridge, ctx.platform_slug
         if bridge is None or slug is None:
             return DownloadResult(
                 status=DownloadStatus.error, detail="no bridge session"
             )
+
+        resp_id, list_id = await self._resolve_stage_one(bridge, slug)
+        if not (resp_id and list_id):
+            return DownloadResult(
+                status=DownloadStatus.error,
+                detail="could not determine Delta Stage One response/list ids",
+            )
+
         try:
-            links = await bridge.find_links(slug, DELTA_DOCUMENT_HREF_PATTERN)
+            await bridge.navigate(slug, DELTA_URLS["stage_one"] % (resp_id, list_id))
         except Exception as exc:  # noqa: BLE001
             return DownloadResult(status=DownloadStatus.error, detail=str(exc))
 
-        # Security boundary: only download Delta-hosted URLs.
-        allowed = [u for u in links if self.matches_url(u)]
-        rejected = [u for u in links if not self.matches_url(u)]
-        if not allowed:
+        # Make sure all rows are on one page, then read the documents table.
+        await self._maximise_page_size(bridge, slug)
+        try:
+            html = await bridge.page_html(slug)
+        except Exception as exc:  # noqa: BLE001
+            return DownloadResult(status=DownloadStatus.error, detail=str(exc))
+
+        rows = _parse_document_rows(html)
+        if not rows:
             return DownloadResult(
                 status=DownloadStatus.nothing_available,
-                missing=rejected,
-                detail="no Delta-hosted document links found",
+                detail="no documents found on Stage One",
             )
 
         files: list[DownloadedFile] = []
         seen_sha: set[str] = set()
-        missing: list[str] = list(rejected) + list(allowed[MAX_DOCS:])
-        for url in allowed[:MAX_DOCS]:
+        missing: list[str] = []
+        for row in rows[:MAX_DOCS]:
+            url = DELTA_URLS["document_download"] % (resp_id, list_id, row.doc_id)
+            if not self.matches_url(url):
+                missing.append(url)
+                continue
+            dest_name = _safe_name(row.title) if row.title else None
             try:
-                bf = await bridge.download(slug, url)
+                bf = await bridge.download(slug, url, dest_name)
             except Exception as exc:  # noqa: BLE001
                 logger.info("delta.download_failed", url=url, error=str(exc))
                 missing.append(url)
                 continue
-            df = _ingest_bridge_file(bf, url, ctx.tender_id)
+            df = _ingest_bridge_file(bf, url, ctx.tender_id, preferred_name=row.title)
             if df is None:
                 missing.append(url)
             elif df.sha256 in seen_sha:
-                # sha256 dedup: skip a duplicate of a file already taken.
                 logger.info("delta.duplicate_skipped", url=url, sha256=df.sha256)
             else:
                 seen_sha.add(df.sha256)
                 files.append(df)
+        # Anything beyond the cap is reported as missing.
+        for row in rows[MAX_DOCS:]:
+            missing.append(
+                DELTA_URLS["document_download"] % (resp_id, list_id, row.doc_id)
+            )
 
         if files and missing:
             status = DownloadStatus.partial
@@ -379,9 +525,12 @@ class DeltaEsourcingAdapter(PortalAdapter):
         return DownloadResult(status=status, files=files, missing=missing)
 
 
-def _ingest_bridge_file(bf, url: str, tender_id: int) -> DownloadedFile | None:
+def _ingest_bridge_file(
+    bf, url: str, tender_id: int, preferred_name: str | None = None
+) -> DownloadedFile | None:
     """Read a bridge-downloaded file from the shared volume, size-cap it,
-    sha256 it, and copy it into the tender-documents storage layout."""
+    sha256 it, and copy it into the tender-documents storage layout. The
+    on-disk record uses preferred_name (the document title) when provided."""
     src = Path(settings.bridge_download_dir) / bf.path
     if not src.is_file():
         logger.info("delta.bridge_file_missing", path=str(src))
@@ -398,7 +547,10 @@ def _ingest_bridge_file(bf, url: str, tender_id: int) -> DownloadedFile | None:
     target.parent.mkdir(parents=True, exist_ok=True)
     if not target.exists():
         target.write_bytes(data)
-    filename = _safe_name(os.path.basename(urlparse(url).path) or f"document.{ext}")
+    if preferred_name:
+        filename = _safe_name(preferred_name)
+    else:
+        filename = _safe_name(os.path.basename(urlparse(url).path) or f"document.{ext}")
     if "." not in filename:
         filename = f"{filename}.{ext}"
     return DownloadedFile(
