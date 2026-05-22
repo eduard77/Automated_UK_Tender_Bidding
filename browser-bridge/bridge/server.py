@@ -89,6 +89,14 @@ class SelectorBody(BaseModel):
     selector: str
 
 
+class SelectOptionBody(BaseModel):
+    selector: str
+    value: str | None = None
+    label: str | None = None
+    # index = -1 selects the LAST option (used to pick the largest page size).
+    index: int | None = None
+
+
 class ScreenshotBody(BaseModel):
     label: str = "screenshot"
 
@@ -306,6 +314,43 @@ async def element_exists(
     except Exception:  # noqa: BLE001
         el = None
     return {"exists": el is not None}
+
+
+@app.post("/session/{slug}/select-option")
+async def select_option(
+    slug: str, body: SelectOptionBody, _: None = Depends(require_token)
+) -> dict:
+    """Choose an option in a <select> (e.g. Delta's "items per page" dropdown).
+    index=-1 selects the last option, used to pick the largest page size so all
+    rows render on one page."""
+    session = _require_session(slug)
+    page = session.page
+    try:
+        if body.index is not None:
+            idx = body.index
+            if idx < 0:
+                count = await page.eval_on_selector(
+                    body.selector, "el => (el.options ? el.options.length : 0)"
+                )
+                idx = max(0, (count or 0) + idx)
+            await page.select_option(body.selector, index=idx)
+        elif body.value is not None:
+            await page.select_option(body.selector, value=body.value)
+        elif body.label is not None:
+            await page.select_option(body.selector, label=body.label)
+        else:
+            raise HTTPException(
+                status_code=400, detail="select-option needs value, label, or index"
+            )
+        with contextlib.suppress(Exception):
+            await page.wait_for_load_state("networkidle")
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502, detail=f"select-option failed: {exc}"
+        ) from exc
+    return {"ok": True, "current_url": page.url}
 
 
 @app.post("/session/{slug}/screenshot")
