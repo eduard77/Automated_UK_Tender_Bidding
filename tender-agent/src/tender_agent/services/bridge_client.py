@@ -118,6 +118,25 @@ class BridgeClient:
         )
         return bool(data.get("exists", False))
 
+    async def select_option(
+        self,
+        slug: str,
+        selector: str,
+        value: str | None = None,
+        label: str | None = None,
+        index: int | None = None,
+    ) -> dict:
+        """Choose an option in a <select>. index=-1 picks the last option (used
+        to maximise a page-size dropdown)."""
+        body: dict[str, Any] = {"selector": selector}
+        if value is not None:
+            body["value"] = value
+        if label is not None:
+            body["label"] = label
+        if index is not None:
+            body["index"] = index
+        return await self._post(f"/session/{slug}/select-option", body)
+
     async def page_text(self, slug: str) -> str:
         return (await self._get(f"/session/{slug}/page-text")).get("text", "")
 

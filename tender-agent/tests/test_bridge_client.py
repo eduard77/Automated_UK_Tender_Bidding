@@ -145,6 +145,21 @@ async def test_element_exists_returns_bool():
 
 
 @pytest.mark.asyncio
+async def test_select_option_endpoint_and_payload():
+    _FakeClient.next_response = _FakeResponse(200, {"ok": True, "current_url": "u"})
+    # index=-1 picks the last option (used to maximise a page-size dropdown).
+    await BridgeClient().select_option("delta", "select.page-size", index=-1)
+    call = _last()
+    assert call["url"].endswith("/session/delta/select-option")
+    assert call["json"] == {"selector": "select.page-size", "index": -1}
+
+    # value/label are only sent when provided (omitted keys stay out of payload).
+    _FakeClient.next_response = _FakeResponse(200, {"ok": True})
+    await BridgeClient().select_option("delta", "select.page-size", value="100")
+    assert _last()["json"] == {"selector": "select.page-size", "value": "100"}
+
+
+@pytest.mark.asyncio
 async def test_download_returns_bridge_file():
     _FakeClient.next_response = _FakeResponse(
         200, {"path": "abc.pdf", "size_bytes": 123, "mime_type": "application/pdf"}

@@ -1,12 +1,14 @@
 """Delta eSourcing adapter against a fully faked bridge. No browser, no network.
 
-These exercise the REAL Response-Manager flow (corrected from chunk 4):
-access-code extraction from the notice, access-code submit, closed-tender
-handling, the Express-Interest gate, and authenticated downloads. The
-Delta-specific selectors are the constants the user validates manually.
+These exercise the REAL Stage-One flow (corrected in chunk 4c after live recon):
+the access code rides in the URL (no form-fill), documents are gated behind a
+REGISTER INTEREST button (pause), and each document is a direct downloadDocument
+GET (no per-row menu clicks). The Delta-specific selectors/URLs are the constants
+the user validates manually.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -14,6 +16,7 @@ import pytest
 from tender_agent.services.bridge_client import BridgeFile
 from tender_agent.services.portals.adapters.delta_esourcing import (
     DELTA_SELECTORS,
+    DELTA_URLS,
     DeltaEsourcingAdapter,
     extract_access_code,
 )
@@ -25,12 +28,38 @@ from tender_agent.services.portals.results import (
     RegisterStatus,
 )
 
-CLOSED_BANNER = DELTA_SELECTORS["not_open_error_text"]
+CLOSED_BANNER = "This opportunity is not currently open."
+STAGE_ONE_URL = (
+    "https://www.delta-esourcing.com/delta/suppliers/select/"
+    "suppRespStatus.html?id=555&listId=777"
+)
+
+
+def _docs_table_html(resp_id="555", list_id="777", n=3, titles=None):
+    """Build a Stage One documents table with n rows, each carrying a direct
+    downloadDocument link (the real download mechanism)."""
+    rows = []
+    for i in range(n):
+        doc_id = 1000 + i
+        title = titles[i] if titles else f"Document {i}.pdf"
+        href = (
+            "/delta/suppliers/response/overview/documents/downloadDocument.html"
+            f"?respId={resp_id}&supplierListId={list_id}&docId={doc_id}"
+        )
+        rows.append(
+            f"<tr><td>{title}</td><td>1 MB</td><td>PDF</td><td>01/05/2026</td>"
+            f"<td><a href='{href}'>Download File</a></td></tr>"
+        )
+    return (
+        "<table><tr><th>Document Title</th><th>Size</th><th>File Type</th>"
+        "<th>Uploaded</th><th>Action</th></tr>" + "".join(rows) + "</table>"
+    )
 
 
 class FakeBridge:
     """Records interactions and returns canned page state. element_exists is
-    driven by `present_selectors` (the exact CSS strings the adapter passes)."""
+    driven by `present_selectors` (the exact CSS strings the adapter passes);
+    find_links filters the configured links by the requested regex."""
 
     def __init__(
         self,
@@ -51,6 +80,8 @@ class FakeBridge:
         self.navigated: list[str] = []
         self.fills: list[tuple[str, str]] = []
         self.clicks: list[str] = []
+        self.selects: list[tuple[str, dict]] = []
+        self.click_downloads: list[str] = []
 
     async def bridge_available(self):
         return True
@@ -59,9 +90,6 @@ class FakeBridge:
         return {}
 
     async def navigate(self, slug, url):
-        # Record the request, but DON'T overwrite current_url: that field models
-        # where the session *lands* (e.g. Delta bouncing an unauthenticated user
-        # to /login.html), which the test configures via the constructor.
         self.navigated.append(url)
         return {"current_url": self.current_url}
 
@@ -82,18 +110,30 @@ class FakeBridge:
         self.clicks.append(selector)
         return {"ok": True, "current_url": self.current_url}
 
+    async def click_download(self, slug, selector, dest_filename=None):
+        # Tracked so tests can assert the adapter NEVER uses the menu-click path.
+        self.click_downloads.append(selector)
+        raise AssertionError("click_download must not be used by the Delta adapter")
+
+    async def select_option(self, slug, selector, value=None, label=None, index=None):
+        self.selects.append((selector, {"value": value, "label": label, "index": index}))
+        return {"ok": True}
+
     async def element_exists(self, slug, selector):
         return selector in self.present_selectors
 
     async def find_links(self, slug, pattern):
-        return self.links
+        rx = re.compile(pattern, re.IGNORECASE)
+        return [u for u in self.links if rx.search(u)]
 
     async def download(self, slug, url, dest_filename=None):
-        name = url.split("/")[-1] or "doc.pdf"
-        p = Path(self.download_dir) / name
+        safe = re.sub(
+            r"[^A-Za-z0-9._-]", "_", dest_filename or url.split("docId=")[-1] or "doc"
+        )
+        p = Path(self.download_dir) / safe
         p.write_bytes(b"%PDF fake " + url.encode())
         return BridgeFile(
-            path=name, size_bytes=p.stat().st_size, mime_type="application/pdf"
+            path=safe, size_bytes=p.stat().st_size, mime_type="application/pdf"
         )
 
     async def close_session(self, slug):
@@ -114,6 +154,17 @@ def _ctx(bridge, *, tender_id=900100, candidate_urls=None, source_url=None,
         description=description,
         tender_ref=tender_ref,
     )
+
+
+def _patch_storage(monkeypatch, tmp_path):
+    from tender_agent.services.portals.adapters import delta_esourcing as mod
+
+    bridge_dl = tmp_path / "bridge-dl"
+    bridge_dl.mkdir()
+    storage = tmp_path / "storage"
+    monkeypatch.setattr(mod.settings, "bridge_download_dir", str(bridge_dl))
+    monkeypatch.setattr(mod.settings, "document_storage_dir", str(storage))
+    return bridge_dl, storage
 
 
 # --- access-code extraction (the real URL patterns) --------------------
@@ -164,7 +215,6 @@ def test_extract_access_code_none_when_no_delta_url():
 
 
 def test_extract_access_code_scans_multiple_sources_in_order():
-    # source_url has nothing; description carries the code.
     assert (
         extract_access_code(
             "https://www.contractsfinder.service.gov.uk/notice/abc",
@@ -220,21 +270,35 @@ async def test_authenticate_is_human_login():
     assert res.status == AuthStatus.success
 
 
-# --- locate: the access-code submit flow -------------------------------
+# --- locate: notice page via accessCode URL (no form-fill) -------------
 
 
 @pytest.mark.asyncio
-async def test_locate_submits_access_code_and_finds_in_responses():
-    bridge = FakeBridge(present_selectors={DELTA_SELECTORS["responses_table"]})
+async def test_locate_opens_notice_via_access_code_url_and_gates_on_register():
+    bridge = FakeBridge(text="This tender is currently OPEN. REGISTER INTEREST to bid.")
     res = await DeltaEsourcingAdapter().locate_tender(
         _ctx(bridge, source_url="https://www.delta-esourcing.com/respond/286EVX23TV"),
         "REF-123",
     )
-    assert res.status == LocateStatus.found
-    # It filled the access code and clicked submit — never searched.
-    assert bridge.fills == [(DELTA_SELECTORS["access_code_input"], "286EVX23TV")]
-    assert DELTA_SELECTORS["submit_button"] in bridge.clicks
-    assert any("addToList.html" in u for u in bridge.navigated)
+    assert res.status == LocateStatus.requires_interest_first
+    assert "Register Interest" in res.detail
+    # Navigated straight to the accessCode notice URL — no form-fill at all.
+    assert any("respondToList.html?accessCode=286EVX23TV" in u for u in bridge.navigated)
+    assert bridge.fills == []
+    assert bridge.clicks == []
+
+
+@pytest.mark.asyncio
+async def test_locate_register_gate_via_element_when_text_absent():
+    bridge = FakeBridge(
+        text="Some notice text without the literal label.",
+        present_selectors={DELTA_SELECTORS["register_interest_button"]},
+    )
+    res = await DeltaEsourcingAdapter().locate_tender(
+        _ctx(bridge, source_url="https://www.delta-esourcing.com/respond/286EVX23TV"),
+        "REF-123",
+    )
+    assert res.status == LocateStatus.requires_interest_first
 
 
 @pytest.mark.asyncio
@@ -246,19 +310,23 @@ async def test_locate_closed_tender_returns_not_found_gracefully():
     )
     assert res.status == LocateStatus.not_found
     assert "not currently open" in res.detail
+    assert bridge.fills == []
 
 
 @pytest.mark.asyncio
-async def test_locate_express_interest_gate_pauses():
+async def test_locate_already_registered_found_and_captures_ids():
+    # No REGISTER INTEREST button; an existing Stage One link is present.
     bridge = FakeBridge(
-        present_selectors={DELTA_SELECTORS["express_interest_button"]}
+        text="Your response is in progress. View documents.",
+        links=[STAGE_ONE_URL],
     )
-    res = await DeltaEsourcingAdapter().locate_tender(
+    adapter = DeltaEsourcingAdapter()
+    res = await adapter.locate_tender(
         _ctx(bridge, source_url="https://www.delta-esourcing.com/respond/286EVX23TV"),
         "REF-123",
     )
-    assert res.status == LocateStatus.requires_interest_first
-    assert "Express Interest" in res.detail
+    assert res.status == LocateStatus.found
+    assert (adapter._resp_id, adapter._list_id) == ("555", "777")
 
 
 @pytest.mark.asyncio
@@ -270,131 +338,161 @@ async def test_locate_no_access_code_returns_not_found():
     )
     assert res.status == LocateStatus.not_found
     assert "access code" in res.detail.lower()
-    # Never navigated/filled when there's no code to submit.
-    assert bridge.fills == []
+    assert bridge.navigated == []
 
 
 @pytest.mark.asyncio
 async def test_locate_legacy_notice_id_navigates_directly():
-    bridge = FakeBridge(present_selectors={DELTA_SELECTORS["responses_table"]})
+    bridge = FakeBridge(text="currently OPEN — REGISTER INTEREST")
     legacy = (
         "https://www.delta-esourcing.com/delta/respondToList.html?noticeId=1032668140"
     )
     res = await DeltaEsourcingAdapter().locate_tender(
         _ctx(bridge, source_url=legacy), "REF-123"
     )
-    assert res.status == LocateStatus.found
-    # Legacy path navigates straight to the respond URL; no access-code box.
+    assert res.status == LocateStatus.requires_interest_first
     assert any("noticeId=1032668140" in u for u in bridge.navigated)
     assert bridge.fills == []
 
 
-# --- express interest (only ever called after user confirm) ------------
+# --- register interest (only ever called after user confirm) -----------
 
 
 @pytest.mark.asyncio
-async def test_register_interest_clicks_button():
-    bridge = FakeBridge()
-    res = await DeltaEsourcingAdapter().register_interest(_ctx(bridge))
+async def test_register_interest_clicks_and_captures_stage_one_ids():
+    # After the click, Delta lands on Stage One — current_url carries the ids.
+    bridge = FakeBridge(current_url=STAGE_ONE_URL)
+    adapter = DeltaEsourcingAdapter()
+    res = await adapter.register_interest(_ctx(bridge))
     assert res.status == RegisterStatus.success
-    assert DELTA_SELECTORS["express_interest_button"] in bridge.clicks
+    assert DELTA_SELECTORS["register_interest_button"] in bridge.clicks
+    assert (adapter._resp_id, adapter._list_id) == ("555", "777")
 
 
-# --- download ----------------------------------------------------------
+# --- download: direct downloadDocument GET (no menu clicks) ------------
 
 
 @pytest.mark.asyncio
-async def test_download_documents_persists(tmp_path, monkeypatch):
-    bridge_dl = tmp_path / "bridge-dl"
-    bridge_dl.mkdir()
-    storage = tmp_path / "storage"
-    monkeypatch.setattr(
-        "tender_agent.services.portals.adapters.delta_esourcing.settings.bridge_download_dir",
-        str(bridge_dl),
-    )
-    monkeypatch.setattr(
-        "tender_agent.services.portals.adapters.delta_esourcing.settings.document_storage_dir",
-        str(storage),
-    )
+async def test_download_documents_via_direct_links(tmp_path, monkeypatch):
+    bridge_dl, storage = _patch_storage(monkeypatch, tmp_path)
     bridge = FakeBridge(
-        links=["https://www.delta-esourcing.com/download/itt.pdf"],
+        html=_docs_table_html(n=3),
+        current_url=STAGE_ONE_URL,  # resolve respId/listId from here
         download_dir=str(bridge_dl),
     )
     res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
     assert res.status == DownloadStatus.complete
-    assert len(res.files) == 1
-    f = res.files[0]
-    assert f.sha256 and f.storage_key
-    assert (storage / f.storage_key).is_file()
+    assert len(res.files) == 3
+    # Navigated to Stage One and built direct download URLs (no menu clicks).
+    assert any("suppRespStatus.html?id=555&listId=777" in u for u in bridge.navigated)
+    assert bridge.click_downloads == []
+    assert bridge.clicks == []
+    for f in res.files:
+        assert "downloadDocument.html" in f.url
+        assert "docId=" in f.url
+        assert f.sha256 and f.storage_key
+        assert (storage / f.storage_key).is_file()
+    # Filenames come from the document titles.
+    assert {f.filename for f in res.files} == {"Document_0.pdf", "Document_1.pdf",
+                                               "Document_2.pdf"}
 
 
 @pytest.mark.asyncio
-async def test_download_dedups_identical_files(tmp_path, monkeypatch):
-    bridge_dl = tmp_path / "bridge-dl"
-    bridge_dl.mkdir()
-    storage = tmp_path / "storage"
-    monkeypatch.setattr(
-        "tender_agent.services.portals.adapters.delta_esourcing.settings.bridge_download_dir",
-        str(bridge_dl),
-    )
-    monkeypatch.setattr(
-        "tender_agent.services.portals.adapters.delta_esourcing.settings.document_storage_dir",
-        str(storage),
-    )
-
-    class DupBridge(FakeBridge):
-        async def download(self, slug, url, dest_filename=None):
-            # Same bytes regardless of URL → same sha256 → deduped.
-            name = url.split("/")[-1]
-            p = Path(self.download_dir) / name
-            p.write_bytes(b"%PDF identical")
-            return BridgeFile(
-                path=name, size_bytes=p.stat().st_size, mime_type="application/pdf"
-            )
-
-    bridge = DupBridge(
-        links=[
-            "https://www.delta-esourcing.com/download/a.pdf",
-            "https://www.delta-esourcing.com/download/b.pdf",
-        ],
+async def test_download_handles_22_documents(tmp_path, monkeypatch):
+    bridge_dl, _ = _patch_storage(monkeypatch, tmp_path)
+    bridge = FakeBridge(
+        html=_docs_table_html(n=22),
+        current_url=STAGE_ONE_URL,
         download_dir=str(bridge_dl),
     )
     res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
-    # Two links, identical content → one file kept after sha256 dedup.
-    assert len(res.files) == 1
+    assert res.status == DownloadStatus.complete
+    assert len(res.files) == 22
+
+
+@pytest.mark.asyncio
+async def test_download_uses_precaptured_ids_and_maximises_page_size(
+    tmp_path, monkeypatch
+):
+    bridge_dl, _ = _patch_storage(monkeypatch, tmp_path)
+    bridge = FakeBridge(
+        html=_docs_table_html(resp_id="888", list_id="999", n=2),
+        current_url="https://www.delta-esourcing.com/delta/respondToList.html?accessCode=X",
+        present_selectors={DELTA_SELECTORS["page_size_select"]},
+        download_dir=str(bridge_dl),
+    )
+    adapter = DeltaEsourcingAdapter()
+    adapter._resp_id, adapter._list_id = "888", "999"
+    res = await adapter.download_documents(_ctx(bridge), "ignored")
+    assert res.status == DownloadStatus.complete
+    assert len(res.files) == 2
+    assert any("id=888&listId=999" in u for u in bridge.navigated)
+    # Page-size dropdown maximised (last option).
+    assert bridge.selects and bridge.selects[0][1]["index"] == -1
 
 
 @pytest.mark.asyncio
 async def test_download_caps_at_max_docs(tmp_path, monkeypatch):
     from tender_agent.services.portals.adapters import delta_esourcing as mod
 
-    bridge_dl = tmp_path / "bridge-dl"
-    bridge_dl.mkdir()
-    storage = tmp_path / "storage"
-    monkeypatch.setattr(mod.settings, "bridge_download_dir", str(bridge_dl))
-    monkeypatch.setattr(mod.settings, "document_storage_dir", str(storage))
+    bridge_dl, _ = _patch_storage(monkeypatch, tmp_path)
     monkeypatch.setattr(mod, "MAX_DOCS", 3)
-    links = [
-        f"https://www.delta-esourcing.com/download/doc{i}.pdf" for i in range(5)
-    ]
-    bridge = FakeBridge(links=links, download_dir=str(bridge_dl))
+    bridge = FakeBridge(
+        html=_docs_table_html(n=5), current_url=STAGE_ONE_URL,
+        download_dir=str(bridge_dl),
+    )
     res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
     assert len(res.files) == 3
-    assert len(res.missing) == 2  # the 2 over the cap
+    assert len(res.missing) == 2
     assert res.status == DownloadStatus.partial
 
 
 @pytest.mark.asyncio
-async def test_download_rejects_off_platform_links(tmp_path, monkeypatch):
-    bridge_dl = tmp_path / "bridge-dl"
-    bridge_dl.mkdir()
-    monkeypatch.setattr(
-        "tender_agent.services.portals.adapters.delta_esourcing.settings.bridge_download_dir",
-        str(bridge_dl),
+async def test_download_dedups_identical_files(tmp_path, monkeypatch):
+    bridge_dl, _ = _patch_storage(monkeypatch, tmp_path)
+
+    class DupBridge(FakeBridge):
+        async def download(self, slug, url, dest_filename=None):
+            safe = re.sub(r"[^A-Za-z0-9._-]", "_", dest_filename or "doc")
+            p = Path(self.download_dir) / safe
+            p.write_bytes(b"%PDF identical")  # same bytes -> same sha256
+            return BridgeFile(
+                path=safe, size_bytes=p.stat().st_size, mime_type="application/pdf"
+            )
+
+    bridge = DupBridge(
+        html=_docs_table_html(n=3), current_url=STAGE_ONE_URL,
+        download_dir=str(bridge_dl),
     )
+    res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
+    assert len(res.files) == 1  # three rows, identical content -> one kept
+
+
+@pytest.mark.asyncio
+async def test_download_errors_without_stage_one_ids(tmp_path, monkeypatch):
+    bridge_dl, _ = _patch_storage(monkeypatch, tmp_path)
     bridge = FakeBridge(
-        links=["https://evil.example/x.pdf"], download_dir=str(bridge_dl)
+        html=_docs_table_html(n=2),
+        current_url="https://www.delta-esourcing.com/delta/respondToList.html?accessCode=X",
+        download_dir=str(bridge_dl),
+    )
+    res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
+    assert res.status == DownloadStatus.error
+    assert "stage one" in res.detail.lower()
+
+
+@pytest.mark.asyncio
+async def test_download_nothing_available_when_table_empty(tmp_path, monkeypatch):
+    bridge_dl, _ = _patch_storage(monkeypatch, tmp_path)
+    bridge = FakeBridge(
+        html="<table><tr><th>Document Title</th></tr></table>",
+        current_url=STAGE_ONE_URL, download_dir=str(bridge_dl),
     )
     res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
     assert res.status == DownloadStatus.nothing_available
-    assert "https://evil.example/x.pdf" in res.missing
+
+
+def test_stage_one_and_download_urls_are_well_formed():
+    assert DELTA_URLS["stage_one"] % ("555", "777") == STAGE_ONE_URL
+    built = DELTA_URLS["document_download"] % ("555", "777", "1000")
+    assert "respId=555" in built and "supplierListId=777" in built and "docId=1000" in built
