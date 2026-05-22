@@ -40,6 +40,15 @@ def _configure_logging() -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     _configure_logging()
+    # Self-diagnosing startup check: log whether the documents dir is writable,
+    # the bridge token is set, and the bridge is reachable. Best-effort and
+    # never fatal — it just makes a first-run misconfiguration explain itself.
+    import contextlib
+
+    from tender_agent.services.preflight import run_preflight
+
+    with contextlib.suppress(Exception):
+        await run_preflight(check_bridge=True)
     scheduler.start()
     try:
         yield
