@@ -9,8 +9,10 @@ flow is idempotent). Real authenticated portal adapters land in chunk 4+.
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -134,6 +136,10 @@ class PortalOrchestrator:
         bridge: BridgeClient | None = None,
         login_wait_cycle_seconds: int = 600,
         login_wait_total_seconds: int = 3600,
+        keepalive_enabled: bool = True,
+        keepalive_interval_seconds: int = 150,
+        keepalive_budget_seconds: int = 2400,
+        pause_on_already_registered: bool = False,
     ) -> None:
         self._creds_store = credentials_store
         self._bridge = bridge
@@ -142,6 +148,19 @@ class PortalOrchestrator:
         # tiny values.
         self.login_wait_cycle_seconds = login_wait_cycle_seconds
         self.login_wait_total_seconds = login_wait_total_seconds
+        # Session keepalive while a fetch sits in the needs_user_confirmation
+        # pause: a single Delta session times out after a few minutes of
+        # inactivity, so we ping it periodically to keep it warm (chunk 4h).
+        # Bounded — after the budget we let it expire; the resume re-auths.
+        self.keepalive_enabled = keepalive_enabled
+        self.keepalive_interval_seconds = keepalive_interval_seconds
+        self.keepalive_budget_seconds = keepalive_budget_seconds
+        self._keepalive_tasks: dict[str, asyncio.Task] = {}
+        # When True the confirmation pause is kept even for already-registered
+        # tenders. Default False: an already-registered tender has no intent-
+        # signalling Register Interest click to gate, so we read its documents
+        # without pausing (chunk 4h, Fix 7).
+        self.pause_on_already_registered = pause_on_already_registered
 
     def _get_bridge(self) -> BridgeClient:
         return self._bridge if self._bridge is not None else BridgeClient()
@@ -380,6 +399,57 @@ class PortalOrchestrator:
                 pass
         return False
 
+    # --- session keepalive during the confirmation pause (chunk 4h) ----
+
+    async def _session_keepalive(
+        self,
+        bridge: BridgeClient,
+        slug: str,
+        *,
+        interval: float | None = None,
+        budget: float | None = None,
+    ) -> None:
+        """Periodically touch the bridge session so Delta doesn't time it out
+        while a fetch waits in needs_user_confirmation. Best-effort and bounded:
+        stops at the budget (the resume re-auths anyway) or quietly the moment a
+        ping fails (the session/bridge is gone)."""
+        interval = interval if interval is not None else self.keepalive_interval_seconds
+        budget = budget if budget is not None else self.keepalive_budget_seconds
+        deadline = time.monotonic() + max(0.0, budget)
+        pings = 0
+        while time.monotonic() < deadline:
+            await asyncio.sleep(max(0.0, interval))
+            if time.monotonic() >= deadline:
+                break
+            try:
+                await bridge.session_status(slug)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.info("delta.session_keepalive_stopped", slug=slug, error=str(exc))
+                return
+            pings += 1
+            logger.info("delta.session_keepalive", slug=slug, pings=pings)
+        logger.info("delta.session_keepalive_budget_reached", slug=slug, pings=pings)
+
+    def _start_keepalive(self, bridge: BridgeClient, slug: str) -> None:
+        """Spawn the bounded keepalive as a background task. No-op when disabled,
+        when no event loop is running, or when the bridge can't be pinged."""
+        if not self.keepalive_enabled or not hasattr(bridge, "session_status"):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._stop_keepalive(slug)
+        task = loop.create_task(self._session_keepalive(bridge, slug))
+        self._keepalive_tasks[slug] = task
+
+    def _stop_keepalive(self, slug: str) -> None:
+        task = self._keepalive_tasks.pop(slug, None)
+        if task is not None and not task.done():
+            task.cancel()
+
     async def _run_login_adapter(
         self,
         db: Session,
@@ -527,34 +597,78 @@ class PortalOrchestrator:
 
                 locate = await adapter.locate_tender(ctx, ref)
                 if locate.status == LocateStatus.requires_interest_first:
-                    self._set_task(
-                        db,
-                        task_id,
-                        status="needs_user_confirmation",
-                        bridge_session_slug=slug,
-                        login_url=locate.tender_url,
-                        detail=(
-                            locate.detail
-                            or "Express Interest is required before documents "
-                            "are released."
-                        ),
-                    )
-                    base.status = OrchestrationStatus.needs_user_confirmation
-                    base.detail = locate.detail
-                    # Keep the session alive across the pause so the resume can
-                    # reuse it (re-login needs Microsoft Authenticator).
-                    release_session = False
-                    return base
-                if locate.status != LocateStatus.found:
+                    if locate.already_authorized and not self.pause_on_already_registered:
+                        # Already registered: there is NO intent-signalling
+                        # Register Interest click to gate, so we don't pause — we
+                        # just read documents the user already has access to. This
+                        # also sidesteps the confirm-delay session timeout for the
+                        # proven already-registered path (chunk 4h, Fix 7).
+                        logger.info(
+                            "orchestrator.already_registered_no_pause",
+                            platform=slug, tender_id=tender.id,
+                        )
+                        reg = await adapter.register_interest(ctx)
+                        if reg.status not in (
+                            RegisterStatus.success,
+                            RegisterStatus.already_registered,
+                        ):
+                            base.status = OrchestrationStatus.register_failed
+                            base.detail = reg.detail
+                            return base
+                        # fall through to the shared download block.
+                    else:
+                        self._set_task(
+                            db,
+                            task_id,
+                            status="needs_user_confirmation",
+                            bridge_session_slug=slug,
+                            login_url=locate.tender_url,
+                            detail=(
+                                locate.detail
+                                or "Express Interest is required before documents "
+                                "are released."
+                            ),
+                        )
+                        base.status = OrchestrationStatus.needs_user_confirmation
+                        base.detail = locate.detail
+                        # Keep the session alive across the pause so the resume can
+                        # reuse it (re-login needs Microsoft Authenticator), and
+                        # ping it periodically so Delta doesn't time it out before
+                        # the user confirms (chunk 4h, Fix 6).
+                        release_session = False
+                        self._start_keepalive(bridge, slug)
+                        return base
+                elif locate.status != LocateStatus.found:
                     base.status = OrchestrationStatus.locate_failed
                     base.detail = locate.detail or locate.status.value
                     return base
             else:
-                # Resuming after the user confirmed Express Interest.
+                # Resuming after the user confirmed Express Interest. The
+                # confirm may have come minutes later, so the Delta session can
+                # have timed out during the pause. Re-auth instead of hard-failing
+                # (chunk 4h, Fix 5): an expired session becomes "log in again",
+                # reusing the waiting_for_login machinery.
+                self._stop_keepalive(slug)
                 if not await adapter.is_authenticated(ctx):
-                    base.status = OrchestrationStatus.failed
-                    base.detail = "Session expired — retry to log in again."
-                    return base
+                    logger.info(
+                        "orchestrator.session_expired_on_resume",
+                        platform=slug, tender_id=tender.id,
+                    )
+                    self._set_task(
+                        db,
+                        task_id,
+                        status="waiting_for_login",
+                        waiting_since=datetime.now(UTC),
+                        login_url=adapter.login_url(),
+                        bridge_session_slug=slug,
+                        detail="Session expired during the pause — log in again to continue.",
+                    )
+                    self._notify_waiting(db, tender, platform_slug)
+                    if not await self._wait_for_login(bridge, adapter, ctx, slug):
+                        base.status = OrchestrationStatus.failed
+                        base.detail = "Login not completed — retry when you're ready."
+                        return base
+                    self._set_task(db, task_id, status="running", detail=None)
                 await adapter.locate_tender(ctx, ref)
                 reg = await adapter.register_interest(ctx)
                 if reg.status not in (
