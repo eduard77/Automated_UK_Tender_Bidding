@@ -207,11 +207,54 @@ class BridgeClient:
         )
 
     async def click_download(
-        self, slug: str, selector: str, dest_filename: str | None = None
+        self,
+        slug: str,
+        selector: str,
+        dest_filename: str | None = None,
+        timeout_ms: int = 30000,
     ) -> BridgeFile:
+        """Click a single element that triggers a download and capture the file."""
         data = await self._post(
             f"/session/{slug}/click-download",
-            {"selector": selector, "dest_filename": dest_filename},
+            {
+                "selector": selector,
+                "dest_filename": dest_filename,
+                "timeout_ms": timeout_ms,
+            },
+            timeout=max(self.timeout, timeout_ms / 1000.0 + 10.0),
+        )
+        return BridgeFile(
+            path=data["path"],
+            size_bytes=data["size_bytes"],
+            mime_type=data.get("mime_type"),
+        )
+
+    async def click_download_in_row(
+        self,
+        slug: str,
+        *,
+        rows_selector: str,
+        trigger_selector: str,
+        item_selector: str,
+        index: int,
+        timeout_ms: int = 30000,
+        dest_filename: str | None = None,
+    ) -> BridgeFile:
+        """Open the index-th data row's action menu (trigger_selector) then click
+        the "Download File" item (item_selector), capturing the resulting
+        download. For portals (Delta) whose rows expose no per-row download link
+        in the DOM — the file only downloads on the menu interaction."""
+        data = await self._post(
+            f"/session/{slug}/click-download-in-row",
+            {
+                "rows_selector": rows_selector,
+                "trigger_selector": trigger_selector,
+                "item_selector": item_selector,
+                "index": index,
+                "timeout_ms": timeout_ms,
+                "dest_filename": dest_filename,
+            },
+            timeout=max(self.timeout, timeout_ms / 1000.0 + 10.0),
         )
         return BridgeFile(
             path=data["path"],

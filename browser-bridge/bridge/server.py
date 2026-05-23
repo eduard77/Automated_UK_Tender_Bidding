@@ -74,6 +74,20 @@ class DownloadBody(BaseModel):
 class ClickDownloadBody(BaseModel):
     selector: str
     dest_filename: str | None = None
+    timeout_ms: int = 30000
+
+
+class ClickDownloadInRowBody(BaseModel):
+    # Generic, portal-agnostic: the caller supplies the selectors. Used for
+    # tables whose rows expose NO download link in the DOM (Delta's bip-table):
+    # the file only downloads after the row's action menu is opened and the
+    # "Download File" item is clicked.
+    rows_selector: str  # all table rows, e.g. "table#document tbody tr"
+    trigger_selector: str  # the action-menu (⋮) trigger, relative to a row
+    item_selector: str  # the "Download File" item revealed by the trigger
+    index: int  # which DATA row (0-based; header/empty rows are skipped)
+    timeout_ms: int = 30000
+    dest_filename: str | None = None
 
 
 class FillBody(BaseModel):
@@ -323,18 +337,61 @@ async def click_download(
     session = _require_session(slug)
     page = session.page
     try:
-        async with page.expect_download() as dl_info:
-            await page.click(body.selector)
+        async with page.expect_download(timeout=body.timeout_ms) as dl_info:
+            await page.click(body.selector, timeout=body.timeout_ms)
         dl = await dl_info.value
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
             status_code=502, detail=f"click-download failed: {exc}"
         ) from exc
-    filename = _safe_name(body.dest_filename or dl.suggested_filename or "download.bin")
-    path = config.download_dir() / filename
-    await dl.save_as(str(path))
-    size = path.stat().st_size if path.exists() else 0
-    return {"path": filename, "size_bytes": size, "mime_type": _guess_mime(filename)}
+    return await _save_download(dl, body.dest_filename)
+
+
+@app.post("/session/{slug}/click-download-in-row")
+async def click_download_in_row(
+    slug: str, body: ClickDownloadInRowBody, _: None = Depends(require_token)
+) -> dict:
+    """Capture a download triggered by a row's action menu.
+
+    Some tables (Delta eSourcing's bip-table) expose no per-row download link;
+    the file only downloads after opening the row's action menu (the ⋮) and
+    clicking "Download File". This opens that menu in the index-th DATA row,
+    clicks the (now-visible) item, and captures the resulting Playwright
+    download. DATA rows are matches of rows_selector that contain
+    trigger_selector — so the index is stable even if a header row sits inside
+    <tbody>. All selectors come from the caller (no portal hardcoding)."""
+    session = _require_session(slug)
+    page = session.page
+    try:
+        rows = page.locator(body.rows_selector)
+        total = await rows.count()
+        data_rows = []
+        for k in range(total):
+            cand = rows.nth(k)
+            if await cand.locator(body.trigger_selector).count() > 0:
+                data_rows.append(cand)
+        if not 0 <= body.index < len(data_rows):
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"row index {body.index} out of range "
+                    f"({len(data_rows)} data rows)"
+                ),
+            )
+        row = data_rows[body.index]
+        # 1. Open the row's action menu (the ⋮ trigger).
+        await row.locator(body.trigger_selector).first.click(timeout=body.timeout_ms)
+        # 2. Click the now-visible "Download File" item and capture the download.
+        async with page.expect_download(timeout=body.timeout_ms) as dl_info:
+            await _click_first_visible(page, body.item_selector, body.timeout_ms)
+        dl = await dl_info.value
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502, detail=f"click-download-in-row failed: {exc}"
+        ) from exc
+    return await _save_download(dl, body.dest_filename)
 
 
 @app.post("/session/{slug}/fill")
@@ -444,6 +501,39 @@ async def close_session(slug: str, _: None = Depends(require_token)) -> dict:
 
 
 # --- helpers ------------------------------------------------------------
+
+
+async def _save_download(dl, dest_filename: str | None) -> dict:
+    """Save a captured Playwright download to the shared download dir and return
+    its metadata (path is relative to that dir; the backend reads it there)."""
+    filename = _safe_name(dest_filename or dl.suggested_filename or "download.bin")
+    path = config.download_dir() / filename
+    await dl.save_as(str(path))
+    size = path.stat().st_size if path.exists() else 0
+    return {
+        "path": filename,
+        "size_bytes": size,
+        "mime_type": _guess_mime(filename),
+        "suggested_filename": dl.suggested_filename,
+    }
+
+
+async def _click_first_visible(page, selector: str, timeout_ms: int) -> None:
+    """Click the first VISIBLE match of selector. Delta renders the "Download
+    File" item in a body-level popup and may keep hidden per-row duplicates in
+    the DOM, so we must click the visible one rather than the first match."""
+    loc = page.locator(selector)
+    count = await loc.count()
+    for k in range(count):
+        item = loc.nth(k)
+        try:
+            if await item.is_visible():
+                await item.click(timeout=timeout_ms)
+                return
+        except Exception:  # noqa: BLE001
+            continue
+    # None reported visible — let a direct click raise a clear, actionable error.
+    await loc.first.click(timeout=timeout_ms)
 
 
 def _safe_name(name: str) -> str:
