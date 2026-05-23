@@ -15,11 +15,13 @@ is reused across fetches so the human re-authenticates as rarely as possible.
 ║     click signals intent to bid, so the orchestrator pauses                 ║
 ║     (needs_user_confirmation) and only clicks it on explicit user confirm.  ║
 ║  3. After Register Interest + login, Delta lands on the Stage One Overview  ║
-║     (suppRespStatus.html?id={RESP_ID}&listId={LIST_ID}); those two ids      ║
-║     build the document download URLs.                                       ║
-║  4. Each document is a direct GET link                                      ║
-║     (downloadDocument.html?respId=&supplierListId=&docId=) — we GET each    ║
-║     through the authenticated session; we do NOT click per-row menus.       ║
+║     (suppRespStatus.html?id={RESP_ID}&listId={LIST_ID}); the documents      ║
+║     table (table#document) lives here.                                      ║
+║  4. There is NO per-row download link in the DOM — Delta uses checkboxes +  ║
+║     a documentIds cookie + JS, so the file only downloads when the row's    ║
+║     Action menu (⋮) is opened and "Download File" is clicked. We mimic the  ║
+║     human: per row, open the ⋮ menu and click Download File, capturing the  ║
+║     browser download via the bridge (chunk 4g). We never scrape a docId.    ║
 ║                                                                            ║
 ║  CONFIRMED constants are validated against the live site. Selectors marked  ║
 ║  "CONFIRM SELECTOR" / "DRY-RUN" are best-effort; the flow around them is    ║
@@ -88,11 +90,6 @@ DELTA_URLS = {
         "https://www.delta-esourcing.com/delta/suppliers/select/"
         "suppRespStatus.html?id=%s&listId=%s"
     ),
-    # CONFIRMED — direct document download. %s, %s, %s = respId, listId, docId.
-    "document_download": (
-        "https://www.delta-esourcing.com/delta/suppliers/response/overview/"
-        "documents/downloadDocument.html?respId=%s&supplierListId=%s&docId=%s"
-    ),
     # BEST-EFFORT — Delta supplier logout, used to release the single concurrent
     # session so the human isn't locked out. Investigate/confirm the exact URL
     # against the live logged-in menu; logout() also falls back to clicking the
@@ -117,19 +114,33 @@ DELTA_SELECTORS = {
         "a:has-text('Response Manager'), a:has-text('Profile Manager'), "
         "a:has-text('Select Accredit'), #supplierMenu, nav a:has-text('Resources')"
     ),
-    # CONFIRM SELECTOR — the Stage One documents table (columns
-    # Document Title / Size / File Type / Uploaded / Action).
-    "documents_table": (
-        "table:has-text('Document Title'), table#documents, table.documents"
+    # CONFIRMED — the Stage One documents table id (inside div#documentList).
+    # Columns: Document Title / Size / File Type / Uploaded / Action.
+    "documents_table": "table#document",
+    # CONFIRMED — the document rows. There is NO per-row download link in the
+    # DOM (Delta uses checkboxes + a documentIds cookie + JS); a file downloads
+    # only when the row's action menu is opened and "Download File" clicked.
+    "document_rows": "table#document tbody tr",
+    # CONFIRM SELECTOR — a rendered data cell, used to detect that the rows have
+    # actually populated (the shell renders before the JS injects the rows).
+    "document_row_cell": "table#document tbody tr td",
+    # CONFIRM SELECTOR — the per-row Action "three dots" (⋮) menu trigger,
+    # matched relative to a row. Best-effort across markup variants.
+    "row_action_menu": (
+        "button[aria-haspopup], button[aria-label*='action' i], "
+        "button[title*='action' i], [class*='dots' i], [class*='kebab' i], "
+        "td:last-child button, td:last-child a"
+    ),
+    # CONFIRM SELECTOR — the "Download File" item the action menu reveals (it may
+    # render in a body-level popup, so it is matched page-wide, not per row).
+    "row_download_item": (
+        "a:has-text('Download File'), button:has-text('Download File'), "
+        "[role='menuitem']:has-text('Download File'), li:has-text('Download File')"
     ),
     # CONFIRM SELECTOR — the "Display N items per page" dropdown.
     "page_size_select": (
         "select[name*='perPage' i], select[name*='pageSize' i], "
         "select[aria-label*='per page' i], select.page-size"
-    ),
-    # CONFIRMED — extract respId, supplierListId, docId from a download link.
-    "download_link_regex": (
-        r"downloadDocument\.html\?respId=(\d+)&supplierListId=(\d+)&docId=(\d+)"
     ),
     # CONFIRMED — the Response Manager "Responses" table lists the supplier's
     # registered opportunities; each opportunity name is a link whose href
@@ -151,7 +162,6 @@ DELTA_SELECTORS = {
     ),
 }
 
-_DOWNLOAD_LINK_RE = re.compile(DELTA_SELECTORS["download_link_regex"], re.IGNORECASE)
 _STAGE_ONE_LINK_RE = re.compile(DELTA_SELECTORS["STAGE_ONE_LINK_REGEX"], re.IGNORECASE)
 
 # Login-success URL pattern for wait-for-login: after the human logs in (and
@@ -244,11 +254,14 @@ def _parse_stage_one_ids(url: str | None) -> tuple[str | None, str | None]:
 
 
 @dataclass
-class _DocRow:
-    resp_id: str
-    list_id: str
-    doc_id: str
+class _DocTableRow:
+    """A Stage One document row. Delta exposes no per-row download link, so we
+    capture only what the table shows: the click order (index), the saved
+    filename (title), and the extension fallback (file_type)."""
+
+    index: int
     title: str | None
+    file_type: str | None
 
 
 _TR_SPLIT_RE = re.compile(r"(?i)<tr\b")
@@ -267,47 +280,55 @@ def _first_cell_text(row_html: str) -> str | None:
     return text or None
 
 
-def _parse_document_rows(html: str) -> list[_DocRow]:
-    """Enumerate document rows from the Stage One documents table HTML by the
-    download-link pattern (which carries respId/listId/docId). One row per
-    distinct docId; title is best-effort from the first cell. Run this over the
-    RENDERED DOM — the links are JS-injected and absent from the initial HTML."""
-    rows: list[_DocRow] = []
-    seen: set[str] = set()
-    for seg in _TR_SPLIT_RE.split(html or ""):
-        m = _DOWNLOAD_LINK_RE.search(seg)
-        if not m:
-            continue
-        resp_id, list_id, doc_id = m.group(1), m.group(2), m.group(3)
-        if doc_id in seen:
-            continue
-        seen.add(doc_id)
-        rows.append(_DocRow(resp_id, list_id, doc_id, _first_cell_text(seg)))
-    return rows
-
-
-# Heuristics to spot a row that is clearly a document (title + file-type + size)
-# but exposes no download link — i.e. no discoverable docId. Used for visibility
-# logging only; never affects which rows are downloaded.
+# A document row in the table has BOTH a file-type and a size cell; these
+# heuristics distinguish data rows from header/control rows without relying on
+# any download link (Delta's rows have none).
 _FILE_TYPE_HINT_RE = re.compile(r"application/|\b(?:pdf|docx?|xlsx?|zip)\b", re.IGNORECASE)
 _SIZE_HINT_RE = re.compile(r"\b\d+(?:\.\d+)?\s?(?:bytes|[kmg]b)\b", re.IGNORECASE)
+_CELL_RE = re.compile(r"(?is)<td[^>]*>(.*?)</td>")
 
 
-def _document_rows_without_docid(html: str) -> list[str]:
-    """Titles of rows that look like a document (have a file-type AND a size)
-    but carry no download link — so no docId can be extracted. Logged so a
-    future Delta markup change (or a partially-rendered table) is visible."""
-    titles: list[str] = []
+def _cell_texts(row_html: str) -> list[str]:
+    """Plain text of each <td> in a row, in column order."""
+    out: list[str] = []
+    for m in _CELL_RE.finditer(row_html):
+        text = re.sub(r"\s+", " ", _TAG_RE.sub(" ", m.group(1))).strip()
+        out.append(text)
+    return out
+
+
+def _detect_file_type(cells: list[str]) -> str | None:
+    """The row's File Type column — conventionally column 3 (index 2); else any
+    non-size cell that looks like a file type. None if not found."""
+    if len(cells) >= 3 and _FILE_TYPE_HINT_RE.search(cells[2]):
+        return cells[2] or None
+    for c in cells[1:]:
+        if _FILE_TYPE_HINT_RE.search(c) and not _SIZE_HINT_RE.search(c):
+            return c or None
+    return None
+
+
+def _parse_document_table_rows(html: str) -> list[_DocTableRow]:
+    """Enumerate Stage One document rows from the RENDERED documents table.
+
+    A row counts as a document when it has BOTH a file-type and a size cell, so
+    header/control rows are skipped. Returns title + file-type per row, indexed
+    0..N-1 in DOM order — the index the adapter passes to the bridge to click
+    each row's action menu. We never parse a download link: Delta exposes none."""
+    rows: list[_DocTableRow] = []
+    idx = 0
     for seg in _TR_SPLIT_RE.split(html or ""):
-        low = seg.lower()
-        if "<th" in low or _DOWNLOAD_LINK_RE.search(seg):
-            continue  # header, or a row that already has a docId
+        if "<th" in seg.lower():
+            continue  # header row
         if not (_FILE_TYPE_HINT_RE.search(seg) and _SIZE_HINT_RE.search(seg)):
             continue
-        title = _first_cell_text(seg)
-        if title:
-            titles.append(title)
-    return titles
+        cells = _cell_texts(seg)
+        title = (cells[0] if cells else _first_cell_text(seg)) or None
+        rows.append(
+            _DocTableRow(index=idx, title=title, file_type=_detect_file_type(cells))
+        )
+        idx += 1
+    return rows
 
 
 # --- Responses-table parsing (the already-registered path) --------------
@@ -384,11 +405,11 @@ MAX_DOCS = 50
 DELTA_RENDER_TIMEOUT_MS = 15000  # primary wait for the rows to render
 DELTA_RENDER_FALLBACK_TIMEOUT_MS = 6000  # each secondary render-signal wait
 
-# Stage One documents: the surest signal the rows rendered is the download link
-# itself; the fallbacks are other proof the table populated (file-type MIME text,
-# the "items per page" control) after which we re-read for the links.
-DELTA_DOC_RENDER_SIGNAL = "downloadDocument"
-DELTA_DOC_RENDER_FALLBACK_TEXTS = ("application/vnd", "items per page")
+# Stage One documents: the rows are JS-injected into an initially-empty shell,
+# so wait until a rendered data cell exists (primary, a selector). Fall back to
+# the items-per-page control text / the page-size dropdown as proof the table
+# populated. There is no download-link text to wait for — Delta exposes none.
+DELTA_DOC_RENDER_FALLBACK_TEXTS = ("items per page",)
 
 # Responses table (already-registered match): the opportunity link carries both
 # Stage One ids; wait for it, falling back to the "Opportunity" header.
@@ -801,22 +822,26 @@ class DeltaEsourcingAdapter(PortalAdapter):
         bridge,
         slug: str,
         *,
-        primary_text: str,
+        primary_selector: str | None = None,
+        primary_text: str | None = None,
         fallback_texts: Iterable[str] = (),
         fallback_selector: str | None = None,
     ) -> str:
         """Read Delta's RENDERED DOM for a JS-rendered table.
 
-        Delta's bip-table rows (and their download/opportunity links) are
-        injected client-side, so the initial server HTML has only the empty
-        shell. We wait for `primary_text` (the reliable proof the rows rendered,
-        e.g. "downloadDocument") to appear; if it doesn't, we wait on each
-        fallback render-signal and re-read; finally we return whatever rendered
-        so the caller can log/handle an empty table explicitly rather than
-        silently. Bridge errors degrade to "" (same as the old page_html path)."""
-        attempts: list[tuple[str, str, int]] = [
-            ("text", primary_text, DELTA_RENDER_TIMEOUT_MS)
-        ]
+        Delta's bip-table rows are injected client-side, so the initial server
+        HTML has only the empty shell. We wait for proof the rows rendered — a
+        primary selector (e.g. a rendered data cell) and/or a primary text
+        marker (e.g. the opportunity link) — then fall back to other render
+        signals; finally we return whatever rendered so the caller can log/handle
+        an empty table explicitly rather than silently. We return as soon as a
+        selector wait is satisfied or a text marker is present. Bridge errors
+        degrade to "" (same as the old page_html path)."""
+        attempts: list[tuple[str, str, int]] = []
+        if primary_selector is not None:
+            attempts.append(("selector", primary_selector, DELTA_RENDER_TIMEOUT_MS))
+        if primary_text is not None:
+            attempts.append(("text", primary_text, DELTA_RENDER_TIMEOUT_MS))
         attempts += [
             ("text", t, DELTA_RENDER_FALLBACK_TIMEOUT_MS) for t in fallback_texts
         ]
@@ -845,10 +870,13 @@ class DeltaEsourcingAdapter(PortalAdapter):
             html = res.html or ""
             if html:
                 best = html
-            # The primary signal proves the rows we care about have rendered.
-            if primary_text in html:
+            # Proof the content rendered: a satisfied selector wait, or the text
+            # marker present in the html.
+            if (kind == "selector" and res.wait_satisfied) or (
+                kind == "text" and value in html
+            ):
                 return html
-        logger.info("delta.render_signal_absent", signal=primary_text)
+        logger.info("delta.render_unconfirmed", slug=slug)
         return best
 
     async def _maximise_page_size(self, bridge, slug: str) -> None:
@@ -866,11 +894,17 @@ class DeltaEsourcingAdapter(PortalAdapter):
     async def download_documents(
         self, ctx: PortalContext, dest_dir: str
     ) -> DownloadResult:
-        """Download every Stage One document via a direct GET to
-        downloadDocument.html (using the captured respId/listId + each row's
-        docId) through the authenticated session. We do NOT click per-row menus.
-        Applies the chunk-3 caps (100MB/doc, 50 docs), sanitised filenames, and
-        sha256 dedup."""
+        """Download every Stage One document by mimicking a human: open each
+        row's Action menu (the ⋮) and click "Download File", capturing the file
+        the browser downloads.
+
+        Delta exposes NO per-row download link in the DOM — it uses checkboxes +
+        a documentIds cookie + JS, and the download only fires on the menu click
+        (confirmed by live inspection). So we read the rendered table only for
+        the row count + each row's Title/File Type, then drive the click per row.
+        Applies the chunk-3 caps (100MB/doc, 50 docs), sanitised filenames (from
+        the row Title), and sha256 dedup. This reads documents only — it never
+        submits anything."""
         bridge, slug = ctx.bridge, ctx.platform_slug
         if bridge is None or slug is None:
             return DownloadResult(
@@ -890,21 +924,20 @@ class DeltaEsourcingAdapter(PortalAdapter):
             return DownloadResult(status=DownloadStatus.error, detail=str(exc))
 
         # Maximise the page size FIRST (so all rows render on one page), THEN
-        # read the RENDERED DOM — Delta's bip-table rows and their download links
-        # are injected by JS, so the initial page HTML has only the empty shell.
-        # Order matters: maximise → wait for render → read.
+        # read the RENDERED DOM — Delta's bip-table rows are injected by JS, so
+        # the initial page HTML has only the empty shell. Order: maximise → wait
+        # for render → read. We read only to learn the row count + names; the
+        # download itself is the per-row menu click below.
         await self._maximise_page_size(bridge, slug)
         html = await self._read_rendered_html(
             bridge, slug,
-            primary_text=DELTA_DOC_RENDER_SIGNAL,
+            primary_selector=DELTA_SELECTORS["document_row_cell"],
             fallback_texts=DELTA_DOC_RENDER_FALLBACK_TEXTS,
             fallback_selector=DELTA_SELECTORS["page_size_select"],
         )
 
-        rows = _parse_document_rows(html)
+        rows = _parse_document_table_rows(html)
         items_count = _parse_items_count(html)
-        for title in _document_rows_without_docid(html):
-            logger.info("delta.docid_missing", title=title)
         if not rows:
             logger.info(
                 "delta.documents_none", resp_id=resp_id, list_id=list_id,
@@ -913,12 +946,12 @@ class DeltaEsourcingAdapter(PortalAdapter):
             return DownloadResult(
                 status=DownloadStatus.nothing_available,
                 detail=(
-                    "Stage One documents table did not render any downloadable "
-                    "rows — Delta may have changed its page structure."
+                    "Stage One documents table rendered no document rows — "
+                    "Delta may have changed its page structure."
                 ),
             )
 
-        # Visibility: the rows the parser saw vs the "N items" total Delta shows.
+        # Visibility: rows the parser saw vs the "N items" total Delta shows.
         render_incomplete = items_count is not None and len(rows) < items_count
         logger.info(
             "delta.documents_enumerated", rows=len(rows), items=items_count,
@@ -930,63 +963,93 @@ class DeltaEsourcingAdapter(PortalAdapter):
                 items_displayed=items_count,
             )
 
+        # Audit ref for each file (no per-doc URL exists): the Stage One page.
+        source_ref = DELTA_URLS["stage_one"] % (resp_id, list_id)
         files: list[DownloadedFile] = []
         seen_sha: set[str] = set()
-        missing: list[str] = []
+        failures: list[str] = []
         for row in rows[:MAX_DOCS]:
-            url = DELTA_URLS["document_download"] % (resp_id, list_id, row.doc_id)
-            if not self.matches_url(url):
-                missing.append(url)
-                continue
-            dest_name = _safe_name(row.title) if row.title else None
+            label = row.title or f"document_{row.index + 1}"
             try:
-                bf = await bridge.download(slug, url, dest_name)
+                bf = await bridge.click_download_in_row(
+                    slug,
+                    rows_selector=DELTA_SELECTORS["document_rows"],
+                    trigger_selector=DELTA_SELECTORS["row_action_menu"],
+                    item_selector=DELTA_SELECTORS["row_download_item"],
+                    index=row.index,
+                )
             except Exception as exc:  # noqa: BLE001
-                logger.info("delta.download_failed", url=url, error=str(exc))
-                missing.append(url)
+                logger.info(
+                    "delta.download_click_failed", title=label, index=row.index,
+                    error=str(exc),
+                )
+                failures.append(label)
                 continue
-            df = _ingest_bridge_file(bf, url, ctx.tender_id, preferred_name=row.title)
+            df = _ingest_bridge_file(
+                bf, source_ref, ctx.tender_id,
+                preferred_name=row.title, file_type=row.file_type,
+            )
             if df is None:
-                missing.append(url)
+                failures.append(label)
             elif df.sha256 in seen_sha:
-                logger.info("delta.duplicate_skipped", url=url, sha256=df.sha256)
+                logger.info("delta.duplicate_skipped", title=label, sha256=df.sha256)
             else:
                 seen_sha.add(df.sha256)
                 files.append(df)
-        # Anything beyond the cap is reported as missing.
+        # Rows beyond the cap are recorded as not downloaded.
         for row in rows[MAX_DOCS:]:
-            missing.append(
-                DELTA_URLS["document_download"] % (resp_id, list_id, row.doc_id)
-            )
+            failures.append(row.title or f"document_{row.index + 1}")
 
-        # render_incomplete (fewer rendered rows than Delta's "N items" total)
-        # counts as partial even when every rendered row downloaded — some rows
-        # never made it into the DOM.
-        if files and (missing or render_incomplete):
-            status = DownloadStatus.partial
-        elif files:
-            status = DownloadStatus.complete
-        else:
-            status = (
-                DownloadStatus.partial if missing else DownloadStatus.nothing_available
-            )
-        detail = None
-        if render_incomplete:
-            detail = (
-                f"Rendered {len(rows)} of {items_count} document rows Delta lists; "
-                "some rows may not have rendered."
-            )
-        return DownloadResult(
-            status=status, files=files, missing=missing, detail=detail
+        return _download_result(
+            files=files, failures=failures, seen=len(rows),
+            render_incomplete=render_incomplete, items_count=items_count,
         )
 
 
+def _download_result(
+    *,
+    files: list[DownloadedFile],
+    failures: list[str],
+    seen: int,
+    render_incomplete: bool,
+    items_count: int | None,
+) -> DownloadResult:
+    """Build the DownloadResult from the per-row outcomes.
+
+    - every row downloaded, nothing missing → complete
+    - some downloaded → partial (missing = the failed / over-cap titles)
+    - none downloaded though rows WERE seen → error with a clear, actionable
+      detail. (A genuinely empty table — zero rows — is handled earlier as
+      nothing_available; we never return a silent empty result here.)"""
+    if files and not failures and not render_incomplete:
+        return DownloadResult(status=DownloadStatus.complete, files=files)
+    if files:
+        bits = [f"downloaded {len(files)} of {seen} document(s)"]
+        if failures:
+            bits.append(f"{len(failures)} could not be downloaded")
+        if render_incomplete and items_count is not None:
+            bits.append(f"Delta lists {items_count} items but {seen} rendered")
+        return DownloadResult(
+            status=DownloadStatus.partial, files=files, missing=failures,
+            detail="; ".join(bits) + ".",
+        )
+    return DownloadResult(
+        status=DownloadStatus.error, missing=failures,
+        detail=(
+            f"Found {seen} document(s) on Stage One but could not trigger any "
+            "download — Delta's action-menu selector may have changed."
+        ),
+    )
+
+
 def _ingest_bridge_file(
-    bf, url: str, tender_id: int, preferred_name: str | None = None
+    bf, url: str, tender_id: int, preferred_name: str | None = None,
+    file_type: str | None = None,
 ) -> DownloadedFile | None:
     """Read a bridge-downloaded file from the shared volume, size-cap it,
-    sha256 it, and copy it into the tender-documents storage layout. The
-    on-disk record uses preferred_name (the document title) when provided."""
+    sha256 it, and copy it into the tender-documents storage layout. The on-disk
+    record uses preferred_name (the document title) when provided; the extension
+    comes from the downloaded file, else the table's File Type column."""
     src = Path(settings.bridge_download_dir) / bf.path
     if not src.is_file():
         logger.info("delta.bridge_file_missing", path=str(src))
@@ -997,7 +1060,7 @@ def _ingest_bridge_file(
         return None
     data = src.read_bytes()
     sha = hashlib.sha256(data).hexdigest()
-    ext = _ext_from(url, bf.mime_type)
+    ext = _ext_from(bf.mime_type, saved_name=bf.path, file_type=file_type)
     rel = Path(str(tender_id)) / sha[:2] / f"{sha}.{ext}"
     target = Path(settings.document_storage_dir) / rel
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1006,7 +1069,8 @@ def _ingest_bridge_file(
     if preferred_name:
         filename = _safe_name(preferred_name)
     else:
-        filename = _safe_name(os.path.basename(urlparse(url).path) or f"document.{ext}")
+        fallback = bf.path or os.path.basename(urlparse(url).path) or f"document.{ext}"
+        filename = _safe_name(fallback)
     if "." not in filename:
         filename = f"{filename}.{ext}"
     return DownloadedFile(
@@ -1026,18 +1090,50 @@ def _safe_name(name: str) -> str:
     return name[:200] or "document"
 
 
-def _ext_from(url: str, mime: str | None) -> str:
-    path = urlparse(url).path
-    if "." in path:
-        cand = path.rsplit(".", 1)[-1].lower()
-        if cand.isalnum() and len(cand) <= 8:
-            return cand
-    mapping = {
-        "application/pdf": "pdf",
-        "application/msword": "doc",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
-        "application/zip": "zip",
-    }
-    if mime and mime.split(";")[0].strip().lower() in mapping:
-        return mapping[mime.split(";")[0].strip().lower()]
+_MIME_EXT = {
+    "application/pdf": "pdf",
+    "application/msword": "doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+    "application/zip": "zip",
+}
+
+
+def _ext_from(
+    mime: str | None, *, saved_name: str | None = None,
+    file_type: str | None = None,
+) -> str:
+    """Pick a file extension, in order of reliability: the bridge's saved
+    filename (the real downloaded name), the MIME type, then the documents
+    table's File Type column. Falls back to 'bin'. (We do not infer from the
+    page URL — under click-download there is no per-document URL, only the Stage
+    One page ref.)"""
+    if saved_name and "." in saved_name:
+        ext = saved_name.rsplit(".", 1)[-1].lower()
+        if ext.isalnum() and len(ext) <= 8:
+            return ext
+    if mime and mime.split(";")[0].strip().lower() in _MIME_EXT:
+        return _MIME_EXT[mime.split(";")[0].strip().lower()]
+    if file_type:
+        return _ext_from_file_type(file_type)
+    return "bin"
+
+
+def _ext_from_file_type(file_type: str) -> str:
+    """Map a documents-table File Type cell (e.g. "PDF", "Word Document", or a
+    MIME string) to an extension. Best-effort; 'bin' if unrecognised."""
+    ft = file_type.strip().lower()
+    if ft in _MIME_EXT:
+        return _MIME_EXT[ft]
+    words = (
+        ("pdf", "pdf"), ("word", "docx"), ("excel", "xlsx"),
+        ("spreadsheet", "xlsx"), ("powerpoint", "pptx"),
+        ("presentation", "pptx"), ("zip", "zip"), ("csv", "csv"), ("text", "txt"),
+    )
+    for key, val in words:
+        if key in ft:
+            return val
+    token = re.sub(r"[^a-z0-9]", "", ft)
+    if token.isalnum() and 1 <= len(token) <= 8:
+        return token
     return "bin"
