@@ -1,10 +1,11 @@
 """Delta eSourcing adapter against a fully faked bridge. No browser, no network.
 
-These exercise the REAL Stage-One flow (corrected in chunk 4c after live recon):
-the access code rides in the URL (no form-fill), documents are gated behind a
-REGISTER INTEREST button (pause), and each document is a direct downloadDocument
-GET (no per-row menu clicks). The Delta-specific selectors/URLs are the constants
-the user validates manually.
+These exercise the REAL Stage-One flow: the access code rides in the URL (no
+form-fill), documents are gated behind a REGISTER INTEREST button (pause), the
+tables are JS-rendered bip-tables read from the rendered DOM, and each document
+is downloaded by opening the row's action menu (⋮) and clicking "Download File"
+(chunk 4g) — Delta exposes no per-row download link. The Delta-specific
+selectors/URLs are the constants the user validates manually.
 """
 from __future__ import annotations
 
@@ -61,27 +62,26 @@ def _responses_table_html(rows):
     )
 
 
-def _docs_table_html(resp_id="555", list_id="777", n=3, titles=None, items=None):
-    """Build a Stage One documents table with n rows, each carrying a direct
-    downloadDocument link (the real download mechanism). When `items` is given,
-    append Delta's "Displaying 1 - n of <items> items" footer so partial-render
+def _docs_table_html(n=3, titles=None, items=None, file_types=None):
+    """Build the Stage One documents table as Delta really renders it: bip-table
+    rows with NO download link — each Action cell holds only a ⋮ menu trigger.
+    Columns Title/Size/File Type/Uploaded/Action. When `items` is given, append
+    Delta's "Displaying 1 - n of <items> items" footer so partial-render
     detection (rows-found vs items-displayed) can be exercised."""
     rows = []
     for i in range(n):
-        doc_id = 1000 + i
         title = titles[i] if titles else f"Document {i}.pdf"
-        href = (
-            "/delta/suppliers/response/overview/documents/downloadDocument.html"
-            f"?respId={resp_id}&supplierListId={list_id}&docId={doc_id}"
-        )
+        ftype = file_types[i] if file_types else "PDF"
         rows.append(
-            f"<tr><td>{title}</td><td>1 MB</td><td>PDF</td><td>01/05/2026</td>"
-            f"<td><a href='{href}'>Download File</a></td></tr>"
+            f"<tr><td>{title}</td><td>1 MB</td><td>{ftype}</td><td>01/05/2026</td>"
+            "<td><button class='dots' aria-haspopup='true'>&#8942;</button></td></tr>"
         )
     footer = f"<div>Displaying 1 - {n} of {items} items</div>" if items else ""
     return (
-        "<table><tr><th>Document Title</th><th>Size</th><th>File Type</th>"
-        "<th>Uploaded</th><th>Action</th></tr>" + "".join(rows) + "</table>" + footer
+        "<div id='documentList'><table id='document'><tbody>"
+        "<tr><th>Document Title</th><th>Size</th><th>File Type</th>"
+        "<th>Uploaded</th><th>Action</th></tr>" + "".join(rows)
+        + "</tbody></table></div>" + footer
     )
 
 
@@ -99,6 +99,8 @@ class FakeBridge:
         current_url="https://www.delta-esourcing.com/delta/suppliers/select/addToList.html",
         present_selectors=None,
         download_dir=None,
+        fail_indices=None,
+        dup_content=False,
     ):
         self.text = text
         self.html = html
@@ -106,11 +108,15 @@ class FakeBridge:
         self.current_url = current_url
         self.present_selectors = set(present_selectors or [])
         self.download_dir = download_dir
+        # Per-row download behaviour for click_download_in_row.
+        self.fail_indices = set(fail_indices or [])
+        self.dup_content = dup_content
         self.navigated: list[str] = []
         self.fills: list[tuple[str, str]] = []
         self.clicks: list[str] = []
         self.selects: list[tuple[str, dict]] = []
         self.click_downloads: list[str] = []
+        self.row_downloads: list[dict] = []
         self.rendered_calls: list[dict] = []
         self.page_html_calls = 0
 
@@ -165,10 +171,37 @@ class FakeBridge:
         self.clicks.append(selector)
         return {"ok": True, "current_url": self.current_url}
 
-    async def click_download(self, slug, selector, dest_filename=None):
-        # Tracked so tests can assert the adapter NEVER uses the menu-click path.
+    async def click_download(self, slug, selector, dest_filename=None, timeout_ms=30000):
+        # Tracked so tests can assert the adapter uses the ROW variant, not this.
         self.click_downloads.append(selector)
-        raise AssertionError("click_download must not be used by the Delta adapter")
+        raise AssertionError(
+            "click_download must not be used by the Delta adapter "
+            "(use click_download_in_row)"
+        )
+
+    async def click_download_in_row(
+        self, slug, *, rows_selector, trigger_selector, item_selector, index,
+        timeout_ms=30000, dest_filename=None,
+    ):
+        """Simulate opening row `index`'s action menu and clicking Download File.
+        Rows in fail_indices raise (a row whose menu/selector failed); the rest
+        write a captured file. dup_content makes every row's bytes identical so
+        sha256 dedup can be exercised."""
+        self.row_downloads.append(
+            {"index": index, "rows": rows_selector, "trigger": trigger_selector,
+             "item": item_selector}
+        )
+        if index in self.fail_indices:
+            raise RuntimeError(f"row {index}: no download event")
+        body = b"%PDF identical" if self.dup_content else (
+            b"%PDF fake row " + str(index).encode()
+        )
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", dest_filename or f"row{index}.pdf")
+        p = Path(self.download_dir) / safe
+        p.write_bytes(body)
+        return BridgeFile(
+            path=safe, size_bytes=p.stat().st_size, mime_type="application/pdf"
+        )
 
     async def select_option(self, slug, selector, value=None, label=None, index=None):
         self.selects.append((selector, {"value": value, "label": label, "index": index}))
@@ -579,11 +612,11 @@ async def test_logout_navigates_to_logout_url():
     assert DELTA_URLS["logout"] in bridge.navigated
 
 
-# --- download: direct downloadDocument GET (no menu clicks) ------------
+# --- download: action-menu click-download (no per-row link in the DOM) -
 
 
 @pytest.mark.asyncio
-async def test_download_documents_via_direct_links(tmp_path, monkeypatch):
+async def test_download_documents_via_action_menu_clicks(tmp_path, monkeypatch):
     bridge_dl, storage = _patch_storage(monkeypatch, tmp_path)
     bridge = FakeBridge(
         html=_docs_table_html(n=3),
@@ -593,18 +626,35 @@ async def test_download_documents_via_direct_links(tmp_path, monkeypatch):
     res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
     assert res.status == DownloadStatus.complete
     assert len(res.files) == 3
-    # Navigated to Stage One and built direct download URLs (no menu clicks).
+    # Navigated to Stage One, then drove ONE click-download per row (the action
+    # menu), in row order — never link scraping or the single-click path.
     assert any("suppRespStatus.html?id=555&listId=777" in u for u in bridge.navigated)
+    assert [d["index"] for d in bridge.row_downloads] == [0, 1, 2]
     assert bridge.click_downloads == []
     assert bridge.clicks == []
     for f in res.files:
-        assert "downloadDocument.html" in f.url
-        assert "docId=" in f.url
         assert f.sha256 and f.storage_key
         assert (storage / f.storage_key).is_file()
     # Filenames come from the document titles.
     assert {f.filename for f in res.files} == {"Document_0.pdf", "Document_1.pdf",
                                                "Document_2.pdf"}
+
+
+@pytest.mark.asyncio
+async def test_download_passes_row_action_menu_selectors(tmp_path, monkeypatch):
+    # Each row download targets the table rows / ⋮ trigger / Download File item
+    # selectors from DELTA_SELECTORS — the human-like interaction, by row index.
+    bridge_dl, _ = _patch_storage(monkeypatch, tmp_path)
+    bridge = FakeBridge(
+        html=_docs_table_html(n=2), current_url=STAGE_ONE_URL,
+        download_dir=str(bridge_dl),
+    )
+    await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
+    assert bridge.row_downloads
+    for call in bridge.row_downloads:
+        assert call["rows"] == DELTA_SELECTORS["document_rows"]
+        assert call["trigger"] == DELTA_SELECTORS["row_action_menu"]
+        assert call["item"] == DELTA_SELECTORS["row_download_item"]
 
 
 @pytest.mark.asyncio
@@ -618,6 +668,7 @@ async def test_download_handles_22_documents(tmp_path, monkeypatch):
     res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
     assert res.status == DownloadStatus.complete
     assert len(res.files) == 22
+    assert [d["index"] for d in bridge.row_downloads] == list(range(22))
 
 
 @pytest.mark.asyncio
@@ -626,7 +677,7 @@ async def test_download_uses_precaptured_ids_and_maximises_page_size(
 ):
     bridge_dl, _ = _patch_storage(monkeypatch, tmp_path)
     bridge = FakeBridge(
-        html=_docs_table_html(resp_id="888", list_id="999", n=2),
+        html=_docs_table_html(n=2),
         current_url="https://www.delta-esourcing.com/delta/respondToList.html?accessCode=X",
         present_selectors={DELTA_SELECTORS["page_size_select"]},
         download_dir=str(bridge_dl),
@@ -637,7 +688,7 @@ async def test_download_uses_precaptured_ids_and_maximises_page_size(
     assert res.status == DownloadStatus.complete
     assert len(res.files) == 2
     assert any("id=888&listId=999" in u for u in bridge.navigated)
-    # Page-size dropdown maximised (last option).
+    # Page-size dropdown maximised (last option) before reading the table.
     assert bridge.selects and bridge.selects[0][1]["index"] == -1
 
 
@@ -659,23 +710,48 @@ async def test_download_caps_at_max_docs(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_download_dedups_identical_files(tmp_path, monkeypatch):
+    # dup_content makes every row's bytes identical -> one kept by sha256 dedup.
     bridge_dl, _ = _patch_storage(monkeypatch, tmp_path)
-
-    class DupBridge(FakeBridge):
-        async def download(self, slug, url, dest_filename=None):
-            safe = re.sub(r"[^A-Za-z0-9._-]", "_", dest_filename or "doc")
-            p = Path(self.download_dir) / safe
-            p.write_bytes(b"%PDF identical")  # same bytes -> same sha256
-            return BridgeFile(
-                path=safe, size_bytes=p.stat().st_size, mime_type="application/pdf"
-            )
-
-    bridge = DupBridge(
+    bridge = FakeBridge(
         html=_docs_table_html(n=3), current_url=STAGE_ONE_URL,
-        download_dir=str(bridge_dl),
+        download_dir=str(bridge_dl), dup_content=True,
     )
     res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
     assert len(res.files) == 1  # three rows, identical content -> one kept
+
+
+@pytest.mark.asyncio
+async def test_download_partial_when_some_rows_fail(tmp_path, monkeypatch):
+    # One row's action-menu click yields no download -> that row is missing, the
+    # rest are saved, status partial (not error, not nothing_available).
+    bridge_dl, _ = _patch_storage(monkeypatch, tmp_path)
+    bridge = FakeBridge(
+        html=_docs_table_html(n=3), current_url=STAGE_ONE_URL,
+        download_dir=str(bridge_dl), fail_indices={1},
+    )
+    res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
+    assert res.status == DownloadStatus.partial
+    assert len(res.files) == 2
+    assert res.missing == ["Document 1.pdf"]
+    assert res.detail and "could not be downloaded" in res.detail
+
+
+@pytest.mark.asyncio
+async def test_download_error_when_rows_seen_but_all_clicks_fail(
+    tmp_path, monkeypatch
+):
+    # Rows enumerated but EVERY action-menu click fails -> error with a clear
+    # detail, NOT a silent nothing_available.
+    bridge_dl, _ = _patch_storage(monkeypatch, tmp_path)
+    bridge = FakeBridge(
+        html=_docs_table_html(n=3), current_url=STAGE_ONE_URL,
+        download_dir=str(bridge_dl), fail_indices={0, 1, 2},
+    )
+    res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
+    assert res.status == DownloadStatus.error
+    assert res.status != DownloadStatus.nothing_available
+    assert "could not trigger any download" in res.detail
+    assert "action-menu" in res.detail
 
 
 @pytest.mark.asyncio
@@ -695,20 +771,22 @@ async def test_download_errors_without_stage_one_ids(tmp_path, monkeypatch):
 async def test_download_nothing_available_when_table_empty(tmp_path, monkeypatch):
     bridge_dl, _ = _patch_storage(monkeypatch, tmp_path)
     bridge = FakeBridge(
-        html="<table><tr><th>Document Title</th></tr></table>",
+        html="<table id='document'><tr><th>Document Title</th></tr></table>",
         current_url=STAGE_ONE_URL, download_dir=str(bridge_dl),
     )
     res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
     assert res.status == DownloadStatus.nothing_available
     # Not a silent empty result — a clear detail naming the likely cause.
-    assert "did not render" in res.detail
+    assert "no document rows" in res.detail
+    # No row downloads were attempted (no rows to click).
+    assert bridge.row_downloads == []
 
 
 @pytest.mark.asyncio
 async def test_download_reads_rendered_dom_not_page_html(tmp_path, monkeypatch):
-    # The download links live only in the RENDERED DOM (bip-table JS render), so
-    # the adapter must read via rendered_html — never the raw page-html shell.
-    bridge_dl, storage = _patch_storage(monkeypatch, tmp_path)
+    # The rows live only in the RENDERED DOM (bip-table JS render), so the adapter
+    # waits on a rendered data cell via rendered_html — never the page-html shell.
+    bridge_dl, _ = _patch_storage(monkeypatch, tmp_path)
     bridge = FakeBridge(
         html=_docs_table_html(n=3),
         current_url=STAGE_ONE_URL,
@@ -717,27 +795,10 @@ async def test_download_reads_rendered_dom_not_page_html(tmp_path, monkeypatch):
     res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
     assert res.status == DownloadStatus.complete
     assert len(res.files) == 3
-    # Rendered DOM read with a wait for the download-link marker; page_html unused.
+    # First rendered read waits on a rendered data cell selector; page_html unused.
     assert bridge.rendered_calls
-    assert bridge.rendered_calls[0]["text"] == "downloadDocument"
+    assert bridge.rendered_calls[0]["selector"] == DELTA_SELECTORS["document_row_cell"]
     assert bridge.page_html_calls == 0
-
-
-@pytest.mark.asyncio
-async def test_download_builds_urls_from_known_ids_and_docid(tmp_path, monkeypatch):
-    # Deterministic URL build: respId/listId come from the captured Stage One ids
-    # and only docId varies per row — independent of the rendered href.
-    bridge_dl, _ = _patch_storage(monkeypatch, tmp_path)
-    bridge = FakeBridge(
-        html=_docs_table_html(resp_id="555", list_id="777", n=3),
-        current_url=STAGE_ONE_URL,
-        download_dir=str(bridge_dl),
-    )
-    res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
-    assert {f.url for f in res.files} == {
-        DELTA_URLS["document_download"] % ("555", "777", str(1000 + i))
-        for i in range(3)
-    }
 
 
 @pytest.mark.asyncio
@@ -745,21 +806,25 @@ async def test_download_nothing_available_on_empty_bip_table_shell(
     tmp_path, monkeypatch
 ):
     # Even after the render wait, the table is just the empty bip-table shell
-    # (no download links) → nothing_available WITH the clear detail, not silent.
+    # (no rows) → nothing_available WITH the clear detail, not silent.
     bridge_dl, _ = _patch_storage(monkeypatch, tmp_path)
     shell = (
         "<bip-table s:id='docs'><bip-table-search></bip-table-search>"
-        "<table><tr><th>Document Title</th><th>Size</th><th>File Type</th>"
-        "<th>Action</th></tr></table></bip-table>"
+        "<table id='document'><tbody><tr><th>Document Title</th><th>Size</th>"
+        "<th>File Type</th><th>Action</th></tr></tbody></table></bip-table>"
     )
     bridge = FakeBridge(
         html=shell, current_url=STAGE_ONE_URL, download_dir=str(bridge_dl)
     )
     res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
     assert res.status == DownloadStatus.nothing_available
-    assert "did not render" in res.detail
-    # It DID wait for the render signal (and the fallbacks) before giving up.
-    assert any(c["text"] == "downloadDocument" for c in bridge.rendered_calls)
+    assert "no document rows" in res.detail
+    # It DID wait for the rendered rows before giving up.
+    assert any(
+        c["selector"] == DELTA_SELECTORS["document_row_cell"]
+        for c in bridge.rendered_calls
+    )
+    assert bridge.row_downloads == []
 
 
 @pytest.mark.asyncio
@@ -776,7 +841,7 @@ async def test_download_partial_render_downloads_found_rows(tmp_path, monkeypatc
     assert res.status == DownloadStatus.partial
     assert len(res.files) == 10
     assert res.status != DownloadStatus.nothing_available
-    assert res.detail and "10 of 22" in res.detail
+    assert res.detail and "Delta lists 22 items but 10 rendered" in res.detail
 
 
 @pytest.mark.asyncio
@@ -795,7 +860,40 @@ async def test_download_full_render_matches_items_count_is_complete(
     assert len(res.files) == 22
 
 
-def test_stage_one_and_download_urls_are_well_formed():
+@pytest.mark.asyncio
+async def test_download_extension_falls_back_to_file_type_column(
+    tmp_path, monkeypatch
+):
+    # A title without an extension + a captured file lacking one → the table's
+    # File Type column drives the stored extension.
+    bridge_dl, storage = _patch_storage(monkeypatch, tmp_path)
+
+    class NoExtBridge(FakeBridge):
+        async def click_download_in_row(self, slug, *, index, **kw):
+            p = Path(self.download_dir) / f"row{index}"  # no extension
+            p.write_bytes(b"%PDF body " + str(index).encode())
+            return BridgeFile(path=f"row{index}", size_bytes=p.stat().st_size,
+                              mime_type=None)
+
+    bridge = NoExtBridge(
+        html=_docs_table_html(n=1, titles=["Tender Spec"], file_types=["PDF"]),
+        current_url=STAGE_ONE_URL, download_dir=str(bridge_dl),
+    )
+    res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
+    assert len(res.files) == 1
+    assert res.files[0].filename == "Tender_Spec.pdf"
+    assert res.files[0].storage_key.endswith(".pdf")
+
+
+def test_stage_one_url_is_well_formed():
     assert DELTA_URLS["stage_one"] % ("555", "777") == STAGE_ONE_URL
-    built = DELTA_URLS["document_download"] % ("555", "777", "1000")
-    assert "respId=555" in built and "supplierListId=777" in built and "docId=1000" in built
+
+
+def test_ext_from_prefers_saved_name_then_mime_then_file_type():
+    from tender_agent.services.portals.adapters.delta_esourcing import _ext_from
+
+    assert _ext_from(None, saved_name="report.PDF") == "pdf"
+    assert _ext_from("application/pdf", saved_name="noext") == "pdf"
+    assert _ext_from(None, file_type="PDF") == "pdf"
+    assert _ext_from(None, file_type="Word Document") == "docx"
+    assert _ext_from(None) == "bin"

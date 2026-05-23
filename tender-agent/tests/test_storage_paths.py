@@ -128,10 +128,15 @@ class _DownloadOnlyBridge:
     async def find_links(self, slug, pattern):
         return []
 
-    async def download(self, slug, url, dest_filename=None):
-        safe = re.sub(r"[^A-Za-z0-9._-]", "_", dest_filename or url.split("docId=")[-1])
+    async def click_download_in_row(
+        self, slug, *, rows_selector, trigger_selector, item_selector, index,
+        timeout_ms=30000, dest_filename=None,
+    ):
+        # Delta downloads each row via its action menu (chunk 4g); the fake writes
+        # a captured file into the bridge download dir, one per row index.
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", dest_filename or f"row{index}.pdf")
         p = Path(self.download_dir) / safe
-        p.write_bytes(b"%PDF fake " + url.encode())
+        p.write_bytes(b"%PDF fake row " + str(index).encode())
         return BridgeFile(path=safe, size_bytes=p.stat().st_size, mime_type="application/pdf")
 
 

@@ -147,6 +147,35 @@ async def test_rendered_html_selector_and_unsatisfied_wait():
 
 
 @pytest.mark.asyncio
+async def test_click_download_in_row_endpoint_and_payload():
+    _FakeClient.next_response = _FakeResponse(
+        200,
+        {"path": "spec.pdf", "size_bytes": 12, "mime_type": "application/pdf",
+         "suggested_filename": "spec.pdf"},
+    )
+    bf = await BridgeClient().click_download_in_row(
+        "delta",
+        rows_selector="table#document tbody tr",
+        trigger_selector="button.dots",
+        item_selector="a:has-text('Download File')",
+        index=2,
+    )
+    call = _last()
+    assert call["url"].endswith("/session/delta/click-download-in-row")
+    assert call["json"] == {
+        "rows_selector": "table#document tbody tr",
+        "trigger_selector": "button.dots",
+        "item_selector": "a:has-text('Download File')",
+        "index": 2,
+        "timeout_ms": 30000,
+        "dest_filename": None,
+    }
+    assert call["headers"]["X-Bridge-Token"] == "secret-token"
+    assert bf.path == "spec.pdf"
+    assert bf.size_bytes == 12
+
+
+@pytest.mark.asyncio
 async def test_fill_endpoint_and_payload():
     _FakeClient.next_response = _FakeResponse(200, {"ok": True, "current_url": "u"})
     await BridgeClient().fill("delta", "input#accessCode", "286EVX23TV")
