@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from tender_agent.services.bridge_client import BridgeFile
+from tender_agent.services.bridge_client import BridgeFile, RenderedPage
 from tender_agent.services.portals.adapters import delta_esourcing as delta_mod
 from tender_agent.services.portals.adapters.delta_esourcing import (
     DeltaEsourcingAdapter,
@@ -110,6 +110,17 @@ class _DownloadOnlyBridge:
 
     async def page_html(self, slug):
         return self.html
+
+    async def rendered_html(
+        self, slug, *, wait_for_selector=None, wait_for_text=None, timeout_ms=15000
+    ):
+        # The Delta adapter reads the JS-rendered documents table via this; the
+        # fake "renders" self.html and reports the wait satisfied when the marker
+        # is present.
+        satisfied = wait_for_text is None or wait_for_text in (self.html or "")
+        return RenderedPage(
+            html=self.html, wait_satisfied=satisfied, current_url=STAGE_ONE_URL
+        )
 
     async def element_exists(self, slug, selector):
         return False
