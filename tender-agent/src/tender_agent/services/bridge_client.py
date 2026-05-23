@@ -27,6 +27,17 @@ class BridgeFile:
     mime_type: str | None = None
 
 
+@dataclass
+class RenderedPage:
+    """Result of /rendered-html: the rendered DOM plus whether the wait
+    condition (selector/text) was satisfied before the read. wait_satisfied is
+    False when the wait timed out — the html is still whatever had rendered."""
+
+    html: str
+    wait_satisfied: bool
+    current_url: str | None = None
+
+
 class BridgeClient:
     def __init__(
         self,
@@ -41,8 +52,10 @@ class BridgeClient:
     def _headers(self) -> dict[str, str]:
         return {"X-Bridge-Token": self.token}
 
-    async def _post(self, path: str, json: dict | None = None) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+    async def _post(
+        self, path: str, json: dict | None = None, timeout: float | None = None
+    ) -> dict[str, Any]:
+        async with httpx.AsyncClient(timeout=timeout or self.timeout) as client:
             resp = await client.post(
                 f"{self.base_url}{path}", json=json or {}, headers=self._headers()
             )
@@ -142,6 +155,38 @@ class BridgeClient:
 
     async def page_html(self, slug: str) -> str:
         return (await self._get(f"/session/{slug}/page-html")).get("html", "")
+
+    async def rendered_html(
+        self,
+        slug: str,
+        *,
+        wait_for_selector: str | None = None,
+        wait_for_text: str | None = None,
+        timeout_ms: int = 15000,
+    ) -> RenderedPage:
+        """Return the RENDERED DOM after the page's JS has populated it.
+
+        Unlike page_html (the initial server HTML), this waits for a selector OR
+        for the content to contain a marker text before reading, so client-side
+        rendered tables (Delta's bip-table) are present. On a wait timeout it
+        still returns whatever rendered, with wait_satisfied=False."""
+        body: dict[str, Any] = {"timeout_ms": timeout_ms}
+        if wait_for_selector is not None:
+            body["wait_for_selector"] = wait_for_selector
+        if wait_for_text is not None:
+            body["wait_for_text"] = wait_for_text
+        # Give the HTTP call headroom over the bridge-side wait so the client
+        # doesn't time out before the bridge returns its (possibly-unsatisfied)
+        # result.
+        http_timeout = max(self.timeout, timeout_ms / 1000.0 + 10.0)
+        data = await self._post(
+            f"/session/{slug}/rendered-html", body, timeout=http_timeout
+        )
+        return RenderedPage(
+            html=data.get("html", ""),
+            wait_satisfied=bool(data.get("wait_satisfied", False)),
+            current_url=data.get("current_url"),
+        )
 
     async def find_links(self, slug: str, pattern: str) -> list[str]:
         return (

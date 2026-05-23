@@ -285,6 +285,7 @@ class PortalOrchestrator:
             domain=domain or "",
             candidate_urls=candidate_urls,
             tender_id=tender.id,
+            title=tender.title,
         )
 
         http_client: httpx.AsyncClient | None = None
@@ -462,110 +463,155 @@ class PortalOrchestrator:
             tender_ref=tender.source_ref,
             source_url=tender.source_url,
             description=tender.description,
+            title=tender.title,
         )
         ref = tender.source_ref or str(tender.id)
 
-        if not resume_from_confirm:
-            if await adapter.is_authenticated(ctx):
-                # Session reused: the persistent bridge context for this platform
-                # is already authenticated, so we skip waiting_for_login entirely.
-                # This is the common case once the human has logged in once
-                # (critical for Delta, where login needs Microsoft Authenticator).
+        # The session is released (logout + close) on every terminal state so
+        # the single Delta login is freed for the real user — EXCEPT the
+        # needs_user_confirmation pause, which must keep the session alive for
+        # the resume. The flag is cleared just before that one return.
+        release_session = True
+        try:
+            # Concurrent-login guard at fetch start: if Delta is blocking us
+            # because another login is active, fail fast with a clear, actionable
+            # message instead of looping on waiting_for_login (issue 4e-2).
+            conflict = await adapter.session_conflict(ctx)
+            if conflict:
                 logger.info(
-                    "orchestrator.session_reused",
+                    "orchestrator.session_conflict",
                     platform=slug,
                     tender_id=tender.id,
                 )
-            else:
-                # Fresh login needed: the persistent bridge session for this
-                # platform isn't authenticated (first use, or it expired). The
-                # human logs in once in the visible window; thereafter the
-                # session is reused and this branch is skipped.
-                logger.info(
-                    "orchestrator.fresh_login_required",
-                    platform=slug,
-                    tender_id=tender.id,
-                )
-                self._set_task(
-                    db,
-                    task_id,
-                    status="waiting_for_login",
-                    waiting_since=datetime.now(UTC),
-                    login_url=adapter.login_url(),
-                    bridge_session_slug=slug,
-                    detail="Waiting for you to log in to the portal.",
-                )
-                self._notify_waiting(db, tender, platform_slug)
-                if not await self._wait_for_login(bridge, adapter, ctx, slug):
-                    base.status = OrchestrationStatus.failed
-                    base.detail = "Login not completed — retry when you're ready."
-                    return base
-                self._set_task(db, task_id, status="running", detail=None)
-
-            locate = await adapter.locate_tender(ctx, ref)
-            if locate.status == LocateStatus.requires_interest_first:
-                self._set_task(
-                    db,
-                    task_id,
-                    status="needs_user_confirmation",
-                    bridge_session_slug=slug,
-                    login_url=locate.tender_url,
-                    detail=(
-                        locate.detail
-                        or "Express Interest is required before documents are released."
-                    ),
-                )
-                base.status = OrchestrationStatus.needs_user_confirmation
-                base.detail = locate.detail
-                return base
-            if locate.status != LocateStatus.found:
-                base.status = OrchestrationStatus.locate_failed
-                base.detail = locate.detail or locate.status.value
-                return base
-        else:
-            # Resuming after the user confirmed Express Interest.
-            if not await adapter.is_authenticated(ctx):
                 base.status = OrchestrationStatus.failed
-                base.detail = "Session expired — retry to log in again."
+                base.detail = conflict
                 return base
-            await adapter.locate_tender(ctx, ref)
-            reg = await adapter.register_interest(ctx)
-            if reg.status not in (
-                RegisterStatus.success,
-                RegisterStatus.already_registered,
-            ):
-                base.status = OrchestrationStatus.register_failed
-                base.detail = reg.detail
-                return base
-            await adapter.locate_tender(ctx, ref)
 
-        dest = _dest_dir(tender.id)
-        download = await adapter.download_documents(ctx, dest)
-        base.files = [
-            {
-                "url": f.url,
-                "filename": f.filename,
-                "bytes": f.bytes,
-                "content_type": f.content_type,
-                "sha256": f.sha256,
-            }
-            for f in download.files
-        ]
-        base.missing = list(download.missing)
-        base.files_persisted = self._persist_documents(db, tender, download)
-        if download.status == DownloadStatus.complete:
-            base.status = OrchestrationStatus.complete
-        elif download.status == DownloadStatus.partial:
-            base.status = OrchestrationStatus.partial
-        elif download.status == DownloadStatus.nothing_available:
-            base.status = OrchestrationStatus.nothing_available
-        else:
-            base.status = OrchestrationStatus.download_failed
-            base.detail = download.detail
+            if not resume_from_confirm:
+                if await adapter.is_authenticated(ctx):
+                    # Session reused: the persistent bridge context for this
+                    # platform is already authenticated, so we skip
+                    # waiting_for_login entirely. This is the common case once
+                    # the human has logged in once (critical for Delta, where
+                    # login needs Microsoft Authenticator).
+                    logger.info(
+                        "orchestrator.session_reused",
+                        platform=slug,
+                        tender_id=tender.id,
+                    )
+                else:
+                    # Fresh login needed: the persistent bridge session for this
+                    # platform isn't authenticated (first use, or it expired).
+                    # The human logs in once in the visible window; thereafter
+                    # the session is reused and this branch is skipped.
+                    logger.info(
+                        "orchestrator.fresh_login_required",
+                        platform=slug,
+                        tender_id=tender.id,
+                    )
+                    self._set_task(
+                        db,
+                        task_id,
+                        status="waiting_for_login",
+                        waiting_since=datetime.now(UTC),
+                        login_url=adapter.login_url(),
+                        bridge_session_slug=slug,
+                        detail="Waiting for you to log in to the portal.",
+                    )
+                    self._notify_waiting(db, tender, platform_slug)
+                    if not await self._wait_for_login(bridge, adapter, ctx, slug):
+                        base.status = OrchestrationStatus.failed
+                        base.detail = "Login not completed — retry when you're ready."
+                        return base
+                    self._set_task(db, task_id, status="running", detail=None)
 
+                locate = await adapter.locate_tender(ctx, ref)
+                if locate.status == LocateStatus.requires_interest_first:
+                    self._set_task(
+                        db,
+                        task_id,
+                        status="needs_user_confirmation",
+                        bridge_session_slug=slug,
+                        login_url=locate.tender_url,
+                        detail=(
+                            locate.detail
+                            or "Express Interest is required before documents "
+                            "are released."
+                        ),
+                    )
+                    base.status = OrchestrationStatus.needs_user_confirmation
+                    base.detail = locate.detail
+                    # Keep the session alive across the pause so the resume can
+                    # reuse it (re-login needs Microsoft Authenticator).
+                    release_session = False
+                    return base
+                if locate.status != LocateStatus.found:
+                    base.status = OrchestrationStatus.locate_failed
+                    base.detail = locate.detail or locate.status.value
+                    return base
+            else:
+                # Resuming after the user confirmed Express Interest.
+                if not await adapter.is_authenticated(ctx):
+                    base.status = OrchestrationStatus.failed
+                    base.detail = "Session expired — retry to log in again."
+                    return base
+                await adapter.locate_tender(ctx, ref)
+                reg = await adapter.register_interest(ctx)
+                if reg.status not in (
+                    RegisterStatus.success,
+                    RegisterStatus.already_registered,
+                ):
+                    base.status = OrchestrationStatus.register_failed
+                    base.detail = reg.detail
+                    return base
+                await adapter.locate_tender(ctx, ref)
+
+            dest = _dest_dir(tender.id)
+            download = await adapter.download_documents(ctx, dest)
+            base.files = [
+                {
+                    "url": f.url,
+                    "filename": f.filename,
+                    "bytes": f.bytes,
+                    "content_type": f.content_type,
+                    "sha256": f.sha256,
+                }
+                for f in download.files
+            ]
+            base.missing = list(download.missing)
+            base.files_persisted = self._persist_documents(db, tender, download)
+            if download.status == DownloadStatus.complete:
+                base.status = OrchestrationStatus.complete
+            elif download.status == DownloadStatus.partial:
+                base.status = OrchestrationStatus.partial
+            elif download.status == DownloadStatus.nothing_available:
+                base.status = OrchestrationStatus.nothing_available
+            else:
+                base.status = OrchestrationStatus.download_failed
+                base.detail = download.detail
+            return base
+        finally:
+            if release_session:
+                await self._release_session(bridge, adapter, ctx, slug, tender.id)
+
+    async def _release_session(
+        self,
+        bridge: BridgeClient,
+        adapter: PortalAdapter,
+        ctx: PortalContext,
+        slug: str,
+        tender_id: int,
+    ) -> None:
+        """Release the portal session after a login-adapter fetch reaches a
+        terminal state. Delta enforces a single concurrent login per account, so
+        holding the session locks the real user out (the lockout seen in live
+        testing — issue 4e-2). We log out server-side (best-effort) THEN close
+        the local bridge context. Both steps are non-fatal."""
+        with contextlib.suppress(Exception):
+            await adapter.logout(ctx)
         with contextlib.suppress(Exception):
             await bridge.close_session(slug)
-        return base
+        logger.info("delta.session_released", platform=slug, tender_id=tender_id)
 
     def _load_credentials(self, portal_id: int, user_id: str) -> Credentials | None:
         store = self._store()

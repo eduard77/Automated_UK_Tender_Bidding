@@ -101,6 +101,15 @@ class ScreenshotBody(BaseModel):
     label: str = "screenshot"
 
 
+class RenderedHtmlBody(BaseModel):
+    # Wait for one of these before reading the DOM (JS-rendered tables, e.g.
+    # Delta's bip-table, are absent from the initial server HTML). If both are
+    # given, the selector is waited for first. Either may be omitted.
+    wait_for_selector: str | None = None
+    wait_for_text: str | None = None
+    timeout_ms: int = 15000
+
+
 # --- health (no token: availability probe only) ------------------------
 
 
@@ -211,6 +220,62 @@ async def page_html(slug: str, _: None = Depends(require_token)) -> dict:
     except Exception:  # noqa: BLE001
         html = ""
     return {"current_url": session.page.url, "html": html}
+
+
+@app.post("/session/{slug}/rendered-html")
+async def rendered_html(
+    slug: str, body: RenderedHtmlBody, _: None = Depends(require_token)
+) -> dict:
+    """Return the RENDERED DOM, optionally after waiting for the page to finish
+    rendering JS-injected content.
+
+    page-html returns the initial server HTML; some portals (Delta eSourcing's
+    bip-table web components) inject the real rows — and their download links —
+    client-side after load, so they are missing from that initial HTML. This
+    endpoint waits for a selector OR for the page content to contain a marker
+    text (e.g. "downloadDocument"), then returns document.documentElement
+    .outerHTML. On timeout it still returns whatever has rendered, with
+    wait_satisfied=false so the caller can decide what to do."""
+    session = _require_session(slug)
+    page = session.page
+    timeout_ms = max(0, body.timeout_ms)
+    wait_satisfied = True
+
+    if body.wait_for_selector:
+        wait_satisfied = False
+        try:
+            await page.wait_for_selector(body.wait_for_selector, timeout=timeout_ms)
+            wait_satisfied = True
+        except Exception:  # noqa: BLE001
+            wait_satisfied = False
+    elif body.wait_for_text:
+        # Poll the live content until the marker text appears or we time out.
+        wait_satisfied = False
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while True:
+            try:
+                content = await page.content()
+            except Exception:  # noqa: BLE001
+                content = ""
+            if body.wait_for_text in content:
+                wait_satisfied = True
+                break
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(0.25)
+
+    try:
+        html = await page.evaluate("() => document.documentElement.outerHTML")
+    except Exception:  # noqa: BLE001
+        try:
+            html = await page.content()
+        except Exception:  # noqa: BLE001
+            html = ""
+    return {
+        "current_url": page.url,
+        "html": html,
+        "wait_satisfied": wait_satisfied,
+    }
 
 
 @app.post("/session/{slug}/find-links")
@@ -366,6 +431,14 @@ async def screenshot(
 
 @app.post("/session/{slug}/close")
 async def close_session(slug: str, _: None = Depends(require_token)) -> dict:
+    """End a session: close its pages and the persistent browser context.
+
+    This is the local half of releasing a session. For portals with a single
+    concurrent-login constraint (Delta eSourcing), the adapter first navigates
+    the live session to the portal's logout URL (via /navigate) so the *server*
+    frees the login too — closing the context alone would leave Delta's session
+    active until it times out, locking the real user out. The orchestrator does
+    logout-then-close on every terminal state."""
     closed = await manager.close(slug)
     return {"closed": closed}
 

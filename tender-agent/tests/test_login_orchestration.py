@@ -105,6 +105,7 @@ class FakeLoginAdapter(PortalAdapter):
         self._download = download or DownloadResult(status=DownloadStatus.nothing_available)
         self._register = register_status
         self.registered = False
+        self.logged_out = False
 
     def matches_url(self, url):
         return "delta-esourcing.com" in url
@@ -127,6 +128,10 @@ class FakeLoginAdapter(PortalAdapter):
 
     async def download_documents(self, ctx, dest_dir):
         return self._download
+
+    async def logout(self, ctx):
+        self.logged_out = True
+        return True
 
 
 def _seed(db: Session, ref="login-1") -> tuple[Tender, Portal]:
@@ -249,6 +254,92 @@ async def test_express_interest_pauses(db: Session):
     task = db.execute(select(FetchTask).where(FetchTask.task_id == task_id)).scalar_one()
     assert task.status == "needs_user_confirmation"
     assert not adapter.registered  # never auto-clicked
+
+
+# --- session release (Delta single-concurrent-login constraint) --------
+
+
+@pytest.mark.asyncio
+async def test_session_released_on_success(db: Session, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "tender_agent.services.portal_orchestrator.settings.document_storage_dir",
+        str(tmp_path),
+    )
+    t, p = _seed(db, "release-ok-1")
+    task_id = _task(db, t)
+    adapter = FakeLoginAdapter(
+        auth_results=[True],
+        locate_status=LocateStatus.found,
+        download=DownloadResult(
+            status=DownloadStatus.complete, files=[_persisted_file(tmp_path)]
+        ),
+    )
+    bridge = FakeBridge()
+    res = await _orch(bridge)._run_login_adapter(
+        db, adapter, t, p, "delta_esourcing", "FakeLoginAdapter", "eduard", [],
+        task_id, False,
+    )
+    assert res.status == OrchestrationStatus.complete
+    # Session released: logged out server-side AND closed locally.
+    assert adapter.logged_out is True
+    assert bridge.closed is True
+
+
+@pytest.mark.asyncio
+async def test_session_released_on_failure(db: Session):
+    t, p = _seed(db, "release-fail-1")
+    task_id = _task(db, t)
+    adapter = FakeLoginAdapter(
+        auth_results=[True], locate_status=LocateStatus.not_found
+    )
+    bridge = FakeBridge()
+    res = await _orch(bridge)._run_login_adapter(
+        db, adapter, t, p, "delta_esourcing", "FakeLoginAdapter", "eduard", [],
+        task_id, False,
+    )
+    assert res.status == OrchestrationStatus.locate_failed
+    # Released even though the fetch failed — the user must not stay locked out.
+    assert adapter.logged_out is True
+    assert bridge.closed is True
+
+
+@pytest.mark.asyncio
+async def test_session_kept_alive_during_confirmation_pause(db: Session):
+    t, p = _seed(db, "release-pause-1")
+    task_id = _task(db, t)
+    adapter = FakeLoginAdapter(
+        auth_results=[True], locate_status=LocateStatus.requires_interest_first
+    )
+    bridge = FakeBridge()
+    res = await _orch(bridge)._run_login_adapter(
+        db, adapter, t, p, "delta_esourcing", "FakeLoginAdapter", "eduard", [],
+        task_id, False,
+    )
+    assert res.status == OrchestrationStatus.needs_user_confirmation
+    # The pause must NOT release the session — the resume reuses it.
+    assert adapter.logged_out is False
+    assert bridge.closed is False
+
+
+@pytest.mark.asyncio
+async def test_session_conflict_fails_fast(db: Session):
+    """A concurrent-login conflict at fetch start fails fast and releases."""
+
+    class ConflictAdapter(FakeLoginAdapter):
+        async def session_conflict(self, ctx):
+            return "Delta session conflict — end your other Delta session."
+
+    t, p = _seed(db, "conflict-1")
+    task_id = _task(db, t)
+    adapter = ConflictAdapter(auth_results=[True], locate_status=LocateStatus.found)
+    bridge = FakeBridge()
+    res = await _orch(bridge)._run_login_adapter(
+        db, adapter, t, p, "delta_esourcing", "FakeLoginAdapter", "eduard", [],
+        task_id, False,
+    )
+    assert res.status == OrchestrationStatus.failed
+    assert "conflict" in res.detail.lower()
+    assert bridge.closed is True
 
 
 @pytest.mark.asyncio
