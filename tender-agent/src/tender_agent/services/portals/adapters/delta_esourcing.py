@@ -270,7 +270,8 @@ def _first_cell_text(row_html: str) -> str | None:
 def _parse_document_rows(html: str) -> list[_DocRow]:
     """Enumerate document rows from the Stage One documents table HTML by the
     download-link pattern (which carries respId/listId/docId). One row per
-    distinct docId; title is best-effort from the first cell."""
+    distinct docId; title is best-effort from the first cell. Run this over the
+    RENDERED DOM — the links are JS-injected and absent from the initial HTML."""
     rows: list[_DocRow] = []
     seen: set[str] = set()
     for seg in _TR_SPLIT_RE.split(html or ""):
@@ -283,6 +284,30 @@ def _parse_document_rows(html: str) -> list[_DocRow]:
         seen.add(doc_id)
         rows.append(_DocRow(resp_id, list_id, doc_id, _first_cell_text(seg)))
     return rows
+
+
+# Heuristics to spot a row that is clearly a document (title + file-type + size)
+# but exposes no download link — i.e. no discoverable docId. Used for visibility
+# logging only; never affects which rows are downloaded.
+_FILE_TYPE_HINT_RE = re.compile(r"application/|\b(?:pdf|docx?|xlsx?|zip)\b", re.IGNORECASE)
+_SIZE_HINT_RE = re.compile(r"\b\d+(?:\.\d+)?\s?(?:bytes|[kmg]b)\b", re.IGNORECASE)
+
+
+def _document_rows_without_docid(html: str) -> list[str]:
+    """Titles of rows that look like a document (have a file-type AND a size)
+    but carry no download link — so no docId can be extracted. Logged so a
+    future Delta markup change (or a partially-rendered table) is visible."""
+    titles: list[str] = []
+    for seg in _TR_SPLIT_RE.split(html or ""):
+        low = seg.lower()
+        if "<th" in low or _DOWNLOAD_LINK_RE.search(seg):
+            continue  # header, or a row that already has a docId
+        if not (_FILE_TYPE_HINT_RE.search(seg) and _SIZE_HINT_RE.search(seg)):
+            continue
+        title = _first_cell_text(seg)
+        if title:
+            titles.append(title)
+    return titles
 
 
 # --- Responses-table parsing (the already-registered path) --------------
@@ -350,6 +375,44 @@ def _title_score(a: str | None, b: str | None) -> float:
 
 MAX_FILE_BYTES = 100 * 1024 * 1024
 MAX_DOCS = 50
+
+# --- rendered-DOM waits (bip-table is JS-rendered) ----------------------
+# Delta's tables (<bip-table> web components) are populated CLIENT-SIDE after
+# load, so the download/opportunity links are absent from the initial server
+# HTML and present only in the RENDERED DOM. We read via the bridge's
+# rendered-html endpoint, waiting for a marker that proves the rows rendered.
+DELTA_RENDER_TIMEOUT_MS = 15000  # primary wait for the rows to render
+DELTA_RENDER_FALLBACK_TIMEOUT_MS = 6000  # each secondary render-signal wait
+
+# Stage One documents: the surest signal the rows rendered is the download link
+# itself; the fallbacks are other proof the table populated (file-type MIME text,
+# the "items per page" control) after which we re-read for the links.
+DELTA_DOC_RENDER_SIGNAL = "downloadDocument"
+DELTA_DOC_RENDER_FALLBACK_TEXTS = ("application/vnd", "items per page")
+
+# Responses table (already-registered match): the opportunity link carries both
+# Stage One ids; wait for it, falling back to the "Opportunity" header.
+DELTA_RESP_RENDER_SIGNAL = "suppRespStatus.html"
+DELTA_RESP_RENDER_FALLBACK_TEXTS = ("Opportunity",)
+
+# Delta shows a row count like "Displaying 1 - 22 of 22 items" near the table.
+# We use it ONLY to log a parser-vs-display mismatch (never to fail a download).
+# "of N items" is the total; the bare "N items" form excludes "N items per page"
+# (the page-size control), which is not a row total.
+_ITEMS_OF_RE = re.compile(r"\bof\s+(\d+)\s+items?\b", re.IGNORECASE)
+_ITEMS_COUNT_RE = re.compile(r"\b(\d+)\s+items?\b(?!\s+per\b)", re.IGNORECASE)
+
+
+def _parse_items_count(html: str) -> int | None:
+    """Best-effort total-row count Delta displays near the documents table, or
+    None if absent. Prefers the "of N items" total; otherwise the largest bare
+    "N items" figure (ignoring "N items per page")."""
+    text = html or ""
+    m = _ITEMS_OF_RE.search(text)
+    if m:
+        return int(m.group(1))
+    nums = [int(mm.group(1)) for mm in _ITEMS_COUNT_RE.finditer(text)]
+    return max(nums) if nums else None
 
 
 class DeltaEsourcingAdapter(PortalAdapter):
@@ -501,10 +564,14 @@ class DeltaEsourcingAdapter(PortalAdapter):
         if _has_concurrent_login(rm_text):
             logger.info("delta.concurrent_login", slug=slug, where="response_manager")
             return LocateResult(status=LocateStatus.error, detail=CONCURRENT_LOGIN_DETAIL)
-        try:
-            rm_html = await bridge.page_html(slug)
-        except Exception:  # noqa: BLE001
-            rm_html = ""
+        # The Responses table is a JS-rendered bip-table: read the RENDERED DOM
+        # (waiting for the opportunity links to appear), not the empty shell that
+        # page_html returns.
+        rm_html = await self._read_rendered_html(
+            bridge, slug,
+            primary_text=DELTA_RESP_RENDER_SIGNAL,
+            fallback_texts=DELTA_RESP_RENDER_FALLBACK_TEXTS,
+        )
         match = self._match_responses_row(rm_html, ctx)
         if match is not None:
             self._resp_id, self._list_id = match.resp_id, match.list_id
@@ -641,7 +708,12 @@ class DeltaEsourcingAdapter(PortalAdapter):
         if not (rid and lid):
             try:
                 await bridge.navigate(slug, DELTA_URLS["response_manager"])
-                rm_html = await bridge.page_html(slug)
+                # Rendered DOM: the Responses bip-table populates client-side.
+                rm_html = await self._read_rendered_html(
+                    bridge, slug,
+                    primary_text=DELTA_RESP_RENDER_SIGNAL,
+                    fallback_texts=DELTA_RESP_RENDER_FALLBACK_TEXTS,
+                )
                 match = self._match_responses_row(rm_html, ctx)
                 if match is not None:
                     rid, lid = match.resp_id, match.list_id
@@ -724,6 +796,61 @@ class DeltaEsourcingAdapter(PortalAdapter):
             pass
         return None, None
 
+    async def _read_rendered_html(
+        self,
+        bridge,
+        slug: str,
+        *,
+        primary_text: str,
+        fallback_texts: Iterable[str] = (),
+        fallback_selector: str | None = None,
+    ) -> str:
+        """Read Delta's RENDERED DOM for a JS-rendered table.
+
+        Delta's bip-table rows (and their download/opportunity links) are
+        injected client-side, so the initial server HTML has only the empty
+        shell. We wait for `primary_text` (the reliable proof the rows rendered,
+        e.g. "downloadDocument") to appear; if it doesn't, we wait on each
+        fallback render-signal and re-read; finally we return whatever rendered
+        so the caller can log/handle an empty table explicitly rather than
+        silently. Bridge errors degrade to "" (same as the old page_html path)."""
+        attempts: list[tuple[str, str, int]] = [
+            ("text", primary_text, DELTA_RENDER_TIMEOUT_MS)
+        ]
+        attempts += [
+            ("text", t, DELTA_RENDER_FALLBACK_TIMEOUT_MS) for t in fallback_texts
+        ]
+        if fallback_selector is not None:
+            attempts.append(
+                ("selector", fallback_selector, DELTA_RENDER_FALLBACK_TIMEOUT_MS)
+            )
+
+        best = ""
+        for kind, value, timeout_ms in attempts:
+            try:
+                if kind == "selector":
+                    res = await bridge.rendered_html(
+                        slug, wait_for_selector=value, timeout_ms=timeout_ms
+                    )
+                else:
+                    res = await bridge.rendered_html(
+                        slug, wait_for_text=value, timeout_ms=timeout_ms
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.info(
+                    "delta.rendered_html_failed", kind=kind, value=value,
+                    error=str(exc),
+                )
+                continue
+            html = res.html or ""
+            if html:
+                best = html
+            # The primary signal proves the rows we care about have rendered.
+            if primary_text in html:
+                return html
+        logger.info("delta.render_signal_absent", signal=primary_text)
+        return best
+
     async def _maximise_page_size(self, bridge, slug: str) -> None:
         """Best-effort: set the documents page-size dropdown to its largest
         option so every row renders on one page. Non-fatal — if it fails we
@@ -762,18 +889,45 @@ class DeltaEsourcingAdapter(PortalAdapter):
         except Exception as exc:  # noqa: BLE001
             return DownloadResult(status=DownloadStatus.error, detail=str(exc))
 
-        # Make sure all rows are on one page, then read the documents table.
+        # Maximise the page size FIRST (so all rows render on one page), THEN
+        # read the RENDERED DOM — Delta's bip-table rows and their download links
+        # are injected by JS, so the initial page HTML has only the empty shell.
+        # Order matters: maximise → wait for render → read.
         await self._maximise_page_size(bridge, slug)
-        try:
-            html = await bridge.page_html(slug)
-        except Exception as exc:  # noqa: BLE001
-            return DownloadResult(status=DownloadStatus.error, detail=str(exc))
+        html = await self._read_rendered_html(
+            bridge, slug,
+            primary_text=DELTA_DOC_RENDER_SIGNAL,
+            fallback_texts=DELTA_DOC_RENDER_FALLBACK_TEXTS,
+            fallback_selector=DELTA_SELECTORS["page_size_select"],
+        )
 
         rows = _parse_document_rows(html)
+        items_count = _parse_items_count(html)
+        for title in _document_rows_without_docid(html):
+            logger.info("delta.docid_missing", title=title)
         if not rows:
+            logger.info(
+                "delta.documents_none", resp_id=resp_id, list_id=list_id,
+                items=items_count,
+            )
             return DownloadResult(
                 status=DownloadStatus.nothing_available,
-                detail="no documents found on Stage One",
+                detail=(
+                    "Stage One documents table did not render any downloadable "
+                    "rows — Delta may have changed its page structure."
+                ),
+            )
+
+        # Visibility: the rows the parser saw vs the "N items" total Delta shows.
+        render_incomplete = items_count is not None and len(rows) < items_count
+        logger.info(
+            "delta.documents_enumerated", rows=len(rows), items=items_count,
+            resp_id=resp_id, list_id=list_id,
+        )
+        if render_incomplete:
+            logger.info(
+                "delta.documents_partial", rows_found=len(rows),
+                items_displayed=items_count,
             )
 
         files: list[DownloadedFile] = []
@@ -805,7 +959,10 @@ class DeltaEsourcingAdapter(PortalAdapter):
                 DELTA_URLS["document_download"] % (resp_id, list_id, row.doc_id)
             )
 
-        if files and missing:
+        # render_incomplete (fewer rendered rows than Delta's "N items" total)
+        # counts as partial even when every rendered row downloaded — some rows
+        # never made it into the DOM.
+        if files and (missing or render_incomplete):
             status = DownloadStatus.partial
         elif files:
             status = DownloadStatus.complete
@@ -813,7 +970,15 @@ class DeltaEsourcingAdapter(PortalAdapter):
             status = (
                 DownloadStatus.partial if missing else DownloadStatus.nothing_available
             )
-        return DownloadResult(status=status, files=files, missing=missing)
+        detail = None
+        if render_incomplete:
+            detail = (
+                f"Rendered {len(rows)} of {items_count} document rows Delta lists; "
+                "some rows may not have rendered."
+            )
+        return DownloadResult(
+            status=status, files=files, missing=missing, detail=detail
+        )
 
 
 def _ingest_bridge_file(
