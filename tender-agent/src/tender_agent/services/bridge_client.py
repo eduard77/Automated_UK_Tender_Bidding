@@ -28,6 +28,18 @@ class BridgeFile:
 
 
 @dataclass
+class BridgeRowDownload:
+    """Result of /click-download-in-row: the captured file (path relative to the
+    shared download dir) plus the browser's suggested filename, which the caller
+    uses to name the document and derive its extension."""
+
+    path: str
+    suggested_filename: str | None = None
+    size_bytes: int = 0
+    mime_type: str | None = None
+
+
+@dataclass
 class RenderedPage:
     """Result of /rendered-html: the rendered DOM plus whether the wait
     condition (selector/text) was satisfied before the read. wait_satisfied is
@@ -216,6 +228,42 @@ class BridgeClient:
         return BridgeFile(
             path=data["path"],
             size_bytes=data["size_bytes"],
+            mime_type=data.get("mime_type"),
+        )
+
+    async def click_download_in_row(
+        self,
+        slug: str,
+        *,
+        table_selector: str,
+        row_index: int,
+        menu_trigger_selector: str,
+        download_item_text: str,
+        timeout_ms: int = 30000,
+    ) -> BridgeRowDownload:
+        """Open a table row's action menu (⋮) and click an item that triggers a
+        file download, returning the captured file. For portals (Delta) whose
+        rows carry no scrapable download link — the file only downloads on the
+        per-row menu click. Raises BridgeError if no download is captured (so the
+        caller can log that row and continue with the rest)."""
+        # Give the HTTP call headroom over the bridge-side download wait so the
+        # client doesn't time out before the bridge returns its result/error.
+        http_timeout = max(self.timeout, timeout_ms / 1000.0 + 10.0)
+        data = await self._post(
+            f"/session/{slug}/click-download-in-row",
+            {
+                "table_selector": table_selector,
+                "row_index": row_index,
+                "menu_trigger_selector": menu_trigger_selector,
+                "download_item_text": download_item_text,
+                "timeout_ms": timeout_ms,
+            },
+            timeout=http_timeout,
+        )
+        return BridgeRowDownload(
+            path=data["path"],
+            suggested_filename=data.get("suggested_filename"),
+            size_bytes=data.get("size_bytes", 0),
             mime_type=data.get("mime_type"),
         )
 
