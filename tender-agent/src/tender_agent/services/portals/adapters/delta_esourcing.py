@@ -114,25 +114,31 @@ DELTA_SELECTORS = {
         "a:has-text('Response Manager'), a:has-text('Profile Manager'), "
         "a:has-text('Select Accredit'), #supplierMenu, nav a:has-text('Resources')"
     ),
-    # CONFIRMED (live DOM) — the Stage One documents table is <table id="document">
-    # inside <div id="documentList"> (a bip-table). Columns: Document Title /
-    # Size / File Type / Uploaded / Action.
+    # CONFIRMED (live DOM, tender 3169) — the Stage One documents table is
+    # <table id="document" class="dataTable ..." role="grid"> inside
+    # <div id="documentList">. Columns: Document Title / Size / File Type /
+    # Uploaded / Action.
     "documents_table": "table#document",
-    # CONFIRMED — the data rows of that table (used to wait for the render and to
-    # target each row's Action menu by index).
-    "document_rows": "table#document tbody tr",
-    # CONFIRM SELECTOR — the ⋮ "three dots" Action control within a row. bip-table
-    # renders it in the last (Action) cell; clicking it opens the row's menu. The
-    # bridge clicks the first match WITHIN the row, so this is a per-row selector.
-    "row_action_menu": (
-        "td:last-child button, td:last-child a, td:last-child [role='button']"
-    ),
-    # CONFIRM SELECTOR — the "Download File" menu item that appears after opening
-    # the ⋮ menu. It may render in a body-level popup, so the bridge matches it
-    # PAGE-WIDE by this exact text rather than within the row.
+    # CONFIRMED (live DOM) — the data rows are tr[role="row"] in the tbody
+    # (classes alternate odd/even); the thead row is excluded. Used to wait for
+    # the render and to target each row's Action menu by index.
+    "document_rows": "table#document tbody tr[role='row']",
+    # CONFIRMED (live DOM) — the ⋮ "three dots" Action control is a Font Awesome
+    # <i> icon (NOT a button/link), inside <bip-actions-menu> in the row's last
+    # (Action) cell. The bridge finds it WITHIN the row, so this is a per-row
+    # selector; clicking it opens the row's menu.
+    "row_action_menu": "i.bip-actions-menu-link.fa-ellipsis-v",
+    # CONFIRMED (live DOM) — after the ⋮ click a popup renders at BODY level (in a
+    # div.highslide-container) containing a "Download File" control. The bridge
+    # matches it PAGE-WIDE by this visible text (get_by_text .last), not within
+    # the row.
     "row_download_item_text": "Download File",
-    # CONFIRM SELECTOR — the "Display N items per page" dropdown.
+    # CONFIRMED (live DOM) — the documents table is a DataTables grid; its length
+    # menu is a <select name="document_length"> in the .dataTables_length control
+    # ("Display N items per page"). Set it to the largest option so all rows
+    # render on one page. Patterns also cover generic per-page selects.
     "page_size_select": (
+        "select[name$='_length'], .dataTables_length select, "
         "select[name*='perPage' i], select[name*='pageSize' i], "
         "select[aria-label*='per page' i], select.page-size"
     ),
@@ -377,6 +383,11 @@ DELTA_RENDER_FALLBACK_TIMEOUT_MS = 6000  # each secondary render-signal wait
 # rendered is a data row in table#document (a selector wait); the fallbacks give
 # the table more time (the "items per page" control / its text) before we re-read.
 DELTA_DOC_RENDER_FALLBACK_TEXTS = ("items per page",)
+
+# After maximising the DataTables page size, the grid re-renders client-side; we
+# re-read the rendered DOM up to this many times, waiting for all "N items" rows
+# to appear, before giving up and downloading whatever rendered.
+DELTA_DOC_REREAD_ATTEMPTS = 5
 
 # Responses table (already-registered match): the opportunity link carries both
 # Stage One ids; wait for it, falling back to the "Opportunity" header.
@@ -958,17 +969,63 @@ class DeltaEsourcingAdapter(PortalAdapter):
         )
         return best
 
-    async def _maximise_page_size(self, bridge, slug: str) -> None:
-        """Best-effort: set the documents page-size dropdown to its largest
-        option so every row renders on one page. Non-fatal — if it fails we
-        enumerate whatever rows are present. DRY-RUN: confirm the select markup."""
+    async def _maximise_page_size(self, bridge, slug: str) -> bool:
+        """Best-effort: set the documents DataTables length menu to its largest
+        option (e.g. 100) so every row renders on one page. Returns True if it
+        set the control. Non-fatal — if the select isn't found we enumerate
+        whatever rows are present (and the caller polls/falls back)."""
+        selector = DELTA_SELECTORS["page_size_select"]
         try:
-            if await bridge.element_exists(slug, DELTA_SELECTORS["page_size_select"]):
-                await bridge.select_option(
-                    slug, DELTA_SELECTORS["page_size_select"], index=-1
-                )
+            if not await bridge.element_exists(slug, selector):
+                logger.info("delta.page_size_max_skipped", reason="select_not_found")
+                return False
+            # index=-1 selects the last (largest) option of the length menu.
+            await bridge.select_option(slug, selector, index=-1)
+            logger.info("delta.page_size_maximised", selector=selector)
+            return True
         except Exception as exc:  # noqa: BLE001
             logger.info("delta.page_size_max_skipped", error=str(exc))
+            return False
+
+    async def _read_documents(
+        self, bridge, slug: str
+    ) -> tuple[str, list[_DocRow], int | None]:
+        """Read the Stage One documents table, polling until all rows render.
+
+        DataTables re-renders client-side after the page-size change, so the
+        first read can catch only the initial page. We read once (waiting for a
+        data row), parse the "N items" total, then — if fewer than N rows are
+        present — re-read up to DELTA_DOC_REREAD_ATTEMPTS times, keeping the
+        largest result and stopping as soon as the count reaches N or stops
+        growing. Returns (best_html, parsed_rows, items_count)."""
+        html = await self._read_rendered_html(
+            bridge, slug,
+            primary_selector=DELTA_SELECTORS["document_rows"],
+            fallback_texts=DELTA_DOC_RENDER_FALLBACK_TEXTS,
+            fallback_selector=DELTA_SELECTORS["page_size_select"],
+        )
+        rows = _parse_document_rows(html)
+        items_count = _parse_items_count(html)
+        if items_count is None or len(rows) >= items_count:
+            return html, rows, items_count
+
+        for _ in range(DELTA_DOC_REREAD_ATTEMPTS):
+            try:
+                res = await bridge.rendered_html(
+                    slug,
+                    wait_for_selector=DELTA_SELECTORS["document_rows"],
+                    timeout_ms=DELTA_RENDER_FALLBACK_TIMEOUT_MS,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.info("delta.documents_reread_failed", error=str(exc))
+                break
+            reread_rows = _parse_document_rows(res.html or "")
+            if len(reread_rows) <= len(rows):
+                break  # stabilised — no further rows appeared
+            html, rows = (res.html or html), reread_rows
+            if len(rows) >= items_count:
+                break
+        return html, rows, items_count
 
     async def download_documents(
         self, ctx: PortalContext, dest_dir: str
@@ -1004,20 +1061,13 @@ class DeltaEsourcingAdapter(PortalAdapter):
             return DownloadResult(status=DownloadStatus.error, detail=str(exc))
 
         # Maximise the page size FIRST (so all rows render on one page), THEN
-        # read the RENDERED DOM — Delta's bip-table rows are injected by JS, so
+        # read the RENDERED DOM — Delta's DataTables rows are injected by JS, so
         # the initial page HTML has only the empty shell. The surest proof the
-        # rows rendered is a data row of table#document (a selector wait).
-        # Order matters: maximise → wait for render → read.
+        # rows rendered is a data row of table#document (a selector wait); after
+        # maximising we poll until all "N items" rows appear.
+        # Order matters: maximise → wait for render → read (with poll).
         await self._maximise_page_size(bridge, slug)
-        html = await self._read_rendered_html(
-            bridge, slug,
-            primary_selector=DELTA_SELECTORS["document_rows"],
-            fallback_texts=DELTA_DOC_RENDER_FALLBACK_TEXTS,
-            fallback_selector=DELTA_SELECTORS["page_size_select"],
-        )
-
-        rows = _parse_document_rows(html)
-        items_count = _parse_items_count(html)
+        html, rows, items_count = await self._read_documents(bridge, slug)
         if not rows:
             # ZERO rows seen → genuinely nothing to download (or the table never
             # rendered). Clear detail, not a silent empty result.
