@@ -147,13 +147,38 @@ class FakeBridge:
         self.page_html_calls += 1
         return self.html
 
+    def _selector_satisfied(self, selector):
+        """Approximate Playwright wait_for_selector against the canned html, for
+        the Delta selectors the adapter waits on. Lets selector-based renders
+        (chunk 4h) be exercised without a real browser."""
+        s = selector or ""
+        html = self.html or ""
+        if "suppRespStatus.html" in s:  # responses_opportunity_link
+            return "suppRespStatus.html" in html
+        if "responses" in s or "Opportunity" in s:  # responses_table container
+            return ("Opportunity" in html) or ("suppRespStatus.html" in html)
+        if any(
+            m in s
+            for m in ("Response Manager", "Profile Manager", "supplierMenu",
+                      "Select Accredit", "Resources")
+        ):  # logged_in_marker
+            return any(
+                m in html
+                for m in ("Response Manager", "Profile Manager",
+                          "Supplier Administrator", "supplierMenu")
+            )
+        if "downloadDocument" in s:
+            return "downloadDocument" in html
+        return False
+
     async def rendered_html(
         self, slug, *, wait_for_selector=None, wait_for_text=None, timeout_ms=15000
     ):
         """Return self.html as the "rendered DOM". wait_satisfied mirrors whether
         the requested marker is present — wait_for_text in the html, or
-        wait_for_selector in present_selectors — so the adapter's fallback logic
-        is exercised exactly as against the live bridge."""
+        wait_for_selector matching present_selectors / a heuristic against the
+        html — so the adapter's wait logic is exercised as against the live
+        bridge."""
         self.rendered_calls.append(
             {"selector": wait_for_selector, "text": wait_for_text,
              "timeout_ms": timeout_ms}
@@ -161,7 +186,10 @@ class FakeBridge:
         if wait_for_text is not None:
             satisfied = wait_for_text in (self.html or "")
         elif wait_for_selector is not None:
-            satisfied = wait_for_selector in self.present_selectors
+            satisfied = (
+                wait_for_selector in self.present_selectors
+                or self._selector_satisfied(wait_for_selector)
+            )
         else:
             satisfied = True
         return RenderedPage(
@@ -446,9 +474,13 @@ async def test_locate_already_registered_reads_rendered_dom_not_page_html():
     )
     assert res.status == LocateStatus.requires_interest_first
     assert (adapter._resp_id, adapter._list_id) == ("1038167190", "1036629453")
-    # Read the rendered DOM (waiting for the opportunity-link marker); never the
-    # raw page-html shell.
-    assert any(c["text"] == "suppRespStatus.html" for c in bridge.rendered_calls)
+    # Read the rendered DOM, WAITING ON THE ACTUAL OPPORTUNITY-LINK ELEMENT
+    # (chunk 4h: a real element wait, not a text-substring poll); never the raw
+    # page-html shell.
+    assert any(
+        c["selector"] == DELTA_SELECTORS["responses_opportunity_link"]
+        for c in bridge.rendered_calls
+    )
     assert bridge.page_html_calls == 0
 
 
@@ -500,6 +532,144 @@ async def test_locate_not_registered_gates_on_register_after_responses_check():
         "respondToList.html?accessCode=286EVX23TV" in u for u in bridge.navigated
     )
     assert bridge.clicks == []
+
+
+# --- chunk 4h: robust Responses-table read (the render race) -----------
+
+
+class RaceBridge(FakeBridge):
+    """Simulates the bip-table render race: the opportunity-link rows only
+    "render" (become wait-satisfied) on/after the Nth Response-Manager
+    navigation. Before then the page is an empty shell — exactly the timing that
+    made already-registered detection intermittent."""
+
+    def __init__(self, *, ready_html, ready_after_nav=2, shell_html=None, **kw):
+        super().__init__(html=shell_html or "<html><body>loading…</body></html>", **kw)
+        self._ready_html = ready_html
+        self._shell_html = shell_html or "<html><body>loading…</body></html>"
+        self._ready_after_nav = ready_after_nav
+        self._rm_navs = 0
+
+    async def navigate(self, slug, url):
+        self.navigated.append(url)
+        if "addToList.html" in url:  # the Response Manager
+            self._rm_navs += 1
+            self.html = (
+                self._ready_html
+                if self._rm_navs >= self._ready_after_nav
+                else self._shell_html
+            )
+        return {"current_url": self.current_url}
+
+
+def _rm_nav_count(bridge):
+    return len([u for u in bridge.navigated if "addToList.html" in u])
+
+
+@pytest.mark.asyncio
+async def test_responses_race_detects_already_registered():
+    # Rows absent on the first read, present after a re-navigate (retry) → the
+    # adapter must DETECT already-registered, not fall through to register.
+    rm_html = _responses_table_html(
+        [("1038167190", "1036629453", "Provision of Cleaning Services")]
+    )
+    bridge = RaceBridge(ready_html=rm_html, ready_after_nav=2, text="My Responses")
+    adapter = DeltaEsourcingAdapter()
+    res = await adapter.locate_tender(
+        _ctx(
+            bridge,
+            source_url="https://www.delta-esourcing.com/respond/286EVX23TV",
+            title="Provision of Cleaning Services for Council",
+        ),
+        "REF-123",
+    )
+    assert res.status == LocateStatus.requires_interest_first
+    assert res.detail == ALREADY_REGISTERED_DETAIL
+    assert res.already_authorized is True
+    assert (adapter._resp_id, adapter._list_id) == ("1038167190", "1036629453")
+    # It retried (re-navigated to the Response Manager) before concluding.
+    assert _rm_nav_count(bridge) >= 2
+    # Never opened the notice page / register path.
+    assert not any("respondToList.html" in u for u in bridge.navigated)
+
+
+@pytest.mark.asyncio
+async def test_responses_genuinely_empty_no_retry():
+    # A positive "no responses" indicator is trusted as genuinely-empty: not
+    # registered, and NO retry loop (one Response-Manager read only).
+    empty_html = "<html><body><div>You have no responses yet.</div></body></html>"
+    bridge = FakeBridge(html=empty_html, text="My Responses")
+    adapter = DeltaEsourcingAdapter()
+    res = await adapter.locate_tender(
+        _ctx(
+            bridge,
+            source_url="https://www.delta-esourcing.com/respond/286EVX23TV",
+            title="Some Tender",
+        ),
+        "REF-123",
+    )
+    # Not already-registered → falls through to the notice/register path.
+    assert res.detail != ALREADY_REGISTERED_DETAIL
+    assert res.already_authorized is False
+    assert (adapter._resp_id, adapter._list_id) == (None, None)
+    # Positive empty → no retry: the Response Manager was read exactly once.
+    assert _rm_nav_count(bridge) == 1
+
+
+@pytest.mark.asyncio
+async def test_responses_retry_then_found_logs_outcome():
+    # First read times out unrendered, the retry finds the row → already-registered.
+    rm_html = _responses_table_html([("999", "888", "Cleaning Services")])
+    bridge = RaceBridge(ready_html=rm_html, ready_after_nav=2, text="My Responses")
+    adapter = DeltaEsourcingAdapter()
+    res = await adapter.locate_tender(
+        _ctx(
+            bridge,
+            source_url="https://www.delta-esourcing.com/respond/286EVX23TV",
+            title="Cleaning Services",
+        ),
+        "REF-123",
+    )
+    assert res.status == LocateStatus.requires_interest_first
+    assert res.already_authorized is True
+    assert (adapter._resp_id, adapter._list_id) == ("999", "888")
+
+
+@pytest.mark.asyncio
+async def test_responses_unrendered_both_times_falls_through():
+    # The table never renders (both reads unrendered) → not-registered path,
+    # bounded (does not loop forever).
+    bridge = RaceBridge(
+        ready_html=_responses_table_html([("1", "2", "X")]),
+        ready_after_nav=99,  # never becomes ready
+        text="This tender is currently OPEN. REGISTER INTEREST to bid.",
+    )
+    adapter = DeltaEsourcingAdapter()
+    res = await adapter.locate_tender(
+        _ctx(
+            bridge,
+            source_url="https://www.delta-esourcing.com/respond/286EVX23TV",
+            title="Some Tender",
+        ),
+        "REF-123",
+    )
+    assert res.status == LocateStatus.requires_interest_first
+    assert res.already_authorized is False  # the register path, not already-reg
+    # Exactly one retry (two Response-Manager reads), then it gave up and opened
+    # the notice page — bounded, not an infinite loop.
+    assert _rm_nav_count(bridge) == 2
+    assert any("respondToList.html" in u for u in bridge.navigated)
+
+
+@pytest.mark.asyncio
+async def test_is_authenticated_true_via_rendered_marker():
+    # An already-authenticated session whose supplier menu is in the RENDERED DOM
+    # is reliably detected (chunk 4h) — even without present_selectors.
+    bridge = FakeBridge(
+        html="<nav><a href='#'>Response Manager</a><a href='#'>Profile Manager</a></nav>",
+        current_url="https://www.delta-esourcing.com/delta/suppliers/select/addToList.html",
+    )
+    assert await DeltaEsourcingAdapter().is_authenticated(_ctx(bridge)) is True
 
 
 @pytest.mark.asyncio
