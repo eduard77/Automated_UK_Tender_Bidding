@@ -409,12 +409,14 @@ async def click_download_in_row(
             status_code=502, detail=f"opening row menu failed: {exc}"
         ) from exc
 
-    # 3. Click the "Download File" item (page-wide by text — it may live in a
-    #    body-level menu portal) and capture the resulting download.
-    item_selector = f"text={body.download_item_text}"
+    # 3. Click the "Download File" item and capture the resulting download. The
+    #    item renders in a BODY-LEVEL popup after the ⋮ click (not inside the
+    #    row), so match it page-wide by visible text and take .last (the
+    #    just-opened popup); the locator click auto-waits for it to appear.
+    item = page.get_by_text(body.download_item_text, exact=False).last
     try:
         async with page.expect_download(timeout=timeout_ms) as dl_info:
-            await page.click(item_selector, timeout=timeout_ms)
+            await item.click(timeout=timeout_ms)
         dl = await dl_info.value
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
