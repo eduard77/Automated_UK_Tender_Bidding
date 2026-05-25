@@ -86,6 +86,46 @@ def _persisted_file(tmp_path: Path) -> DownloadedFile:
     )
 
 
+# Stage One URL shared by all of a tender's Delta documents — every file is
+# rooted here, so each MUST add a distinct fragment (the chunk-4k fix) to avoid
+# the (tender_id, url) unique-constraint collapse.
+_DELTA_STAGE_ONE = (
+    "https://www.delta-esourcing.com/delta/suppliers/select/"
+    "suppRespStatus.html?id=555&listId=777"
+)
+
+
+def _delta_files(tmp_path: Path, n: int, *, same_url: bool = False) -> list[DownloadedFile]:
+    """N Delta-style downloaded files. By default each carries a DISTINCT url
+    (Stage One URL + per-doc fragment), like the real adapter; same_url=True
+    forces the pre-4k bug shape (all sharing the Stage One URL) for the
+    constraint-collapse characterization test."""
+    out: list[DownloadedFile] = []
+    for i in range(n):
+        data = f"%PDF delta doc {i}".encode()
+        sha = hashlib.sha256(data).hexdigest()
+        rel = f"delta/{sha[:2]}/{sha}.docx"
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+        url = _DELTA_STAGE_ONE if same_url else f"{_DELTA_STAGE_ONE}#{i + 1}-doc{i}.docx"
+        out.append(
+            DownloadedFile(
+                url=url,
+                path=str(p),
+                filename=f"doc{i}.docx",
+                bytes=len(data),
+                content_type=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "wordprocessingml.document"
+                ),
+                sha256=sha,
+                storage_key=rel,
+            )
+        )
+    return out
+
+
 class FakeLoginAdapter(PortalAdapter):
     platform_slug = "delta_esourcing"
     requires_browser = False
@@ -449,6 +489,67 @@ async def test_already_registered_skips_confirmation_pause(
     )
     assert res.status == OrchestrationStatus.complete
     assert res.status != OrchestrationStatus.needs_user_confirmation
+
+
+@pytest.mark.asyncio
+async def test_already_registered_persists_all_documents(
+    db: Session, tmp_path, monkeypatch
+):
+    """Chunk 4k: the already-registered (no-pause) Delta path must persist ALL
+    fetched files as tender_document_files rows — not collapse them to one. With
+    distinct per-doc urls (the adapter's fix), N files -> N rows, and a re-fetch
+    is idempotent (sha256 dedup)."""
+    monkeypatch.setattr(
+        "tender_agent.services.portal_orchestrator.settings.document_storage_dir",
+        str(tmp_path),
+    )
+    t, p = _seed(db, "delta-persist-1")
+    task_id = _task(db, t)
+    files = _delta_files(tmp_path, 3)
+    adapter = FakeLoginAdapter(
+        auth_results=[True],
+        locate_status=LocateStatus.requires_interest_first,
+        locate_already_authorized=True,
+        register_status=RegisterStatus.already_registered,
+        download=DownloadResult(status=DownloadStatus.complete, files=files),
+    )
+    res = await _orch(FakeBridge())._run_login_adapter(
+        db, adapter, t, p, "delta_esourcing", "FakeLoginAdapter", "eduard", [],
+        task_id, False,
+    )
+    assert res.status == OrchestrationStatus.complete
+    assert res.files_persisted == 3
+    rows = db.execute(
+        select(TenderDocumentFile).where(TenderDocumentFile.tender_id == t.id)
+    ).scalars().all()
+    assert len(rows) == 3  # all three recorded, NOT collapsed onto one row
+    assert {r.title for r in rows} == {"doc0.docx", "doc1.docx", "doc2.docx"}
+    assert all(r.download_status == "ok" and r.storage_key for r in rows)
+
+    # Re-fetch: still three rows (sha256 dedup makes it idempotent).
+    res2 = await _orch(FakeBridge())._run_login_adapter(
+        db, adapter, t, p, "delta_esourcing", "FakeLoginAdapter", "eduard", [],
+        f"{task_id}-2", False,
+    )
+    assert res2.status == OrchestrationStatus.complete
+    rows2 = db.execute(
+        select(TenderDocumentFile).where(TenderDocumentFile.tender_id == t.id)
+    ).scalars().all()
+    assert len(rows2) == 3
+
+
+def test_same_url_documents_collapse_to_one_row(db: Session, tmp_path):
+    """Characterize the (tender_id, url) unique constraint: files sharing one url
+    collapse onto a single row — exactly the pre-4k Delta bug (every doc carried
+    the Stage One URL), which is why each file now gets a distinct url."""
+    t, _ = _seed(db, "delta-collapse-1")
+    files = _delta_files(tmp_path, 3, same_url=True)
+    dl = DownloadResult(status=DownloadStatus.complete, files=files)
+    PortalOrchestrator()._persist_documents(db, t, dl)
+    rows = db.execute(
+        select(TenderDocumentFile).where(TenderDocumentFile.tender_id == t.id)
+    ).scalars().all()
+    assert len(rows) == 1  # the bug: three identical-url files -> one row
 
 
 @pytest.mark.asyncio
