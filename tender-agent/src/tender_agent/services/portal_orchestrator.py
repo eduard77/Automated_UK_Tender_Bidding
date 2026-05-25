@@ -105,6 +105,26 @@ def _dest_dir(tender_id: int) -> str:
     return str(Path(base) / str(tender_id) / ts)
 
 
+def _doc_format(filename: str | None, content_type: str | None) -> str | None:
+    """A SHORT format token for TenderDocumentFile.format (a varchar(32)).
+
+    The file extension is preferred (e.g. "docx", "pdf"); falling back to the
+    MIME subtype, capped to fit the column. The raw OOXML subtype
+    (vnd.openxmlformats-officedocument.wordprocessingml.document — 58 chars)
+    overflows the column, so deriving format straight from content_type made the
+    INSERT fail and rolled back the whole persist, leaving Delta docx/xlsx files
+    on disk but unrecorded (chunk 4k bug)."""
+    if filename and "." in filename:
+        ext = filename.rsplit(".", 1)[-1].lower()
+        if ext.isalnum() and len(ext) <= 32:
+            return ext
+    if content_type:
+        sub = content_type.split("/")[-1].split("+")[0].strip().lower()
+        if sub:
+            return sub[:32]
+    return None
+
+
 def _candidate_urls(tender: Tender, sightings: list[PortalUrlSighting]) -> list[str]:
     """HTTP URLs worth trying for a direct download: the tender's documents[]
     plus link-type sightings on the chosen portal."""
@@ -852,9 +872,17 @@ class PortalOrchestrator:
         self, db: Session, tender: Tender, download: DownloadResult
     ) -> int:
         """Persist downloaded files as TenderDocumentFile rows, deduped by
-        sha256 so re-running fetch never duplicates. Files without a sha256
-        (e.g. from non-persisting adapters in tests) are skipped."""
+        sha256 so re-running fetch never duplicates. Files without a sha256 or
+        storage_key (e.g. from non-persisting adapters in tests) are skipped.
+
+        The SAME routine serves every adapter (CF, Delta, …); each file must
+        carry a DISTINCT url, because (tender_id, url) is unique — files sharing a
+        url would collapse onto one row (the Delta click-download bug fixed in
+        chunk 4k, where every doc shared the Stage One URL)."""
         persisted = 0
+        inserted = 0
+        updated = 0
+        deduped = 0
         for f in download.files:
             if not f.sha256 or not f.storage_key:
                 continue
@@ -866,6 +894,7 @@ class PortalOrchestrator:
             ).scalar_one_or_none()
             if existing_sha is not None:
                 persisted += 1
+                deduped += 1
                 continue
             by_url = db.execute(
                 select(TenderDocumentFile)
@@ -875,9 +904,7 @@ class PortalOrchestrator:
             ).scalar_one_or_none()
             rec = by_url or TenderDocumentFile(tender_id=tender.id, url=f.url)
             rec.title = f.filename
-            rec.format = (
-                (f.content_type or "").split("/")[-1].split("+")[0] or None
-            )
+            rec.format = _doc_format(f.filename, f.content_type)
             rec.storage_key = f.storage_key
             rec.storage_backend = "local"
             rec.bytes = f.bytes
@@ -887,7 +914,20 @@ class PortalOrchestrator:
             rec.downloaded_at = datetime.now(UTC)
             if by_url is None:
                 db.add(rec)
+                inserted += 1
+            else:
+                updated += 1
             db.flush()
             persisted += 1
         db.commit()
+        # Visibility: the persistence step's outcome (its absence in the logs was
+        # the clue that fetched Delta files weren't being recorded).
+        logger.info(
+            "orchestrator.documents_persisted",
+            tender_id=tender.id,
+            files=len(download.files),
+            inserted=inserted,
+            updated=updated,
+            deduped=deduped,
+        )
         return persisted
