@@ -98,12 +98,14 @@ class FakeLoginAdapter(PortalAdapter):
         locate_status,
         download=None,
         register_status=RegisterStatus.success,
+        locate_already_authorized=False,
     ):
         # auth_results: list of bools consumed by is_authenticated
         self._auth = list(auth_results)
         self._locate_status = locate_status
         self._download = download or DownloadResult(status=DownloadStatus.nothing_available)
         self._register = register_status
+        self._locate_already_authorized = locate_already_authorized
         self.registered = False
         self.logged_out = False
 
@@ -120,7 +122,11 @@ class FakeLoginAdapter(PortalAdapter):
         return AuthResult(status=AuthStatus.success)
 
     async def locate_tender(self, ctx, ref):
-        return LocateResult(status=self._locate_status, tender_url="https://delta-esourcing.com/t/1")
+        return LocateResult(
+            status=self._locate_status,
+            tender_url="https://delta-esourcing.com/t/1",
+            already_authorized=self._locate_already_authorized,
+        )
 
     async def register_interest(self, ctx):
         self.registered = True
@@ -364,6 +370,158 @@ async def test_confirm_resume_registers_and_downloads(db: Session, tmp_path, mon
         select(TenderDocumentFile).where(TenderDocumentFile.tender_id == t.id)
     ).scalars().all()
     assert len(rows) == 1
+
+
+# --- chunk 4h: confirm-delay session handling + reliability ------------
+
+
+@pytest.mark.asyncio
+async def test_resume_reauths_when_session_expired(db: Session, tmp_path, monkeypatch):
+    """If the Delta session expired during the confirm pause, resume must re-auth
+    (waiting_for_login) instead of hard-failing 'Session expired'."""
+    monkeypatch.setattr(
+        "tender_agent.services.portal_orchestrator.settings.document_storage_dir",
+        str(tmp_path),
+    )
+    t, p = _seed(db, "reauth-1")
+    task_id = _task(db, t)
+    # Resume: is_authenticated False (expired) → re-auth via wait_for_login.
+    adapter = FakeLoginAdapter(
+        auth_results=[False],
+        locate_status=LocateStatus.found,
+        download=DownloadResult(
+            status=DownloadStatus.complete, files=[_persisted_file(tmp_path)]
+        ),
+    )
+    bridge = FakeBridge(login_sequence=["logged_in"])
+    res = await _orch(bridge)._run_login_adapter(
+        db, adapter, t, p, "delta_esourcing", "FakeLoginAdapter", "eduard", [],
+        task_id, True,
+    )
+    # Re-authed and completed — NOT a hard failure.
+    assert res.status == OrchestrationStatus.complete
+    assert res.status != OrchestrationStatus.failed
+    assert adapter.registered is True
+
+
+@pytest.mark.asyncio
+async def test_resume_fails_only_if_relogin_not_completed(db: Session):
+    """Resume with an expired session AND the user never logs back in → failed
+    with the retry message (not the old 'Session expired' dead-end)."""
+    t, p = _seed(db, "reauth-fail-1")
+    task_id = _task(db, t)
+    adapter = FakeLoginAdapter(
+        auth_results=[False, False, False, False], locate_status=LocateStatus.found
+    )
+    bridge = FakeBridge(login_sequence=["timeout", "timeout", "timeout"])
+    res = await _orch(bridge)._run_login_adapter(
+        db, adapter, t, p, "delta_esourcing", "FakeLoginAdapter", "eduard", [],
+        task_id, True,
+    )
+    assert res.status == OrchestrationStatus.failed
+    assert "retry" in res.detail.lower()
+
+
+@pytest.mark.asyncio
+async def test_already_registered_skips_confirmation_pause(
+    db: Session, tmp_path, monkeypatch
+):
+    """An already-registered tender (no Register Interest click to gate) goes
+    straight to download — no needs_user_confirmation pause (chunk 4h, Fix 7)."""
+    monkeypatch.setattr(
+        "tender_agent.services.portal_orchestrator.settings.document_storage_dir",
+        str(tmp_path),
+    )
+    t, p = _seed(db, "noreg-pause-1")
+    task_id = _task(db, t)
+    adapter = FakeLoginAdapter(
+        auth_results=[True],
+        locate_status=LocateStatus.requires_interest_first,
+        locate_already_authorized=True,
+        register_status=RegisterStatus.already_registered,
+        download=DownloadResult(
+            status=DownloadStatus.complete, files=[_persisted_file(tmp_path)]
+        ),
+    )
+    res = await _orch(FakeBridge())._run_login_adapter(
+        db, adapter, t, p, "delta_esourcing", "FakeLoginAdapter", "eduard", [],
+        task_id, False,
+    )
+    assert res.status == OrchestrationStatus.complete
+    assert res.status != OrchestrationStatus.needs_user_confirmation
+
+
+@pytest.mark.asyncio
+async def test_not_registered_still_pauses(db: Session):
+    """A NOT-yet-registered tender still pauses for confirmation (the Register
+    Interest click must be user-gated)."""
+    t, p = _seed(db, "still-pause-1")
+    task_id = _task(db, t)
+    adapter = FakeLoginAdapter(
+        auth_results=[True],
+        locate_status=LocateStatus.requires_interest_first,
+        locate_already_authorized=False,
+    )
+    res = await _orch(FakeBridge())._run_login_adapter(
+        db, adapter, t, p, "delta_esourcing", "FakeLoginAdapter", "eduard", [],
+        task_id, False,
+    )
+    assert res.status == OrchestrationStatus.needs_user_confirmation
+    assert not adapter.registered
+
+
+@pytest.mark.asyncio
+async def test_already_registered_pause_kept_when_flag_set(db: Session):
+    """pause_on_already_registered=True keeps the pause even for already-registered
+    tenders (config escape hatch)."""
+    t, p = _seed(db, "flag-pause-1")
+    task_id = _task(db, t)
+    adapter = FakeLoginAdapter(
+        auth_results=[True],
+        locate_status=LocateStatus.requires_interest_first,
+        locate_already_authorized=True,
+    )
+    orch = PortalOrchestrator(
+        bridge=FakeBridge(), login_wait_cycle_seconds=1, login_wait_total_seconds=3,
+        pause_on_already_registered=True,
+    )
+    res = await orch._run_login_adapter(
+        db, adapter, t, p, "delta_esourcing", "FakeLoginAdapter", "eduard", [],
+        task_id, False,
+    )
+    assert res.status == OrchestrationStatus.needs_user_confirmation
+
+
+@pytest.mark.asyncio
+async def test_session_keepalive_pings_then_stops_at_budget():
+    """The keepalive pings on schedule and STOPS at the budget (no infinite loop)."""
+
+    class PingBridge:
+        def __init__(self):
+            self.pings = 0
+
+        async def session_status(self, slug):
+            self.pings += 1
+            return {"exists": True}
+
+    bridge = PingBridge()
+    orch = PortalOrchestrator(bridge=bridge)
+    await orch._session_keepalive(bridge, "delta_esourcing", interval=0.01, budget=0.06)
+    assert bridge.pings >= 1  # fired on schedule
+    # Reaching here means it returned (stopped) rather than looping forever.
+
+
+@pytest.mark.asyncio
+async def test_session_keepalive_stops_quietly_on_error():
+    """If the session/bridge is gone, the keepalive stops quietly (no raise)."""
+
+    class DeadBridge:
+        async def session_status(self, slug):
+            raise RuntimeError("session gone")
+
+    orch = PortalOrchestrator(bridge=DeadBridge())
+    # budget is large, but the first failed ping returns immediately.
+    await orch._session_keepalive(DeadBridge(), "delta_esourcing", interval=0.01, budget=5.0)
 
 
 # --- full routing through fetch_tender_documents -----------------------

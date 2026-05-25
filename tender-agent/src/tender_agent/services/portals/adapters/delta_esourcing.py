@@ -28,6 +28,7 @@ is reused across fetches so the human re-authenticates as rarely as possible.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import re
@@ -395,6 +396,26 @@ DELTA_DOC_RENDER_FALLBACK_TEXTS = ("application/vnd", "items per page")
 DELTA_RESP_RENDER_SIGNAL = "suppRespStatus.html"
 DELTA_RESP_RENDER_FALLBACK_TEXTS = ("Opportunity",)
 
+# --- robust Responses-table read (chunk 4h: fixes the render race) ------
+# The bip-table renders its container first, then injects the row links a moment
+# later. A single short wait can return BEFORE the links exist, making an
+# already-registered tender read as "not registered" (intermittent — same tender,
+# same account, pure timing). So we wait on the ACTUAL opportunity-link element
+# (a real Playwright wait, not a text-substring poll) with a generous budget,
+# distinguish a genuinely-empty table from one that hasn't rendered, and retry
+# once before concluding not-registered.
+DELTA_RESPONSES_WAIT_MS = 22000  # generous wait for the opportunity-link rows
+DELTA_RESPONSES_CONTAINER_WAIT_MS = 4000  # quick probe: did the table container render?
+DELTA_AUTH_MARKER_WAIT_MS = 8000  # wait for the logged-in menu marker (session reuse)
+
+# Positive "you have no responses" indicators — when present we trust the table
+# is genuinely empty (not registered) and do NOT retry.
+_RESPONSES_EMPTY_RE = re.compile(
+    r"no responses|you have not responded|have not registered|no opportunities|"
+    r"\b0\s+items\b|no records found",
+    re.IGNORECASE,
+)
+
 # Delta shows a row count like "Displaying 1 - 22 of 22 items" near the table.
 # We use it ONLY to log a parser-vs-display mismatch (never to fail a download).
 # "of N items" is the total; the bare "N items" form excludes "N items per page"
@@ -443,8 +464,13 @@ class DeltaEsourcingAdapter(PortalAdapter):
 
     async def is_authenticated(self, ctx: PortalContext) -> bool:
         """Navigate to the Response Manager; authenticated if we're not bounced
-        to login and the logged-in supplier menu is present. Logs whether the
-        session was reused or a fresh login is required."""
+        to login and the logged-in supplier menu is present.
+
+        The supplier menu is part of the JS-rendered chrome, so we WAIT for the
+        marker in the rendered DOM (a real element wait) rather than probing the
+        current DOM once — an already-authenticated session that renders the menu
+        a beat late used to read as "fresh login required" and either re-prompt
+        or hang waiting_for_login (chunk 4h). Logs reuse vs fresh-login."""
         bridge, slug = ctx.bridge, ctx.platform_slug
         if bridge is None or slug is None:
             return False
@@ -459,10 +485,18 @@ class DeltaEsourcingAdapter(PortalAdapter):
         if "login" in current:
             logger.info("delta.fresh_login_required", reason="redirected_to_login")
             return False
+        # Wait for the logged-in marker to render (robust to a slow menu render).
         try:
-            marker = await bridge.element_exists(
-                slug, DELTA_SELECTORS["logged_in_marker"]
+            res = await bridge.rendered_html(
+                slug,
+                wait_for_selector=DELTA_SELECTORS["logged_in_marker"],
+                timeout_ms=DELTA_AUTH_MARKER_WAIT_MS,
             )
+            marker = res.wait_satisfied
+            # A late client-side bounce to login still means not authenticated.
+            if not marker and "login" in (res.current_url or "").lower():
+                logger.info("delta.fresh_login_required", reason="redirected_to_login")
+                return False
         except Exception:  # noqa: BLE001
             marker = False
         if marker:
@@ -529,6 +563,82 @@ class DeltaEsourcingAdapter(PortalAdapter):
         )
         return None
 
+    async def _read_responses_robust(
+        self, bridge, slug: str
+    ) -> tuple[str, str]:
+        """Read the Response Manager "Responses" table robustly (chunk 4h).
+
+        Returns (html, outcome) where outcome is one of:
+          - "rows":  the opportunity-link rows rendered (registered tenders present)
+          - "empty": a positive "no responses" indicator is shown (genuinely empty)
+          - "empty_container": the table rendered but with no rows (ambiguous)
+          - "unrendered": the table did not render at all (transient render race)
+
+        We WAIT on the actual opportunity-link element (a real Playwright wait,
+        not a content-substring poll) with a generous budget, so a slow bip-table
+        render does not read as empty. The caller retries on the ambiguous /
+        unrendered outcomes before concluding not-registered."""
+        html = ""
+        # 1. Wait for the opportunity-link rows themselves (the surest signal).
+        try:
+            r = await bridge.rendered_html(
+                slug,
+                wait_for_selector=DELTA_SELECTORS["responses_opportunity_link"],
+                timeout_ms=DELTA_RESPONSES_WAIT_MS,
+            )
+            html = r.html or ""
+            if r.wait_satisfied:
+                return html, "rows"
+        except Exception as exc:  # noqa: BLE001
+            logger.info(
+                "delta.rendered_html_failed", where="responses_rows", error=str(exc)
+            )
+        # 2. No rows. A positive empty indicator means genuinely not registered.
+        if _RESPONSES_EMPTY_RE.search(html):
+            return html, "empty"
+        # 3. Did the table CONTAINER render (header present, just no rows)?
+        try:
+            c = await bridge.rendered_html(
+                slug,
+                wait_for_selector=DELTA_SELECTORS["responses_table"],
+                timeout_ms=DELTA_RESPONSES_CONTAINER_WAIT_MS,
+            )
+            html = c.html or html
+            if _RESPONSES_EMPTY_RE.search(html):
+                return html, "empty"
+            if c.wait_satisfied:
+                return html, "empty_container"
+        except Exception as exc:  # noqa: BLE001
+            logger.info(
+                "delta.rendered_html_failed", where="responses_container",
+                error=str(exc),
+            )
+        return html, "unrendered"
+
+    async def _match_in_responses(
+        self, bridge, slug: str, ctx: PortalContext
+    ) -> tuple[_RespRow | None, str]:
+        """Robustly find THIS tender in the Responses table, with a bounded retry.
+
+        A registered tender (the proven 3169 case) must be detected reliably, so
+        a transient empty/unrendered read is re-navigated and re-read once before
+        we conclude not-registered. Returns (match_or_None, final_outcome)."""
+        html, outcome = await self._read_responses_robust(bridge, slug)
+        match = self._match_responses_row(html, ctx) if outcome == "rows" else None
+        if match is None and outcome in ("empty_container", "unrendered"):
+            logger.info("delta.responses_retry", slug=slug, outcome=outcome)
+            with contextlib.suppress(Exception):
+                await bridge.navigate(slug, DELTA_URLS["response_manager"])
+            html, outcome = await self._read_responses_robust(bridge, slug)
+            match = self._match_responses_row(html, ctx) if outcome == "rows" else None
+        if match is None:
+            logger.info(
+                "delta.responses_empty", slug=slug, outcome=outcome,
+                positive_empty=(outcome == "empty"),
+                rows=len(_parse_responses_rows(html)),
+            )
+        return match, outcome
+
     async def locate_tender(
         self, ctx: PortalContext, tender_ref: str
     ) -> LocateResult:
@@ -565,14 +675,10 @@ class DeltaEsourcingAdapter(PortalAdapter):
             logger.info("delta.concurrent_login", slug=slug, where="response_manager")
             return LocateResult(status=LocateStatus.error, detail=CONCURRENT_LOGIN_DETAIL)
         # The Responses table is a JS-rendered bip-table: read the RENDERED DOM
-        # (waiting for the opportunity links to appear), not the empty shell that
-        # page_html returns.
-        rm_html = await self._read_rendered_html(
-            bridge, slug,
-            primary_text=DELTA_RESP_RENDER_SIGNAL,
-            fallback_texts=DELTA_RESP_RENDER_FALLBACK_TEXTS,
-        )
-        match = self._match_responses_row(rm_html, ctx)
+        # robustly (wait for the real opportunity-link rows, distinguish empty
+        # from not-yet-rendered, retry once) so an already-registered tender is
+        # detected reliably rather than intermittently (chunk 4h, BUG 1).
+        match, _ = await self._match_in_responses(bridge, slug, ctx)
         if match is not None:
             self._resp_id, self._list_id = match.resp_id, match.list_id
             logger.info(
@@ -583,6 +689,7 @@ class DeltaEsourcingAdapter(PortalAdapter):
                 status=LocateStatus.requires_interest_first,
                 tender_url=DELTA_URLS["stage_one"] % (match.resp_id, match.list_id),
                 detail=ALREADY_REGISTERED_DETAIL,
+                already_authorized=True,
             )
 
         # 2. Not registered yet → open the notice page; gate on REGISTER INTEREST.
@@ -642,6 +749,7 @@ class DeltaEsourcingAdapter(PortalAdapter):
                         status=LocateStatus.requires_interest_first,
                         tender_url=DELTA_URLS["stage_one"] % (rid, lid),
                         detail=ALREADY_REGISTERED_DETAIL,
+                        already_authorized=True,
                     )
         except Exception:  # noqa: BLE001
             pass
@@ -708,13 +816,10 @@ class DeltaEsourcingAdapter(PortalAdapter):
         if not (rid and lid):
             try:
                 await bridge.navigate(slug, DELTA_URLS["response_manager"])
-                # Rendered DOM: the Responses bip-table populates client-side.
-                rm_html = await self._read_rendered_html(
-                    bridge, slug,
-                    primary_text=DELTA_RESP_RENDER_SIGNAL,
-                    fallback_texts=DELTA_RESP_RENDER_FALLBACK_TEXTS,
-                )
-                match = self._match_responses_row(rm_html, ctx)
+                # Rendered DOM, robust: the Responses bip-table populates
+                # client-side; wait for the real rows (with a retry) so the
+                # just-registered tender is found rather than missed by timing.
+                match, _ = await self._match_in_responses(bridge, slug, ctx)
                 if match is not None:
                     rid, lid = match.resp_id, match.list_id
             except Exception:  # noqa: BLE001

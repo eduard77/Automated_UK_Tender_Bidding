@@ -65,6 +65,12 @@ class LocateResult:
     status: LocateStatus
     tender_url: str | None = None
     detail: str | None = None
+    # True when the tender is reachable WITHOUT an intent-signalling action (e.g.
+    # Delta already-registered: no Register Interest click to gate). Lets the
+    # orchestrator skip the needs_user_confirmation pause and read documents the
+    # user already has access to. Stays False for the not-yet-registered case,
+    # where confirming authorises the Register Interest click.
+    already_authorized: bool = False
 
 
 @dataclass
