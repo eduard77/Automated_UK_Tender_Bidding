@@ -80,6 +80,21 @@ class _ExpectDownload:
         return _get()
 
 
+class FakeLocator:
+    """Stand-in for page.get_by_text(...).last — records the clicked text."""
+
+    def __init__(self, page: FakePage, text: str) -> None:
+        self._page = page
+        self._text = text
+
+    @property
+    def last(self) -> FakeLocator:
+        return self
+
+    async def click(self, timeout: int | None = None) -> None:
+        self._page.clicked.append(f"get_by_text:{self._text}")
+
+
 class FakePage:
     def __init__(
         self,
@@ -103,8 +118,8 @@ class FakePage:
     def expect_download(self, timeout: int | None = None):
         return _ExpectDownload(self._download, fire=self._fire)
 
-    async def click(self, selector: str, timeout: int | None = None) -> None:
-        self.clicked.append(selector)
+    def get_by_text(self, text: str, exact: bool = False) -> FakeLocator:
+        return FakeLocator(self, text)
 
 
 @pytest.fixture()
@@ -132,7 +147,7 @@ def _body(**over):
     body = {
         "table_selector": "table#document",
         "row_index": 0,
-        "menu_trigger_selector": "td:last-child button",
+        "menu_trigger_selector": "i.bip-actions-menu-link.fa-ellipsis-v",
         "download_item_text": "Download File",
     }
     body.update(over)
@@ -156,8 +171,8 @@ async def test_captures_download_and_returns_path(client_and_manager):
     assert data["size_bytes"] > 0
     # The header row was skipped, so data-row 0 is the row that got its ⋮ clicked.
     assert trigger.clicks == 1
-    # The "Download File" item was clicked page-wide by text.
-    assert page.clicked == ["text=Download File"]
+    # The "Download File" item was clicked page-wide by text (get_by_text .last).
+    assert page.clicked == ["get_by_text:Download File"]
     # The captured file landed in the configured bridge download dir.
     from bridge import config
 

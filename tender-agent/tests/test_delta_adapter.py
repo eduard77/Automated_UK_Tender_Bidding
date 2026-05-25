@@ -63,25 +63,34 @@ def _responses_table_html(rows):
 
 
 def _docs_table_html(n=3, titles=None, file_types=None, items=None):
-    """Build a Stage One documents table (table#document inside div#documentList,
-    like the live DOM). Each row carries title/size/file-type/uploaded columns
-    and an Action cell with a ⋮ menu trigger — NO download link (the file only
-    downloads via the menu click). When `items` is given, append Delta's
-    "Displaying 1 - n of <items> items" footer so partial-render detection
-    (rows-found vs items-displayed) can be exercised."""
+    """Build a Stage One documents table mirroring the live DOM (tender 3169):
+    <table id="document" class="dataTable" role="grid"> inside div#documentList,
+    a thead header row, and data rows as tr[role="row"] (alternating odd/even).
+    Each row's Action cell holds the ⋮ icon (i.bip-actions-menu-link.fa-ellipsis-v
+    inside <bip-actions-menu>) — NO download link (the file only downloads via the
+    menu click). When `items` is given, append Delta's "Displaying 1 - n of
+    <items> items" footer so partial-render detection can be exercised."""
     rows = []
     for i in range(n):
         title = titles[i] if titles else f"Document {i}.pdf"
         ft = file_types[i] if file_types else "PDF"
+        parity = "odd" if i % 2 == 0 else "even"
         rows.append(
-            f"<tr><td>{title}</td><td>1 MB</td><td>{ft}</td><td>01/05/2026</td>"
-            "<td><button class='action-menu' aria-haspopup='true'>⋮</button></td></tr>"
+            f"<tr class='{parity}' role='row'>"
+            f"<td>{title}</td><td>1 MB</td><td>{ft}</td><td>01/05/2026</td>"
+            "<td><bip-actions-menu><div s:id='actionsMenu' class='bip-actions-menu'>"
+            "<i s:id='actions_i' class='bip-actions-menu-link fa fa-ellipsis-v' "
+            "tabindex='-1'></i></div></bip-actions-menu></td></tr>"
         )
-    footer = f"<div>Displaying 1 - {n} of {items} items</div>" if items else ""
+    footer = (
+        f"<div class='dataTables_info'>Displaying 1 - {n} of {items} items</div>"
+        if items else ""
+    )
     return (
-        "<div id='documentList'><table id='document'><tbody>"
-        "<tr><th>Document Title</th><th>Size</th><th>File Type</th>"
-        "<th>Uploaded</th><th>Action</th></tr>"
+        "<div id='documentList'>"
+        "<table id='document' class='dataTable no-footer' role='grid'>"
+        "<thead><tr role='row'><th>Document Title</th><th>Size</th>"
+        "<th>File Type</th><th>Uploaded</th><th>Action</th></tr></thead><tbody>"
         + "".join(rows) + "</tbody></table></div>" + footer
     )
 
@@ -104,9 +113,15 @@ class FakeBridge:
         row_filenames=None,
         row_contents=None,
         row_mime="application/pdf",
+        html_sequence=None,
     ):
         self.text = text
         self.html = html
+        # Successive rendered_html() reads return successive html_sequence entries
+        # (sticking on the last) — used to exercise the post-maximise poll where
+        # the DataTables grid re-renders with more rows on a later read.
+        self.html_sequence = list(html_sequence) if html_sequence else None
+        self._html_idx = 0
         self.links = links or []
         self.current_url = current_url
         self.present_selectors = set(present_selectors or [])
@@ -147,12 +162,21 @@ class FakeBridge:
         self.page_html_calls += 1
         return self.html
 
-    def _selector_satisfied(self, selector):
+    def _current_html(self):
+        """The html for the current rendered_html() read: the next html_sequence
+        entry (sticking on the last) if a sequence is configured, else self.html."""
+        if self.html_sequence:
+            idx = min(self._html_idx, len(self.html_sequence) - 1)
+            self._html_idx += 1
+            return self.html_sequence[idx]
+        return self.html
+
+    def _selector_satisfied(self, selector, html=None):
         """Approximate Playwright wait_for_selector against the canned html, for
         the Delta selectors the adapter waits on. Lets selector-based renders
         (chunk 4h) be exercised without a real browser."""
         s = selector or ""
-        html = self.html or ""
+        html = (self.html if html is None else html) or ""
         if "suppRespStatus.html" in s:  # responses_opportunity_link
             return "suppRespStatus.html" in html
         if "responses" in s or "Opportunity" in s:  # responses_table container
@@ -183,17 +207,18 @@ class FakeBridge:
             {"selector": wait_for_selector, "text": wait_for_text,
              "timeout_ms": timeout_ms}
         )
+        html = self._current_html()
         if wait_for_text is not None:
-            satisfied = wait_for_text in (self.html or "")
+            satisfied = wait_for_text in (html or "")
         elif wait_for_selector is not None:
             satisfied = (
                 wait_for_selector in self.present_selectors
-                or self._selector_satisfied(wait_for_selector)
+                or self._selector_satisfied(wait_for_selector, html)
             )
         else:
             satisfied = True
         return RenderedPage(
-            html=self.html, wait_satisfied=satisfied, current_url=self.current_url
+            html=html, wait_satisfied=satisfied, current_url=self.current_url
         )
 
     async def fill(self, slug, selector, value):
@@ -803,6 +828,11 @@ async def test_download_documents_via_row_clicks(tmp_path, monkeypatch):
     # confirmed table id and the ⋮/"Download File" selectors.
     assert [r["row_index"] for r in bridge.row_downloads] == [0, 1, 2]
     assert all(r["table"] == "table#document" for r in bridge.row_downloads)
+    # The ⋮ trigger is the confirmed Font Awesome icon, the item the body popup.
+    assert all(
+        r["trigger"] == "i.bip-actions-menu-link.fa-ellipsis-v"
+        for r in bridge.row_downloads
+    )
     assert all(r["text"] == "Download File" for r in bridge.row_downloads)
     for f in res.files:
         # The doc belongs to the Stage One page; there is no per-doc URL.
@@ -1038,6 +1068,69 @@ async def test_download_full_render_matches_items_count_is_complete(
     res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
     assert res.status == DownloadStatus.complete
     assert len(res.files) == 22
+
+
+@pytest.mark.asyncio
+async def test_download_maximises_page_size_and_polls_until_all_rows(
+    tmp_path, monkeypatch
+):
+    # Live bug 4j: the page-size wasn't maximised, so only 10 of 22 rows rendered.
+    # The length select is present → maximise; the grid then re-renders with all
+    # 22 rows on a LATER read → the adapter polls until it sees them, downloads 22.
+    bridge_dl, _ = _patch_storage(monkeypatch, tmp_path)
+    bridge = FakeBridge(
+        current_url=STAGE_ONE_URL,
+        download_dir=str(bridge_dl),
+        present_selectors={
+            DELTA_SELECTORS["page_size_select"],
+            DELTA_SELECTORS["document_rows"],
+        },
+        # First read = 10 rows (default page), then the maximised grid re-renders
+        # with all 22; "of 22 items" is shown throughout.
+        html_sequence=[
+            _docs_table_html(n=10, items=22),
+            _docs_table_html(n=22, items=22),
+            _docs_table_html(n=22, items=22),
+        ],
+    )
+    res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
+    assert res.status == DownloadStatus.complete
+    assert len(res.files) == 22
+    assert len(bridge.row_downloads) == 22
+    # The DataTables length select was maximised to its largest option.
+    assert bridge.selects and bridge.selects[0][1]["index"] == -1
+    assert bridge.selects[0][0] == DELTA_SELECTORS["page_size_select"]
+
+
+@pytest.mark.asyncio
+async def test_download_partial_when_select_missing_and_rows_short(
+    tmp_path, monkeypatch
+):
+    # The length select is NOT present → maximise is skipped (logged fallback);
+    # only 10 of 22 rows render and never grow → partial, not a hang.
+    bridge_dl, _ = _patch_storage(monkeypatch, tmp_path)
+    bridge = FakeBridge(
+        html=_docs_table_html(n=10, items=22),
+        current_url=STAGE_ONE_URL,
+        download_dir=str(bridge_dl),
+    )
+    res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
+    assert res.status == DownloadStatus.partial
+    assert len(res.files) == 10
+    # No page-size select was found, so none was set.
+    assert bridge.selects == []
+    assert res.detail and "10 of 22" in res.detail
+
+
+def test_action_menu_selectors_are_confirmed():
+    # Pin the live-confirmed Stage One selectors (chunk 4j) so a regression in
+    # any of them is caught here, not only on a live run.
+    assert DELTA_SELECTORS["documents_table"] == "table#document"
+    assert DELTA_SELECTORS["document_rows"] == "table#document tbody tr[role='row']"
+    assert DELTA_SELECTORS["row_action_menu"] == "i.bip-actions-menu-link.fa-ellipsis-v"
+    assert DELTA_SELECTORS["row_download_item_text"] == "Download File"
+    # The page-size selector covers the DataTables length menu.
+    assert "_length" in DELTA_SELECTORS["page_size_select"]
 
 
 def test_stage_one_url_is_well_formed():
