@@ -76,6 +76,19 @@ class ClickDownloadBody(BaseModel):
     dest_filename: str | None = None
 
 
+class ClickDownloadInRowBody(BaseModel):
+    # Generic per-row action-menu download (selectors passed in, NOT portal-
+    # hardcoded). The caller gives the table, the DATA-row index, the in-row
+    # menu-trigger selector (the ⋮), and the menu-item text (e.g. "Download
+    # File"). Used for portals whose rows expose no scrapable download link.
+    table_selector: str
+    row_index: int
+    menu_trigger_selector: str
+    download_item_text: str
+    dest_filename: str | None = None
+    timeout_ms: int = 30000
+
+
 class FillBody(BaseModel):
     selector: str
     value: str
@@ -335,6 +348,96 @@ async def click_download(
     await dl.save_as(str(path))
     size = path.stat().st_size if path.exists() else 0
     return {"path": filename, "size_bytes": size, "mime_type": _guess_mime(filename)}
+
+
+@app.post("/session/{slug}/click-download-in-row")
+async def click_download_in_row(
+    slug: str, body: ClickDownloadInRowBody, _: None = Depends(require_token)
+) -> dict:
+    """Open a table row's action menu (the ⋮ control) and click an item that
+    triggers a file download, capturing the file via Playwright.
+
+    Generic: the caller passes the table, the row index, the in-row menu-trigger
+    selector, and the menu-item text. Built for Delta eSourcing, whose Stage One
+    document rows carry NO per-row download link in the DOM — the file only
+    downloads when a human opens the row's ⋮ menu and clicks "Download File".
+
+    We resolve the row_index-th DATA row (a row with a <td>, so header/empty
+    rows don't shift the index), click its menu trigger to open the menu, then
+    click the menu item (matched PAGE-WIDE by text — it may render in a
+    body-level popup) inside expect_download. A row whose download never fires
+    returns 502 so the caller can log that row and carry on with the rest."""
+    session = _require_session(slug)
+    page = session.page
+    timeout_ms = max(1, body.timeout_ms)
+
+    # 1. Resolve the row_index-th DATA row. A data row has at least one <td>;
+    #    pure-header rows have only <th>, so skipping them keeps the index stable
+    #    over data rows only.
+    try:
+        all_rows = await page.query_selector_all(f"{body.table_selector} tr")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"row lookup failed: {exc}") from exc
+    data_rows = []
+    for r in all_rows:
+        with contextlib.suppress(Exception):
+            if await r.query_selector("td") is not None:
+                data_rows.append(r)
+    if not 0 <= body.row_index < len(data_rows):
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"row index {body.row_index} out of range "
+                f"({len(data_rows)} data rows)"
+            ),
+        )
+    row = data_rows[body.row_index]
+
+    # 2. Open that row's action menu (the ⋮ trigger in its Action cell).
+    trigger = None
+    with contextlib.suppress(Exception):
+        trigger = await row.query_selector(body.menu_trigger_selector)
+    if trigger is None:
+        raise HTTPException(
+            status_code=502,
+            detail=f"action-menu trigger not found in row {body.row_index}",
+        )
+    try:
+        await trigger.click()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502, detail=f"opening row menu failed: {exc}"
+        ) from exc
+
+    # 3. Click the "Download File" item (page-wide by text — it may live in a
+    #    body-level menu portal) and capture the resulting download.
+    item_selector = f"text={body.download_item_text}"
+    try:
+        async with page.expect_download(timeout=timeout_ms) as dl_info:
+            await page.click(item_selector, timeout=timeout_ms)
+        dl = await dl_info.value
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502,
+            detail=f"no download captured for row {body.row_index}: {exc}",
+        ) from exc
+
+    suggested = None
+    with contextlib.suppress(Exception):
+        suggested = dl.suggested_filename
+    # Unique on-disk name per row so successive rows don't overwrite each other.
+    filename = _safe_name(
+        body.dest_filename or f"r{body.row_index}_{suggested or 'download.bin'}"
+    )
+    path = config.download_dir() / filename
+    await dl.save_as(str(path))
+    size = path.stat().st_size if path.exists() else 0
+    return {
+        "path": filename,
+        "suggested_filename": suggested,
+        "size_bytes": size,
+        "mime_type": _guess_mime(suggested or filename),
+    }
 
 
 @app.post("/session/{slug}/fill")

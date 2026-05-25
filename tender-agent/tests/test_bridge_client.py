@@ -206,6 +206,59 @@ async def test_download_returns_bridge_file():
 
 
 @pytest.mark.asyncio
+async def test_click_download_in_row_endpoint_and_payload():
+    from tender_agent.services.bridge_client import BridgeRowDownload
+
+    _FakeClient.next_response = _FakeResponse(
+        200,
+        {
+            "path": "r0_spec.pdf",
+            "suggested_filename": "spec.pdf",
+            "size_bytes": 321,
+            "mime_type": "application/pdf",
+        },
+    )
+    out = await BridgeClient().click_download_in_row(
+        "delta",
+        table_selector="table#document",
+        row_index=0,
+        menu_trigger_selector="td:last-child button",
+        download_item_text="Download File",
+        timeout_ms=30000,
+    )
+    call = _last()
+    assert call["url"].endswith("/session/delta/click-download-in-row")
+    assert call["headers"]["X-Bridge-Token"] == "secret-token"
+    assert call["json"] == {
+        "table_selector": "table#document",
+        "row_index": 0,
+        "menu_trigger_selector": "td:last-child button",
+        "download_item_text": "Download File",
+        "timeout_ms": 30000,
+    }
+    assert isinstance(out, BridgeRowDownload)
+    assert out.path == "r0_spec.pdf"
+    assert out.suggested_filename == "spec.pdf"
+    assert out.size_bytes == 321
+    assert out.mime_type == "application/pdf"
+
+
+@pytest.mark.asyncio
+async def test_click_download_in_row_error_status_raises():
+    from tender_agent.services.bridge_client import BridgeError
+
+    _FakeClient.next_response = _FakeResponse(502, {"detail": "no download captured"})
+    with pytest.raises(BridgeError):
+        await BridgeClient().click_download_in_row(
+            "delta",
+            table_selector="table#document",
+            row_index=3,
+            menu_trigger_selector="td:last-child button",
+            download_item_text="Download File",
+        )
+
+
+@pytest.mark.asyncio
 async def test_error_status_raises():
     from tender_agent.services.bridge_client import BridgeError
 

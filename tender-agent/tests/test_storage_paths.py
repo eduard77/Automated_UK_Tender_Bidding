@@ -7,12 +7,11 @@ relative 'data' directory is ever created. Fully mocked — no bridge, no networ
 """
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import pytest
 
-from tender_agent.services.bridge_client import BridgeFile, RenderedPage
+from tender_agent.services.bridge_client import BridgeRowDownload, RenderedPage
 from tender_agent.services.portals.adapters import delta_esourcing as delta_mod
 from tender_agent.services.portals.adapters.delta_esourcing import (
     DeltaEsourcingAdapter,
@@ -71,14 +70,18 @@ def _patch_storage(monkeypatch, tmp_path):
 
 def test_ingest_bridge_file_writes_under_storage_only(tmp_path, monkeypatch):
     bridge_dl, storage = _patch_storage(monkeypatch, tmp_path)
-    (bridge_dl / "downloaded.pdf").write_bytes(b"%PDF body")
-    bf = BridgeFile(path="downloaded.pdf", size_bytes=9, mime_type="application/pdf")
+    (bridge_dl / "r0_downloaded.pdf").write_bytes(b"%PDF body")
+    rd = BridgeRowDownload(
+        path="r0_downloaded.pdf", suggested_filename="downloaded.pdf",
+        size_bytes=9, mime_type="application/pdf",
+    )
 
     df = _ingest_bridge_file(
-        bf,
-        "https://www.delta-esourcing.com/.../downloadDocument.html?docId=1",
+        rd,
         tender_id=900,
-        preferred_name="Spec.pdf",
+        title="Spec.pdf",
+        file_type="PDF",
+        source_url=STAGE_ONE_URL,
     )
 
     assert df is not None
@@ -94,7 +97,7 @@ def test_ingest_bridge_file_writes_under_storage_only(tmp_path, monkeypatch):
 
 class _DownloadOnlyBridge:
     """Minimal fake bridge for the Delta download step — records navigation and
-    writes each 'downloaded' file into the (fake) bridge download dir."""
+    writes each click-captured file into the (fake) bridge download dir."""
 
     def __init__(self, *, html: str, download_dir: str):
         self.html = html
@@ -115,9 +118,8 @@ class _DownloadOnlyBridge:
         self, slug, *, wait_for_selector=None, wait_for_text=None, timeout_ms=15000
     ):
         # The Delta adapter reads the JS-rendered documents table via this; the
-        # fake "renders" self.html and reports the wait satisfied when the marker
-        # is present.
-        satisfied = wait_for_text is None or wait_for_text in (self.html or "")
+        # fake "renders" self.html and reports the selector/text wait satisfied.
+        satisfied = wait_for_text in (self.html or "") if wait_for_text is not None else True
         return RenderedPage(
             html=self.html, wait_satisfied=satisfied, current_url=STAGE_ONE_URL
         )
@@ -128,25 +130,30 @@ class _DownloadOnlyBridge:
     async def find_links(self, slug, pattern):
         return []
 
-    async def download(self, slug, url, dest_filename=None):
-        safe = re.sub(r"[^A-Za-z0-9._-]", "_", dest_filename or url.split("docId=")[-1])
-        p = Path(self.download_dir) / safe
-        p.write_bytes(b"%PDF fake " + url.encode())
-        return BridgeFile(path=safe, size_bytes=p.stat().st_size, mime_type="application/pdf")
+    async def click_download_in_row(
+        self, slug, *, table_selector, row_index, menu_trigger_selector,
+        download_item_text, timeout_ms=30000,
+    ):
+        saved = f"r{row_index}_doc{row_index}.pdf"
+        p = Path(self.download_dir) / saved
+        p.write_bytes(b"%PDF fake row " + str(row_index).encode())
+        return BridgeRowDownload(
+            path=saved, suggested_filename=f"doc{row_index}.pdf",
+            size_bytes=p.stat().st_size, mime_type="application/pdf",
+        )
 
 
-def _docs_table_html(n=2, resp_id="555", list_id="777"):
+def _docs_table_html(n=2):
     rows = []
     for i in range(n):
-        href = (
-            "/delta/suppliers/response/overview/documents/downloadDocument.html"
-            f"?respId={resp_id}&supplierListId={list_id}&docId={1000 + i}"
-        )
         rows.append(
             f"<tr><td>Document {i}.pdf</td><td>1 MB</td><td>PDF</td>"
-            f"<td>01/05/2026</td><td><a href='{href}'>Download</a></td></tr>"
+            "<td>01/05/2026</td><td><button class='action-menu'>⋮</button></td></tr>"
         )
-    return "<table>" + "".join(rows) + "</table>"
+    return (
+        "<div id='documentList'><table id='document'><tbody>"
+        + "".join(rows) + "</tbody></table></div>"
+    )
 
 
 @pytest.mark.asyncio
