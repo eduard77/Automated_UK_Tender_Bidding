@@ -1098,6 +1098,7 @@ class DeltaEsourcingAdapter(PortalAdapter):
         files: list[DownloadedFile] = []
         seen_sha: set[str] = set()
         missing: list[str] = []
+        ingest_failures = 0
         for i, row in enumerate(rows[:MAX_DOCS]):
             label = row.title or f"row {i}"
             try:
@@ -1115,15 +1116,21 @@ class DeltaEsourcingAdapter(PortalAdapter):
                 )
                 missing.append(label)
                 continue
+            # Delta has NO per-document URL, so give each file a DISTINCT, non-null
+            # identifier (Stage One URL + a per-doc fragment). Without this every
+            # file would carry the same Stage One URL and collide on the
+            # tender_document_files (tender_id, url) unique constraint, collapsing
+            # all rows into one — the bug that left the DB with no records.
+            source_url = f"{stage_one_url}#{i + 1}-{_safe_name(row.title or 'document')}"
             df = _ingest_bridge_file(
                 rd, ctx.tender_id, title=row.title, file_type=row.file_type,
-                source_url=stage_one_url,
+                source_url=source_url,
             )
             if df is None:
-                logger.info(
-                    "delta.download_click_failed", row=i, title=row.title,
-                    error="ingest_failed",
-                )
+                # The click captured a file but the BACKEND couldn't read it back
+                # from the shared bridge-downloads volume (or it was oversize).
+                logger.info("delta.download_ingest_failed", row=i, title=row.title)
+                ingest_failures += 1
                 missing.append(label)
             elif df.sha256 in seen_sha:
                 logger.info(
@@ -1154,20 +1161,26 @@ class DeltaEsourcingAdapter(PortalAdapter):
                 status=status, files=files, missing=missing, detail=detail
             )
 
-        # Rows were seen but NOT ONE downloaded — surface a clear error rather
-        # than a silent nothing_available (which would hide a broken action-menu
-        # selector).
+        # Rows were seen but NOT ONE produced a usable file — surface a clear
+        # error (never a silent nothing_available). Distinguish the two failure
+        # modes so the operator sees the real cause.
         logger.info(
-            "delta.download_all_failed", rows=len(rows), resp_id=resp_id,
-            list_id=list_id,
+            "delta.download_all_failed", rows=len(rows),
+            ingest_failures=ingest_failures, resp_id=resp_id, list_id=list_id,
         )
-        return DownloadResult(
-            status=DownloadStatus.error,
-            missing=missing,
-            detail=(
+        if ingest_failures:
+            detail = (
+                f"Downloaded {ingest_failures} document(s) but could not read them "
+                "back from the bridge-downloads volume — check the shared mount "
+                "(TENDER_AGENT_BRIDGE_DOWNLOAD_DIR)."
+            )
+        else:
+            detail = (
                 f"Found {len(rows)} documents but could not trigger any "
                 "downloads — Delta action-menu selector may have changed."
-            ),
+            )
+        return DownloadResult(
+            status=DownloadStatus.error, missing=missing, detail=detail
         )
 
 

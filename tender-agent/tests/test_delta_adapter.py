@@ -1122,6 +1122,30 @@ async def test_download_partial_when_select_missing_and_rows_short(
     assert res.detail and "10 of 22" in res.detail
 
 
+@pytest.mark.asyncio
+async def test_download_assigns_distinct_per_doc_urls(tmp_path, monkeypatch):
+    # Chunk 4k regression: every file must carry a DISTINCT url so they don't
+    # collide on the tender_document_files (tender_id, url) unique constraint and
+    # collapse to one DB row. Delta has no per-doc URL, so the adapter derives a
+    # unique, non-null one from the Stage One URL + the row title.
+    bridge_dl, _ = _patch_storage(monkeypatch, tmp_path)
+    bridge = FakeBridge(
+        html=_docs_table_html(n=3, titles=["A.pdf", "B.pdf", "C.pdf"]),
+        current_url=STAGE_ONE_URL,
+        download_dir=str(bridge_dl),
+    )
+    res = await DeltaEsourcingAdapter().download_documents(_ctx(bridge), "ignored")
+    assert res.status == DownloadStatus.complete
+    urls = [f.url for f in res.files]
+    # Three documents -> three DISTINCT, non-null urls.
+    assert len(urls) == 3
+    assert all(urls)
+    assert len(set(urls)) == 3
+    # Each is rooted at the Stage One URL (so it stays a delta-esourcing.com ref).
+    assert all(u.startswith(STAGE_ONE_URL) for u in urls)
+    assert all("suppRespStatus.html" in u for u in urls)
+
+
 def test_action_menu_selectors_are_confirmed():
     # Pin the live-confirmed Stage One selectors (chunk 4j) so a regression in
     # any of them is caught here, not only on a live run.
