@@ -11,6 +11,7 @@ from tender_agent.db import get_db
 from tender_agent.models import (
     FilterMatch,
     Tender,
+    TenderDocumentContent,
     TenderDocumentFile,
     TenderRequirements,
 )
@@ -19,6 +20,7 @@ from tender_agent.schemas import (
     TenderRead,
     TenderRequirementsRead,
 )
+from tender_agent.services.brief.content_store import EXTRACTOR_VERSION
 
 router = APIRouter(prefix="/tenders", tags=["tenders"])
 
@@ -72,11 +74,34 @@ def get_requirements(tender_id: int, db: Session = Depends(get_db)) -> TenderReq
 
 
 @router.get("/{tender_id}/documents", response_model=list[TenderDocumentFileRead])
-def get_documents(tender_id: int, db: Session = Depends(get_db)) -> list[TenderDocumentFileRead]:
-    return list(
+def get_documents(
+    tender_id: int, db: Session = Depends(get_db)
+) -> list[TenderDocumentFileRead]:
+    files = list(
         db.execute(
             select(TenderDocumentFile)
             .where(TenderDocumentFile.tender_id == tender_id)
             .order_by(TenderDocumentFile.created_at)
         ).scalars().all()
     )
+    # Which files have a usable, current-version content row? Joined here so
+    # the dashboard can show a "content stored" indicator without a second
+    # round-trip per file.
+    shas = {f.sha256 for f in files if f.sha256}
+    stored: set[str] = set()
+    if shas:
+        stored = {
+            s
+            for (s,) in db.execute(
+                select(TenderDocumentContent.sha256)
+                .where(TenderDocumentContent.sha256.in_(shas))
+                .where(TenderDocumentContent.extractor_version == EXTRACTOR_VERSION)
+                .where(TenderDocumentContent.extraction_status == "ok")
+            ).all()
+        }
+    out: list[TenderDocumentFileRead] = []
+    for f in files:
+        row = TenderDocumentFileRead.model_validate(f)
+        row.content_stored = bool(f.sha256 and f.sha256 in stored)
+        out.append(row)
+    return out
