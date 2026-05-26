@@ -157,6 +157,9 @@ class TenderDocumentFileRead(BaseModel):
     download_status: str
     error: str | None
     downloaded_at: datetime | None
+    # True if this file's text has been extracted into the content store and
+    # is reusable without re-reading the file (Phase 4 chunk 5).
+    content_stored: bool = False
 
 
 class PushSubscriptionKeys(BaseModel):
@@ -192,3 +195,39 @@ class VapidPublicKey(BaseModel):
 
     public_key: str
     subject: str
+
+
+class TenderBriefRead(BaseModel):
+    """One generated bid-brief, as returned by GET /tenders/{id}/brief.
+
+    `brief_json` is the validated payload shape from
+    services/brief/brief_generator.BriefPayload — kept as `dict` here so the
+    dashboard can render it without re-parsing on the backend.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    tender_id: int
+    status: str
+    recommendation: str | None
+    confidence: str | None
+    headline: str | None
+    brief_json: dict | None
+    model: str | None
+    documents_considered: list[dict] | None
+    input_tokens: int | None
+    output_tokens: int | None
+    error_detail: str | None
+    generated_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class TenderBriefStarted(BaseModel):
+    """Response from POST /tenders/{id}/generate-brief — 202 + brief id."""
+
+    id: int
+    tender_id: int
+    status: str
+    created_at: datetime

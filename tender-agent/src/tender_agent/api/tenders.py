@@ -11,6 +11,7 @@ from tender_agent.db import get_db
 from tender_agent.models import (
     FilterMatch,
     Tender,
+    TenderDocumentContent,
     TenderDocumentFile,
     TenderRequirements,
 )
@@ -19,6 +20,7 @@ from tender_agent.schemas import (
     TenderRead,
     TenderRequirementsRead,
 )
+from tender_agent.services.brief.document_extractor import EXTRACTOR_VERSION
 
 router = APIRouter(prefix="/tenders", tags=["tenders"])
 
@@ -73,10 +75,35 @@ def get_requirements(tender_id: int, db: Session = Depends(get_db)) -> TenderReq
 
 @router.get("/{tender_id}/documents", response_model=list[TenderDocumentFileRead])
 def get_documents(tender_id: int, db: Session = Depends(get_db)) -> list[TenderDocumentFileRead]:
-    return list(
+    files = list(
         db.execute(
             select(TenderDocumentFile)
             .where(TenderDocumentFile.tender_id == tender_id)
             .order_by(TenderDocumentFile.created_at)
         ).scalars().all()
     )
+    if not files:
+        return []
+    # Surface a per-file content-stored indicator so the dashboard can show
+    # "content stored — reusable without re-download" next to each file. We
+    # look up by sha256 because the content store keeps ONE canonical
+    # extraction per (sha256, extractor_version) globally — the same row may
+    # have been first extracted from a different tender that pointed at the
+    # same document.
+    shas = [f.sha256 for f in files if f.sha256]
+    stored_shas: set[str] = set()
+    if shas:
+        stored_shas = set(
+            db.execute(
+                select(TenderDocumentContent.sha256)
+                .where(TenderDocumentContent.sha256.in_(shas))
+                .where(TenderDocumentContent.extractor_version == EXTRACTOR_VERSION)
+                .where(TenderDocumentContent.extraction_status.in_(("ok", "empty")))
+            ).scalars().all()
+        )
+    out: list[TenderDocumentFileRead] = []
+    for f in files:
+        read = TenderDocumentFileRead.model_validate(f)
+        read.content_stored = bool(f.sha256 and f.sha256 in stored_shas)
+        out.append(read)
+    return out
