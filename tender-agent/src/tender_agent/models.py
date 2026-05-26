@@ -128,6 +128,14 @@ class Tender(Base):
     requirements: Mapped[TenderRequirements | None] = relationship(
         back_populates="tender", uselist=False, cascade="all, delete-orphan"
     )
+    document_contents: Mapped[list[TenderDocumentContent]] = relationship(
+        back_populates="tender", cascade="all, delete-orphan"
+    )
+    briefs: Mapped[list[TenderBrief]] = relationship(
+        back_populates="tender",
+        cascade="all, delete-orphan",
+        order_by="TenderBrief.created_at.desc()",
+    )
 
 
 class TenderDocumentFile(Base):
@@ -158,6 +166,64 @@ class TenderDocumentFile(Base):
     )
 
     tender: Mapped[Tender] = relationship(back_populates="document_files")
+    contents: Mapped[list[TenderDocumentContent]] = relationship(
+        back_populates="document_file",
+        cascade="all, delete-orphan",
+    )
+
+
+class TenderDocumentContent(Base):
+    """The extracted text content of a `tender_document_files` row.
+
+    Content lives here so it becomes durable, reusable database data. Same
+    sha256 + same extractor_version = ONE canonical extraction we reuse
+    forever — re-running fetch never re-extracts, and a second tender that
+    points at the same document doesn't either (we copy/link the existing
+    extracted_text). This is the foundation for moving content to a cloud DB
+    later, and for cross-tender comparison.
+    """
+
+    __tablename__ = "tender_document_content"
+    __table_args__ = (
+        UniqueConstraint(
+            "sha256", "extractor_version", name="uq_content_sha_extractor"
+        ),
+        Index("ix_tender_document_content_tender_id", "tender_id"),
+        Index("ix_tender_document_content_doc_file_id", "document_file_id"),
+        Index("ix_tender_document_content_sha256", "sha256"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    document_file_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("tender_document_files.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    tender_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("tenders.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    sha256: Mapped[str] = mapped_column(Text, nullable=False)
+    extracted_text: Mapped[str | None] = mapped_column(Text)
+    char_count: Mapped[int | None] = mapped_column(Integer)
+    # ok | empty | unsupported | error
+    extraction_status: Mapped[str] = mapped_column(Text, nullable=False)
+    extraction_detail: Mapped[str | None] = mapped_column(Text)
+    # docx | xlsx | pdf | zip-member | txt | csv | ...
+    doc_type: Mapped[str | None] = mapped_column(Text)
+    extractor_version: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    document_file: Mapped[TenderDocumentFile] = relationship(
+        back_populates="contents"
+    )
+    tender: Mapped[Tender] = relationship(back_populates="document_contents")
 
 
 class TenderRequirements(Base):
@@ -578,4 +644,47 @@ class FetchTask(Base):
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class TenderBrief(Base):
+    """One generated bid-brief. We keep history (each Generate-brief click
+    creates a new row); the dashboard shows the latest by created_at.
+
+    `brief_json` is the validated JSON payload from the LLM (see
+    services/brief/brief_generator.BriefPayload). The headline fields
+    (recommendation, confidence, headline) are mirrored as columns for cheap
+    list/filter queries and so the UI can render them without re-parsing JSON.
+    `documents_considered` records which document files were included
+    full/truncated/omitted in the prompt so the brief footer can show
+    "based on N of M documents".
+    """
+
+    __tablename__ = "tender_briefs"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    tender_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("tenders.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # generating | complete | failed | no_documents
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="generating")
+    recommendation: Mapped[str | None] = mapped_column(Text)  # bid|no_bid|conditional
+    confidence: Mapped[str | None] = mapped_column(Text)  # high|medium|low
+    headline: Mapped[str | None] = mapped_column(Text)
+    brief_json: Mapped[dict | None] = mapped_column(JSONB)
+    model: Mapped[str | None] = mapped_column(Text)
+    documents_considered: Mapped[list[dict] | None] = mapped_column(JSONB)
+    input_tokens: Mapped[int | None] = mapped_column(Integer)
+    output_tokens: Mapped[int | None] = mapped_column(Integer)
+    error_detail: Mapped[str | None] = mapped_column(Text)
+    generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    tender: Mapped[Tender] = relationship(back_populates="briefs")
 
