@@ -853,7 +853,14 @@ class PortalOrchestrator:
     ) -> int:
         """Persist downloaded files as TenderDocumentFile rows, deduped by
         sha256 so re-running fetch never duplicates. Files without a sha256
-        (e.g. from non-persisting adapters in tests) are skipped."""
+        (e.g. from non-persisting adapters in tests) are skipped.
+
+        After persistence, extract document text into the content store so the
+        content becomes durable, reusable database data (extract once, reuse
+        forever — including across tenders by sha256). Extraction failures for
+        individual documents are recorded as content rows with status='error'
+        and MUST NOT fail the fetch.
+        """
         persisted = 0
         for f in download.files:
             if not f.sha256 or not f.storage_key:
@@ -890,4 +897,22 @@ class PortalOrchestrator:
             db.flush()
             persisted += 1
         db.commit()
+
+        # Capture content at fetch time so re-fetches and brief-generation
+        # both reuse it without re-reading the file. Local import to avoid a
+        # circular import (brief services touch the orchestrator's models).
+        try:
+            from tender_agent.services.brief.content_store import (
+                ensure_content_extracted,
+            )
+
+            db.refresh(tender)
+            ensure_content_extracted(db, tender)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "orchestrator.content_extract_failed",
+                tender_id=tender.id,
+                error=str(exc),
+            )
+
         return persisted
