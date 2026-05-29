@@ -227,6 +227,90 @@ export interface ListTendersParams {
 }
 
 // ---------------------------------------------------------------------------
+// Tender search (Phase 4 chunk 7) — mirrors tender_agent/schemas.py
+// (TenderSearchResult / TenderSearchResponse / TenderFacets) and the
+// /tenders/search query params. Source-agnostic: a result from any source
+// (current or future) carries the same fields.
+// ---------------------------------------------------------------------------
+
+export type SearchSort = "deadline_asc" | "published_desc" | "value_desc";
+
+export interface TenderSearchResult {
+  id: number;
+  title: string;
+  buyer_name: string | null;
+  buyer_region: string | null;
+  status: string | null;
+  source_code: string;
+  source_url: string | null;
+  cpv_codes: string[] | null;
+  value_amount: string | number | null;
+  value_currency: string | null;
+  value_min: string | number | null;
+  value_max: string | number | null;
+  published_at: string | null;
+  deadline_at: string | null;
+  procurement_ref: string | null;
+  duplicate_of_id: number | null;
+  is_duplicate: boolean;
+}
+
+export interface TenderSearchResponse {
+  total: number;
+  page: number;
+  page_size: number;
+  results: TenderSearchResult[];
+}
+
+export interface TenderFacets {
+  sources: string[];
+  statuses: string[];
+  regions: string[];
+}
+
+export interface TenderSearchParams {
+  q?: string;
+  cpv?: string[];
+  region?: string[];
+  buyer?: string;
+  value_min?: string | number | null;
+  value_max?: string | number | null;
+  deadline_from?: string;
+  deadline_to?: string;
+  open_only?: boolean;
+  status?: string[];
+  source?: string[];
+  include_duplicates?: boolean;
+  sort?: SearchSort;
+  page?: number;
+  page_size?: number;
+}
+
+// Builds /tenders/search?... — arrays become repeated params (cpv=a&cpv=b),
+// empties/nulls are dropped so the URL stays a stable SWR cache key.
+export function searchPath(params: TenderSearchParams): string {
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined || v === null || v === "") continue;
+    if (Array.isArray(v)) {
+      for (const item of v) {
+        if (item === undefined || item === null || item === "") continue;
+        q.append(k, String(item));
+      }
+    } else {
+      q.set(k, String(v));
+    }
+  }
+  const qs = q.toString();
+  return `/tenders/search${qs ? `?${qs}` : ""}`;
+}
+
+export const searchTenders = (params: TenderSearchParams) =>
+  request<TenderSearchResponse>(searchPath(params));
+
+export const getTenderFacets = () => request<TenderFacets>("/tenders/facets");
+
+// ---------------------------------------------------------------------------
 // Low-level fetcher
 // ---------------------------------------------------------------------------
 

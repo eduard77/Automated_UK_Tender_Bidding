@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
@@ -17,10 +18,19 @@ from tender_agent.models import (
 )
 from tender_agent.schemas import (
     TenderDocumentFileRead,
+    TenderFacets,
     TenderRead,
     TenderRequirementsRead,
+    TenderSearchResponse,
+    TenderSearchResult,
 )
 from tender_agent.services.brief.content_store import EXTRACTOR_VERSION
+from tender_agent.services.tender_search import (
+    SortKey,
+    TenderSearchParams,
+    search_tenders,
+    tender_facets,
+)
 
 router = APIRouter(prefix="/tenders", tags=["tenders"])
 
@@ -53,6 +63,63 @@ def list_tenders(
 
     stmt = stmt.order_by(Tender.published_at.desc().nullslast()).offset(offset).limit(limit)
     return list(db.execute(stmt).scalars().all())
+
+
+@router.get("/search", response_model=TenderSearchResponse)
+def search(
+    db: Session = Depends(get_db),
+    q: str | None = Query(None, description="Free text across title, description, keywords"),
+    cpv: list[str] = Query(default_factory=list, description="CPV codes; match any overlap"),
+    region: list[str] = Query(default_factory=list, description="buyer_region (contains, OR)"),
+    buyer: str | None = Query(None, description="buyer_name contains"),
+    value_min: Decimal | None = Query(None, ge=0),
+    value_max: Decimal | None = Query(None, ge=0),
+    deadline_from: datetime | None = Query(None),
+    deadline_to: datetime | None = Query(None),
+    open_only: bool = Query(False, description="Only live notices: future deadline + active"),
+    status: list[str] = Query(default_factory=list),
+    source: list[str] = Query(default_factory=list, description="source_code; default all"),
+    include_duplicates: bool = Query(
+        True, description="Show all matches; duplicates are annotated, not hidden"
+    ),
+    sort: SortKey = Query(SortKey.deadline_asc),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=100),
+) -> TenderSearchResponse:
+    """Source-agnostic search over the tender table. See services/tender_search."""
+    params = TenderSearchParams(
+        q=q,
+        cpv=cpv,
+        region=region,
+        buyer=buyer,
+        value_min=value_min,
+        value_max=value_max,
+        deadline_from=deadline_from,
+        deadline_to=deadline_to,
+        open_only=open_only,
+        status=status,
+        source=source,
+        include_duplicates=include_duplicates,
+        sort=sort,
+        page=page,
+        page_size=page_size,
+    )
+    total, rows = search_tenders(db, params)
+    results = []
+    for t in rows:
+        row = TenderSearchResult.model_validate(t)
+        row.is_duplicate = t.duplicate_of_id is not None
+        results.append(row)
+    return TenderSearchResponse(
+        total=total, page=page, page_size=page_size, results=results
+    )
+
+
+@router.get("/facets", response_model=TenderFacets)
+def facets(db: Session = Depends(get_db)) -> TenderFacets:
+    """Distinct sources/statuses/regions for the search filter controls."""
+    sources, statuses, regions = tender_facets(db)
+    return TenderFacets(sources=sources, statuses=statuses, regions=regions)
 
 
 @router.get("/{tender_id}", response_model=TenderRead)
