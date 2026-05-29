@@ -87,6 +87,10 @@ class Tender(Base):
     buyer_id: Mapped[str | None] = mapped_column(String(128))
     buyer_country: Mapped[str | None] = mapped_column(String(64))
     buyer_region: Mapped[str | None] = mapped_column(String(128))
+    # Canonical UK region (chunk 8) extracted from raw OCDS delivery-address data
+    # (region field -> postcode -> country). buyer_region is kept untouched as
+    # the raw source value; this is the normalised, filterable region.
+    region: Mapped[str | None] = mapped_column(String(64), index=True)
 
     # Classification
     cpv_codes: Mapped[list[str] | None] = mapped_column(ARRAY(String))
@@ -279,6 +283,25 @@ class TenderBrief(Base):
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+
+class RegionLookup(Base):
+    """Cache of resolved region keys (chunk 8).
+
+    Each distinct unresolved location key (a postcode area, a country name, or a
+    free-text location handed to the AI fallback) is resolved once and reused.
+    ``method`` records how it was resolved so a backfill can report the mix and
+    so the rare AI calls are never repeated for the same key."""
+
+    __tablename__ = "region_lookup"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    raw_key: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    canonical_region: Mapped[str] = mapped_column(String(64), nullable=False)
+    method: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
 
