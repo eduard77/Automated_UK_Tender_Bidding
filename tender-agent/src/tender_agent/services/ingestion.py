@@ -18,6 +18,7 @@ from tender_agent.services.deduplicator import find_duplicate
 from tender_agent.services.document_downloader import download_documents_for_tender
 from tender_agent.services.portal_classifier import schedule_classification
 from tender_agent.services.portal_discovery import process_tender_for_portals
+from tender_agent.services.regions import resolve_for_tender
 from tender_agent.services.requirements_extractor import extract_requirements
 
 logger = structlog.get_logger(__name__)
@@ -52,11 +53,20 @@ def _upsert_tender(db: Session, normalised: NormalisedTender) -> tuple[Tender, s
     docs_payload = payload.pop("documents", [])
     raw_payload = payload.pop("raw", {})
 
+    # Canonical region (chunk 8): extracted from the raw OCDS delivery-address
+    # data (region -> postcode -> country). Deterministic only in the polling
+    # hot path — never an AI call; the rare unresolved tenders become
+    # "Unspecified" and the backfill can upgrade them later. Source-agnostic.
+    region = resolve_for_tender(
+        raw_payload, normalised.buyer_region, normalised.buyer_country
+    )
+
     if existing is None:
         tender = Tender(
             **payload,
             documents=docs_payload,
             raw=raw_payload,
+            region=region,
             content_hash=chash,
             first_seen_at=now,
             last_seen_at=now,
@@ -78,6 +88,7 @@ def _upsert_tender(db: Session, normalised: NormalisedTender) -> tuple[Tender, s
         setattr(existing, k, v)
     existing.documents = docs_payload
     existing.raw = raw_payload
+    existing.region = region
     existing.content_hash = chash
     return existing, "updated"
 
