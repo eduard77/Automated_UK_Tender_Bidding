@@ -70,6 +70,57 @@ class TenderRead(BaseModel):
     last_seen_at: datetime
 
 
+class TenderSearchResult(BaseModel):
+    """One row in a /tenders/search response.
+
+    Source-agnostic: every field comes straight off the canonical Tender model,
+    so a tender from any source (CF, FTS, PCS, future portals) renders the same.
+    `is_duplicate` is computed from `duplicate_of_id` — when set, the row is a
+    cross-source duplicate of the referenced primary tender.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    title: str
+    buyer_name: str | None
+    buyer_region: str | None
+    status: str | None
+    source_code: str
+    source_url: str | None
+    cpv_codes: list[str] | None
+    value_amount: Decimal | None
+    value_currency: str | None
+    value_min: Decimal | None
+    value_max: Decimal | None
+    published_at: datetime | None
+    deadline_at: datetime | None
+    procurement_ref: str | None
+    duplicate_of_id: int | None
+    # Computed by the endpoint from duplicate_of_id (Tender has no such column),
+    # so it carries a default for model_validate(orm_obj) and is set after.
+    is_duplicate: bool = False
+
+
+class TenderSearchResponse(BaseModel):
+    """Paginated search response: the matched page plus the full match count."""
+
+    total: int
+    page: int
+    page_size: int
+    results: list[TenderSearchResult]
+
+
+class TenderFacets(BaseModel):
+    """Distinct values for the search filter controls. Populated from whatever
+    is actually present in the table, so new sources/regions appear with no
+    code change."""
+
+    sources: list[str]
+    statuses: list[str]
+    regions: list[str]
+
+
 class FilterProfileCreate(BaseModel):
     name: str
     enabled: bool = True
