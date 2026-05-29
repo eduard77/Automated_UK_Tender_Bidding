@@ -7,7 +7,11 @@ import SearchPage from "@/components/SearchPage";
 const FACETS = {
   sources: ["CF", "FTS", "PCS"],
   statuses: ["active", "closed"],
-  regions: ["London", "Manchester"],
+  // Chunk 8: canonical regions present, with counts (drives the dropdown).
+  regions: [
+    { value: "London", count: 12 },
+    { value: "South West", count: 4 },
+  ],
 };
 
 const SEARCH_RESPONSE = {
@@ -20,6 +24,7 @@ const SEARCH_RESPONSE = {
       title: "Mock Result Tender",
       buyer_name: "Mock City Council",
       buyer_region: "London",
+      region: "London",
       status: "active",
       source_code: "CF",
       source_url: null,
@@ -120,6 +125,50 @@ describe("SearchPage", () => {
 
     await waitFor(() =>
       expect(searchCalls().some((u) => u.includes("page=2"))).toBe(true),
+    );
+  });
+
+  it("region multi-select adds an exact region to the query + a removable chip", async () => {
+    renderPage();
+    await waitFor(() => expect(facetsLoaded()).toBe(true));
+
+    // Canonical region options come from the facets dropdown (not free text).
+    fireEvent.click(screen.getByRole("checkbox", { name: /London/i }));
+    fireEvent.click(screen.getByRole("button", { name: /search/i }));
+
+    await waitFor(() =>
+      expect(searchCalls().some((u) => u.includes("region=London"))).toBe(true),
+    );
+
+    // An active-filter chip is shown; removing it re-queries without the region.
+    const remove = await screen.findByRole("button", { name: /Remove filter Region/i });
+    fireEvent.click(remove);
+    await waitFor(() =>
+      expect(searchCalls().some((u) => !u.includes("region=London"))).toBe(true),
+    );
+  });
+
+  it("value range includes null-value tenders by default; the toggle flips it", async () => {
+    renderPage();
+    await waitFor(() => expect(facetsLoaded()).toBe(true));
+
+    fireEvent.change(screen.getByPlaceholderText("50000"), {
+      target: { value: "100000" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /search/i }));
+    await waitFor(() =>
+      expect(searchCalls().some((u) => u.includes("value_min=100000"))).toBe(true),
+    );
+    // Default: null-value tenders are NOT excluded — no value_stated_only param.
+    expect(searchCalls().every((u) => !u.includes("value_stated_only"))).toBe(true);
+
+    // Flip the toggle on → the exclusion is requested.
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: /Only tenders with a stated value/i }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /search/i }));
+    await waitFor(() =>
+      expect(searchCalls().some((u) => u.includes("value_stated_only=true"))).toBe(true),
     );
   });
 
