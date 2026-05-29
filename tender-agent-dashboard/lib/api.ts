@@ -240,6 +240,8 @@ export interface TenderSearchResult {
   title: string;
   buyer_name: string | null;
   buyer_region: string | null;
+  // Canonical UK region (chunk 8); buyer_region is the raw source locality.
+  region: string | null;
   status: string | null;
   source_code: string;
   source_url: string | null;
@@ -262,10 +264,16 @@ export interface TenderSearchResponse {
   results: TenderSearchResult[];
 }
 
+// One canonical region present in the table, with its tender count (chunk 8).
+export interface RegionFacet {
+  value: string;
+  count: number;
+}
+
 export interface TenderFacets {
   sources: string[];
   statuses: string[];
-  regions: string[];
+  regions: RegionFacet[];
 }
 
 export interface TenderSearchParams {
@@ -275,6 +283,8 @@ export interface TenderSearchParams {
   buyer?: string;
   value_min?: string | number | null;
   value_max?: string | number | null;
+  // With a value range set, exclude null-value tenders (default: include them).
+  value_stated_only?: boolean;
   deadline_from?: string;
   deadline_to?: string;
   open_only?: boolean;

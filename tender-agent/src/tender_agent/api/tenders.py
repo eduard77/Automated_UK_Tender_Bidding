@@ -17,6 +17,7 @@ from tender_agent.models import (
     TenderRequirements,
 )
 from tender_agent.schemas import (
+    RegionFacet,
     TenderDocumentFileRead,
     TenderFacets,
     TenderRead,
@@ -70,10 +71,15 @@ def search(
     db: Session = Depends(get_db),
     q: str | None = Query(None, description="Free text across title, description, keywords"),
     cpv: list[str] = Query(default_factory=list, description="CPV codes; match any overlap"),
-    region: list[str] = Query(default_factory=list, description="buyer_region (contains, OR)"),
+    region: list[str] = Query(
+        default_factory=list, description="canonical region (exact, OR; see /tenders/facets)"
+    ),
     buyer: str | None = Query(None, description="buyer_name contains"),
     value_min: Decimal | None = Query(None, ge=0),
     value_max: Decimal | None = Query(None, ge=0),
+    value_stated_only: bool = Query(
+        False, description="With a value range, exclude null-value tenders (default: include)"
+    ),
     deadline_from: datetime | None = Query(None),
     deadline_to: datetime | None = Query(None),
     open_only: bool = Query(False, description="Only live notices: future deadline + active"),
@@ -94,6 +100,7 @@ def search(
         buyer=buyer,
         value_min=value_min,
         value_max=value_max,
+        value_stated_only=value_stated_only,
         deadline_from=deadline_from,
         deadline_to=deadline_to,
         open_only=open_only,
@@ -119,7 +126,11 @@ def search(
 def facets(db: Session = Depends(get_db)) -> TenderFacets:
     """Distinct sources/statuses/regions for the search filter controls."""
     sources, statuses, regions = tender_facets(db)
-    return TenderFacets(sources=sources, statuses=statuses, regions=regions)
+    return TenderFacets(
+        sources=sources,
+        statuses=statuses,
+        regions=[RegionFacet(value=value, count=count) for value, count in regions],
+    )
 
 
 @router.get("/{tender_id}", response_model=TenderRead)
