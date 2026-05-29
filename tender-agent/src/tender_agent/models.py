@@ -158,6 +158,55 @@ class TenderDocumentFile(Base):
     )
 
     tender: Mapped[Tender] = relationship(back_populates="document_files")
+    content_rows: Mapped[list[TenderDocumentContent]] = relationship(
+        back_populates="document_file", cascade="all, delete-orphan"
+    )
+
+
+class TenderDocumentContent(Base):
+    """Extracted text content from a tender document, keyed by (sha256, extractor_version).
+
+    Same content + same extractor = ONE row, reused across every tender the
+    document appears on. The bytes on disk are a cache; this table is the
+    durable, queryable, cloud-portable home for document content. Chunk 5
+    Part A.
+    """
+
+    __tablename__ = "tender_document_content"
+    __table_args__ = (
+        UniqueConstraint("sha256", "extractor_version", name="uq_tdc_sha_version"),
+        Index("ix_tender_document_content_tender_id", "tender_id"),
+        Index("ix_tender_document_content_document_file_id", "document_file_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    document_file_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("tender_document_files.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    tender_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("tenders.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    sha256: Mapped[str] = mapped_column(Text, nullable=False)
+    extracted_text: Mapped[str | None] = mapped_column(Text)
+    char_count: Mapped[int | None] = mapped_column(Integer)
+    extraction_status: Mapped[str] = mapped_column(Text, nullable=False)
+    extraction_detail: Mapped[str | None] = mapped_column(Text)
+    doc_type: Mapped[str | None] = mapped_column(Text)
+    extractor_version: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    document_file: Mapped[TenderDocumentFile] = relationship(
+        back_populates="content_rows"
+    )
 
 
 class TenderRequirements(Base):
@@ -190,6 +239,48 @@ class TenderRequirements(Base):
     raw_response: Mapped[dict | None] = mapped_column(JSON)
 
     tender: Mapped[Tender] = relationship(back_populates="requirements")
+
+
+class TenderBrief(Base):
+    """A bid-brief generation record (chunk 5).
+
+    Multiple rows per tender: each generate-brief request inserts one. The
+    dashboard reads the latest by created_at. Status transitions:
+        generating → complete | failed.
+    """
+
+    __tablename__ = "tender_briefs"
+    __table_args__ = (
+        Index(
+            "ix_tender_briefs_tender_created",
+            "tender_id",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    tender_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("tenders.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="generating")
+    recommendation: Mapped[str | None] = mapped_column(Text)
+    confidence: Mapped[str | None] = mapped_column(Text)
+    headline: Mapped[str | None] = mapped_column(Text)
+    brief_json: Mapped[dict | None] = mapped_column(JSONB)
+    model: Mapped[str | None] = mapped_column(Text)
+    documents_considered: Mapped[list[dict] | None] = mapped_column(JSONB)
+    input_tokens: Mapped[int | None] = mapped_column(Integer)
+    output_tokens: Mapped[int | None] = mapped_column(Integer)
+    error_detail: Mapped[str | None] = mapped_column(Text)
+    generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
 
 
 class FilterProfile(Base):

@@ -157,6 +157,47 @@ class TenderDocumentFileRead(BaseModel):
     download_status: str
     error: str | None
     downloaded_at: datetime | None
+    # Chunk 5: whether stored, reusable content exists for this file (joined
+    # in by the API; the field is computed, never queried directly).
+    content_stored: bool = False
+
+
+class TenderDocumentContentRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    document_file_id: int
+    tender_id: int
+    sha256: str
+    char_count: int | None
+    extraction_status: str
+    extraction_detail: str | None
+    doc_type: str | None
+    extractor_version: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class TenderBriefRead(BaseModel):
+    """A bid-brief generation record (chunk 5)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    tender_id: int
+    status: str
+    recommendation: str | None
+    confidence: str | None
+    headline: str | None
+    brief_json: dict | None
+    model: str | None
+    documents_considered: list[dict] | None
+    input_tokens: int | None
+    output_tokens: int | None
+    error_detail: str | None
+    generated_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
 
 
 class PushSubscriptionKeys(BaseModel):

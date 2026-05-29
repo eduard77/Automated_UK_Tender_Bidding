@@ -95,6 +95,96 @@ export interface TenderDocumentFile {
   download_status: string;
   error: string | null;
   downloaded_at: string | null;
+  // Chunk 5: true when extracted text for this file's sha256 is stored at the
+  // current extractor_version. Means the brief engine can re-use it without
+  // re-reading the file (and a different tender with the same ITT can re-use
+  // it without re-downloading).
+  content_stored?: boolean;
+}
+
+// Chunk 5: bid-brief engine.
+
+export type BriefRecommendation = "bid" | "no_bid" | "conditional";
+export type BriefConfidence = "high" | "medium" | "low";
+export type RiskSeverity = "high" | "medium" | "low";
+export type BriefStatus = "generating" | "complete" | "failed";
+
+export interface BriefKeyRisk {
+  risk: string;
+  severity: RiskSeverity;
+  detail?: string | null;
+}
+
+export interface BriefDeadline {
+  date?: string | null;
+  note?: string | null;
+}
+
+export interface BriefContractValue {
+  amount?: string | null;
+  note?: string | null;
+}
+
+export interface BriefScoringCriterion {
+  criterion: string;
+  weight?: string | null;
+}
+
+export interface BriefScoring {
+  summary?: string | null;
+  criteria?: BriefScoringCriterion[];
+}
+
+export interface BriefJson {
+  recommendation: BriefRecommendation;
+  confidence: BriefConfidence;
+  headline: string;
+  rationale: string;
+  key_risks: BriefKeyRisk[];
+  deadline?: BriefDeadline | null;
+  contract_value?: BriefContractValue | null;
+  mandatory_requirements?: string[];
+  scoring?: BriefScoring | null;
+  scope_summary?: string | null;
+  notable_conditions?: string[];
+  missing_or_unclear?: string[];
+}
+
+export interface BriefDocumentConsidered {
+  filename: string;
+  included: "full" | "truncated" | "omitted";
+  sha256?: string | null;
+  doc_type?: string | null;
+}
+
+export interface TenderBrief {
+  id: number;
+  tender_id: number;
+  status: BriefStatus;
+  recommendation: BriefRecommendation | null;
+  confidence: BriefConfidence | null;
+  headline: string | null;
+  brief_json: BriefJson | null;
+  model: string | null;
+  documents_considered: BriefDocumentConsidered[] | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  error_detail: string | null;
+  generated_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export const startGenerateBrief = (tenderId: number) =>
+  request<TenderBrief>(`/tenders/${tenderId}/generate-brief`, {
+    method: "POST",
+  });
+
+export const getLatestBrief = (tenderId: number) =>
+  request<TenderBrief | null>(`/tenders/${tenderId}/brief`);
+
+export function isBriefActive(status: string): boolean {
+  return status === "generating";
 }
 
 export interface FilterProfileCreate {

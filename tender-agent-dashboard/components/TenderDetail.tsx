@@ -12,16 +12,19 @@ import {
   documentFileUrl,
   fetcher,
   getFetchStatus,
+  isBriefActive,
   isFetchTaskActive,
   startFetchDocuments,
-  type DocumentRequired,
-  type EvaluationCriterion,
+  startGenerateBrief,
+  type BriefDocumentConsidered,
+  type BriefJson,
+  type BriefKeyRisk,
+  type BriefScoring,
   type FetchTask,
-  type QuestionToAnswer,
-  type RequirementItem,
+  type RiskSeverity,
   type Tender,
+  type TenderBrief,
   type TenderDocumentFile,
-  type TenderRequirements,
 } from "@/lib/api";
 import {
   absoluteDeadline,
@@ -36,14 +39,10 @@ export default function TenderDetail({ id }: { id: number }) {
   const tender = useSWR<Tender>(`/tenders/${id}`, fetcher, {
     revalidateOnFocus: false,
   });
-  const requirements = useSWR<TenderRequirements>(
-    `/tenders/${id}/requirements`,
+  const brief = useSWR<TenderBrief | null>(
+    `/tenders/${id}/brief`,
     fetcher,
-    {
-      revalidateOnFocus: false,
-      shouldRetryOnError: (err) =>
-        !(err instanceof ApiError && err.status === 404),
-    },
+    { revalidateOnFocus: false, shouldRetryOnError: false },
   );
   const documents = useSWR<TenderDocumentFile[]>(
     `/tenders/${id}/documents`,
@@ -121,21 +120,19 @@ export default function TenderDetail({ id }: { id: number }) {
     return <DetailSkeleton />;
   }
 
-  const brief = requirements.data ?? null;
-  const briefIs404 =
-    requirements.error instanceof ApiError && requirements.error.status === 404;
+  const hasDocuments = (documents.data ?? []).length > 0;
 
   return (
     <div className="space-y-14 py-14">
       <Header tender={tender.data} />
       <Description description={tender.data.description} />
       <Sidebar tender={tender.data} />
-      <BriefBlock
+      <BriefPanel
         tenderId={id}
-        brief={brief}
-        is404={briefIs404}
-        otherError={!brief && !briefIs404 && requirements.error ? requirements.error : null}
-        onReload={() => requirements.mutate()}
+        brief={brief.data ?? null}
+        otherError={brief.error}
+        hasDocuments={hasDocuments}
+        onReload={() => brief.mutate()}
       />
       <DocumentsSection
         tenderId={id}
@@ -383,22 +380,84 @@ function DataPoint({
 }
 
 // ---------------------------------------------------------------------------
-// Brief block (requirements)
+// Brief panel (chunk 5 — bid / no-bid, key risks first)
 // ---------------------------------------------------------------------------
 
-function BriefBlock({
+function BriefPanel({
   tenderId,
   brief,
-  is404,
   otherError,
+  hasDocuments,
   onReload,
 }: {
   tenderId: number;
-  brief: TenderRequirements | null;
-  is404: boolean;
+  brief: TenderBrief | null;
   otherError: unknown;
+  hasDocuments: boolean;
   onReload: () => void;
 }) {
+  const [localBrief, setLocalBrief] = useState<TenderBrief | null>(brief);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Keep local state in sync with SWR if it refetches.
+  if (brief && (!localBrief || brief.id !== localBrief.id)) {
+    if (
+      !localBrief ||
+      Date.parse(brief.updated_at) >= Date.parse(localBrief.updated_at)
+    ) {
+      setLocalBrief(brief);
+    }
+  }
+
+  const stopPolling = useCallback(() => {
+    if (pollRef.current) {
+      clearTimeout(pollRef.current);
+      pollRef.current = null;
+    }
+  }, []);
+
+  const pollBrief = useCallback(() => {
+    const tick = async () => {
+      try {
+        const apiBase =
+          process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/$/, "") ?? "/__api";
+        const res = await fetch(`${apiBase}/tenders/${tenderId}/brief`, {
+          cache: "no-store",
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const next = (await res.json()) as TenderBrief | null;
+        setLocalBrief(next);
+        if (next && isBriefActive(next.status)) {
+          pollRef.current = setTimeout(tick, 2000);
+        } else {
+          stopPolling();
+          onReload();
+        }
+      } catch {
+        stopPolling();
+        setError("Lost track of brief generation.");
+      }
+    };
+    pollRef.current = setTimeout(tick, 1500);
+  }, [tenderId, onReload, stopPolling]);
+
+  const trigger = useCallback(async () => {
+    setError(null);
+    setBusy(true);
+    stopPolling();
+    try {
+      const started = await startGenerateBrief(tenderId);
+      setLocalBrief(started);
+      pollBrief();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to start generation");
+    } finally {
+      setBusy(false);
+    }
+  }, [tenderId, pollBrief, stopPolling]);
+
   if (otherError) {
     return (
       <section
@@ -416,95 +475,62 @@ function BriefBlock({
     );
   }
 
-  if (is404 || !brief) {
-    return <GenerateBriefCta tenderId={tenderId} onSuccess={onReload} />;
+  if (!localBrief) {
+    return (
+      <BriefCta
+        tenderId={tenderId}
+        hasDocuments={hasDocuments}
+        busy={busy}
+        onTrigger={trigger}
+        error={error}
+      />
+    );
+  }
+
+  if (localBrief.status === "generating") {
+    return <BriefGenerating />;
+  }
+
+  if (localBrief.status === "failed") {
+    return (
+      <BriefFailed
+        brief={localBrief}
+        hasDocuments={hasDocuments}
+        busy={busy}
+        onTrigger={trigger}
+      />
+    );
   }
 
   return (
-    <section className="space-y-10">
-      <div className="section-eyebrow">Brief</div>
-
-      {brief.recommendation && <RecommendationBanner brief={brief} />}
-      {brief.risk_flags && brief.risk_flags.length > 0 && <RiskFlags flags={brief.risk_flags} />}
-
-      {brief.summary && (
-        <div
-          className="max-w-3xl text-text"
-          style={{ fontSize: "16px", lineHeight: 1.7 }}
-        >
-          {brief.summary}
-        </div>
-      )}
-
-      <EvaluationCriteriaCards items={brief.evaluation_criteria} />
-
-      <RequirementsList
-        title="Mandatory requirements"
-        items={brief.mandatory_requirements}
-        prominence="primary"
-      />
-      <RequirementsList
-        title="Desired requirements"
-        items={brief.desired_requirements}
-        prominence="secondary"
-      />
-
-      <DocumentsRequiredList items={brief.documents_required} />
-      <QuestionsList items={brief.questions_to_answer} />
-
-      {(brief.estimated_effort_days || brief.model) && (
-        <footer
-          className="flex flex-wrap gap-6 border-t border-border pt-6 text-text-dim"
-          style={{ fontSize: "11px", letterSpacing: "0.1em", textTransform: "uppercase" }}
-        >
-          {brief.estimated_effort_days != null && (
-            <span>Estimated effort: {brief.estimated_effort_days} days</span>
-          )}
-          {brief.model && <span>Model: {brief.model}</span>}
-          {brief.extracted_at && (
-            <span>Extracted: {formatDate(brief.extracted_at)}</span>
-          )}
-        </footer>
-      )}
-    </section>
+    <BriefComplete
+      brief={localBrief}
+      busy={busy}
+      onRegenerate={trigger}
+      error={error}
+    />
   );
 }
 
-function GenerateBriefCta({
-  tenderId,
-  onSuccess,
+function BriefCta({
+  tenderId: _tenderId,
+  hasDocuments,
+  busy,
+  onTrigger,
+  error,
 }: {
   tenderId: number;
-  onSuccess: () => void;
+  hasDocuments: boolean;
+  busy: boolean;
+  onTrigger: () => void;
+  error: string | null;
 }) {
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const trigger = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      const apiBase =
-        process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/$/, "") ?? "/__api";
-      const res = await fetch(`${apiBase}/admin/extract-requirements/${tenderId}`, {
-        method: "POST",
-      });
-      if (!res.ok) {
-        const body = await res.text().catch(() => "");
-        throw new Error(body || `HTTP ${res.status}`);
-      }
-      onSuccess();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to generate brief");
-    } finally {
-      setBusy(false);
-    }
-  };
   return (
     <section
       className="featured-glow-line relative overflow-hidden rounded-2xl border border-border-strong bg-bg-elevated p-10 backdrop-blur-md"
       style={{ borderRadius: "24px" }}
     >
-      <PillKicker withDot={false}>Brief draft</PillKicker>
+      <PillKicker withDot={false}>Bid brief</PillKicker>
       <h2
         className="font-display text-text mt-5 mb-4"
         style={{ fontSize: "32px", letterSpacing: "-0.02em", lineHeight: 1.1 }}
@@ -515,20 +541,25 @@ function GenerateBriefCta({
         className="text-text-muted mb-7 max-w-2xl"
         style={{ fontSize: "15px", lineHeight: 1.6 }}
       >
-        Run the requirements extractor over the attached documents to produce
-        a structured brief: mandatory and desired requirements, evaluation
-        criteria, risk flags, and a recommendation.
+        {hasDocuments
+          ? "Read every attached document and produce a recommendation-led brief: BID / NO-BID, confidence, the key risks, deadline, contract value, mandatory requirements, scoring, and what's missing."
+          : "Fetch the documents first — the brief reads the ITT pack to recommend BID / NO-BID."}
       </p>
       <div className="flex flex-wrap items-center gap-3">
         <button
           type="button"
-          onClick={trigger}
-          disabled={busy}
-          className="btn-primary"
+          onClick={onTrigger}
+          disabled={busy || !hasDocuments}
+          className="btn-primary disabled:opacity-50"
         >
-          {busy ? "Generating…" : "Generate brief"}
+          {busy ? "Starting…" : "Generate brief"}
           {!busy && <span className="arrow">→</span>}
         </button>
+        {!hasDocuments && (
+          <span className="text-text-muted" style={{ fontSize: "13px" }}>
+            Scroll down to Fetch documents.
+          </span>
+        )}
         {error && (
           <span role="alert" className="text-danger" style={{ fontSize: "13px" }}>
             {error}
@@ -539,185 +570,201 @@ function GenerateBriefCta({
   );
 }
 
-function RecommendationBanner({ brief }: { brief: TenderRequirements }) {
-  if (!brief.recommendation) return null;
-  const r = brief.recommendation.toLowerCase();
+function BriefGenerating() {
+  return (
+    <section
+      role="status"
+      className="rounded-2xl border border-border-strong bg-bg-elevated p-8 backdrop-blur-md"
+      style={{ borderRadius: "24px" }}
+    >
+      <PillKicker withDot={false}>Bid brief</PillKicker>
+      <p
+        className="text-text mt-5"
+        style={{ fontSize: "16px", lineHeight: 1.6 }}
+      >
+        <span className="mr-2 inline-block animate-pulse">●</span>
+        Reading the documents and analysing…
+      </p>
+      <p className="text-text-muted mt-3" style={{ fontSize: "13px" }}>
+        Usually under a minute. The page updates automatically.
+      </p>
+    </section>
+  );
+}
+
+function BriefFailed({
+  brief,
+  hasDocuments,
+  busy,
+  onTrigger,
+}: {
+  brief: TenderBrief;
+  hasDocuments: boolean;
+  busy: boolean;
+  onTrigger: () => void;
+}) {
+  const noDocs =
+    brief.error_detail?.toLowerCase().includes("no documents") === true;
+  return (
+    <section
+      role="alert"
+      className="rounded-2xl border border-danger/40 bg-bg-elevated p-8 backdrop-blur-md"
+      style={{ borderRadius: "24px" }}
+    >
+      <PillKicker withDot={false}>Bid brief</PillKicker>
+      <h2
+        className="font-display text-text mt-5 mb-3"
+        style={{ fontSize: "22px" }}
+      >
+        {noDocs ? "No documents to analyse" : "Brief generation failed"}
+      </h2>
+      <p className="text-text-muted mb-6" style={{ fontSize: "14px", lineHeight: 1.6 }}>
+        {brief.error_detail ?? "Try again, or check the backend logs."}
+      </p>
+      <div className="flex flex-wrap gap-3">
+        <button
+          type="button"
+          onClick={onTrigger}
+          disabled={busy || (!hasDocuments && !noDocs)}
+          className="btn-primary disabled:opacity-50"
+        >
+          {busy ? "Starting…" : noDocs ? "Try again" : "Retry"}
+          {!busy && <span className="arrow">→</span>}
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function BriefComplete({
+  brief,
+  busy,
+  onRegenerate,
+  error,
+}: {
+  brief: TenderBrief;
+  busy: boolean;
+  onRegenerate: () => void;
+  error: string | null;
+}) {
+  const json = brief.brief_json;
+  if (!json) return null;
+  return (
+    <section className="space-y-10">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="section-eyebrow">Bid brief</div>
+        <button
+          type="button"
+          onClick={onRegenerate}
+          disabled={busy}
+          className="btn-ghost"
+        >
+          {busy ? "Regenerating…" : "Regenerate"}
+        </button>
+      </div>
+
+      <RecommendationBanner brief={json} />
+      <KeyRisks risks={json.key_risks} />
+
+      <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
+        <DeadlineCard deadline={json.deadline} />
+        <ContractValueCard value={json.contract_value} />
+      </div>
+
+      <MandatoryRequirementsChecklist
+        items={json.mandatory_requirements ?? []}
+      />
+
+      <ScoringBlock scoring={json.scoring} />
+
+      {json.scope_summary && (
+        <BriefSection title="Scope summary">
+          <p
+            className="max-w-3xl text-text"
+            style={{ fontSize: "16px", lineHeight: 1.7 }}
+          >
+            {json.scope_summary}
+          </p>
+        </BriefSection>
+      )}
+
+      <BulletList
+        title="Notable conditions"
+        items={json.notable_conditions ?? []}
+      />
+      <BulletList
+        title="Things to clarify with the buyer"
+        items={json.missing_or_unclear ?? []}
+      />
+
+      <BriefFooter brief={brief} />
+      {error && (
+        <p role="alert" className="text-danger" style={{ fontSize: "13px" }}>
+          {error}
+        </p>
+      )}
+    </section>
+  );
+}
+
+function RecommendationBanner({ brief }: { brief: BriefJson }) {
   const palette =
-    r === "pursue"
-      ? { border: "border-mint/40", bg: "bg-mint/10", text: "text-mint" }
-      : r === "decline"
-        ? { border: "border-danger/40", bg: "bg-danger/10", text: "text-danger" }
-        : { border: "border-amber/40", bg: "bg-amber/10", text: "text-amber" };
+    brief.recommendation === "bid"
+      ? {
+          border: "border-mint/40",
+          bg: "bg-mint/10",
+          text: "text-mint",
+          label: "BID",
+        }
+      : brief.recommendation === "no_bid"
+        ? {
+            border: "border-danger/40",
+            bg: "bg-danger/10",
+            text: "text-danger",
+            label: "NO-BID",
+          }
+        : {
+            border: "border-amber/40",
+            bg: "bg-amber/10",
+            text: "text-amber",
+            label: "CONDITIONAL",
+          };
   return (
     <div
       role="status"
-      className={`rounded-2xl border ${palette.border} ${palette.bg} p-6 backdrop-blur-md`}
-      style={{ borderRadius: "18px" }}
+      className={`rounded-2xl border ${palette.border} ${palette.bg} p-7 backdrop-blur-md`}
+      style={{ borderRadius: "22px" }}
     >
-      <div
-        className={`${palette.text}`}
-        style={{
-          fontSize: "11px",
-          fontWeight: 500,
-          letterSpacing: "0.14em",
-          textTransform: "uppercase",
-          marginBottom: "10px",
-        }}
-      >
-        Recommendation · {brief.recommendation}
+      <div className="flex flex-wrap items-center gap-4 mb-4">
+        <span
+          className={`font-display ${palette.text}`}
+          style={{
+            fontSize: "32px",
+            letterSpacing: "0.04em",
+            fontWeight: 500,
+          }}
+        >
+          {palette.label}
+        </span>
+        <ConfidenceChip confidence={brief.confidence} />
       </div>
-      {brief.recommendation_reason && (
-        <p className="text-text" style={{ fontSize: "15px", lineHeight: 1.6 }}>
-          {brief.recommendation_reason}
+      {brief.headline && (
+        <p
+          className="text-text mb-3"
+          style={{ fontSize: "18px", lineHeight: 1.55, fontWeight: 500 }}
+        >
+          {brief.headline}
+        </p>
+      )}
+      {brief.rationale && (
+        <p
+          className="text-text-muted"
+          style={{ fontSize: "15px", lineHeight: 1.65 }}
+        >
+          {brief.rationale}
         </p>
       )}
     </div>
-  );
-}
-
-function RiskFlags({ flags }: { flags: string[] }) {
-  return (
-    <div
-      role="note"
-      aria-label="Risk flags"
-      className="rounded-xl border border-amber/30 bg-amber/5 p-5"
-      style={{ borderRadius: "18px" }}
-    >
-      <div
-        className="text-amber mb-3"
-        style={{
-          fontSize: "11px",
-          fontWeight: 500,
-          letterSpacing: "0.14em",
-          textTransform: "uppercase",
-        }}
-      >
-        ⚠ Risk flags
-      </div>
-      <ul className="space-y-2">
-        {flags.map((f, i) => (
-          <li key={`${i}-${f}`} className="text-text" style={{ fontSize: "14px", lineHeight: 1.55 }}>
-            · {f}
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-}
-
-function EvaluationCriteriaCards({
-  items,
-}: {
-  items: EvaluationCriterion[] | null;
-}) {
-  if (!items?.length) return null;
-  return (
-    <section className="space-y-4">
-      <h3 className="font-display text-text" style={{ fontSize: "22px", letterSpacing: "-0.02em" }}>
-        Evaluation criteria
-      </h3>
-      <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-        {items.map((c, i) => (
-          <div
-            key={`${i}-${c.name}`}
-            className="rounded-xl border border-border bg-bg-elevated p-5 backdrop-blur-sm"
-            style={{ borderRadius: "18px" }}
-          >
-            <div className="flex items-baseline justify-between gap-3 mb-2">
-              <span className="text-text" style={{ fontWeight: 500 }}>
-                {c.name}
-              </span>
-              {c.weight != null && (
-                <span className="display-num text-mint-pale" style={{ fontSize: "20px" }}>
-                  {c.weight}%
-                </span>
-              )}
-            </div>
-            {c.description && (
-              <p className="text-text-muted" style={{ fontSize: "13px", lineHeight: 1.55 }}>
-                {c.description}
-              </p>
-            )}
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function RequirementsList({
-  title,
-  items,
-  prominence,
-}: {
-  title: string;
-  items: RequirementItem[] | null;
-  prominence: "primary" | "secondary";
-}) {
-  if (!items?.length) return null;
-  return (
-    <section className="space-y-4">
-      <h3
-        className={`font-display ${prominence === "primary" ? "text-text" : "text-text-muted"}`}
-        style={{
-          fontSize: prominence === "primary" ? "24px" : "20px",
-          letterSpacing: "-0.02em",
-        }}
-      >
-        {title}
-      </h3>
-      <ol className="space-y-3">
-        {items.map((req, i) => (
-          <li
-            key={i}
-            className={`flex gap-5 ${
-              prominence === "primary"
-                ? "rounded-xl border border-border bg-bg-elevated p-5 backdrop-blur-sm"
-                : "border-l border-border pl-5 py-2"
-            }`}
-            style={prominence === "primary" ? { borderRadius: "18px" } : undefined}
-          >
-            <span
-              className="display-num text-mint-pale shrink-0"
-              style={{ fontSize: "20px", lineHeight: 1.4, width: "32px" }}
-              aria-hidden="true"
-            >
-              {String(i + 1).padStart(2, "0")}
-            </span>
-            <div className="flex-1 min-w-0">
-              <div className="flex items-start justify-between gap-3">
-                <p
-                  className={prominence === "primary" ? "text-text" : "text-text-muted"}
-                  style={{ fontSize: "15px", lineHeight: 1.55 }}
-                >
-                  {req.text}
-                </p>
-                {req.confidence && <ConfidenceChip confidence={req.confidence} />}
-              </div>
-              {(req.category || req.evidence_required) && (
-                <div
-                  className="mt-2 flex flex-wrap gap-3 text-text-dim font-mono"
-                  style={{ fontSize: "10px", letterSpacing: "0.1em", textTransform: "uppercase" }}
-                >
-                  {req.category && <span>cat: {req.category}</span>}
-                  {req.evidence_required && (
-                    <span>evidence: {req.evidence_required}</span>
-                  )}
-                </div>
-              )}
-              {req.source_excerpt && (
-                <blockquote
-                  className="mt-3 border-l-2 border-border-strong pl-3 italic text-text-dim"
-                  style={{ fontSize: "13px", lineHeight: 1.5 }}
-                >
-                  &ldquo;{req.source_excerpt}&rdquo;
-                </blockquote>
-              )}
-            </div>
-          </li>
-        ))}
-      </ol>
-    </section>
   );
 }
 
@@ -734,121 +781,299 @@ function ConfidenceChip({
         : "border-danger/40 text-danger";
   return (
     <span
-      className={`shrink-0 whitespace-nowrap rounded-pill border px-2 py-0.5 font-mono ${tone}`}
-      style={{ fontSize: "10px", letterSpacing: "0.1em", textTransform: "uppercase" }}
+      className={`shrink-0 whitespace-nowrap rounded-pill border px-2.5 py-1 font-mono ${tone}`}
+      style={{
+        fontSize: "11px",
+        letterSpacing: "0.1em",
+        textTransform: "uppercase",
+      }}
       aria-label={`Confidence: ${confidence}`}
     >
-      {confidence}
+      {confidence} confidence
     </span>
   );
 }
 
-function DocumentsRequiredList({
-  items,
-}: {
-  items: DocumentRequired[] | null;
-}) {
-  if (!items?.length) return null;
+function KeyRisks({ risks }: { risks: BriefKeyRisk[] }) {
+  if (!risks?.length) return null;
   return (
-    <section className="space-y-4">
-      <h3 className="font-display text-text" style={{ fontSize: "22px", letterSpacing: "-0.02em" }}>
-        Documents required
-      </h3>
-      <ul className="space-y-3">
-        {items.map((doc, i) => (
+    <BriefSection title="Key risks">
+      <ol className="space-y-3">
+        {risks.map((r, i) => (
           <li
-            key={`${i}-${doc.name}`}
-            className="flex items-start gap-4 rounded-xl border border-border bg-bg-elevated p-5"
+            key={`${i}-${r.risk}`}
+            className="rounded-xl border border-border bg-bg-elevated p-5 backdrop-blur-sm"
             style={{ borderRadius: "18px" }}
           >
-            <span
-              className="font-mono text-text-muted shrink-0"
-              style={{
-                fontSize: "10px",
-                padding: "4px 8px",
-                background: "rgba(255, 255, 255, 0.04)",
-                border: "1px solid rgba(255, 255, 255, 0.08)",
-                borderRadius: "4px",
-                letterSpacing: "0.08em",
-                textTransform: "uppercase",
-              }}
-            >
-              {classifyDocumentKind(doc.name)}
-            </span>
-            <div className="flex-1 min-w-0">
-              <div className="flex flex-wrap items-baseline gap-3">
-                <p className="text-text" style={{ fontSize: "15px" }}>
-                  {doc.name}
-                </p>
-                {doc.mandatory && (
-                  <span
-                    className="font-mono text-amber"
-                    style={{
-                      fontSize: "10px",
-                      padding: "2px 7px",
-                      border: "1px solid rgba(245, 166, 35, 0.4)",
-                      borderRadius: "4px",
-                      letterSpacing: "0.1em",
-                      textTransform: "uppercase",
-                    }}
-                  >
-                    Mandatory
-                  </span>
-                )}
-              </div>
-              {doc.description && (
-                <p className="text-text-muted mt-2" style={{ fontSize: "13px", lineHeight: 1.55 }}>
-                  {doc.description}
-                </p>
-              )}
+            <div className="flex items-start justify-between gap-3 mb-2">
+              <p
+                className="text-text"
+                style={{ fontSize: "15px", lineHeight: 1.55, fontWeight: 500 }}
+              >
+                {r.risk}
+              </p>
+              <SeverityChip severity={r.severity} />
             </div>
+            {r.detail && (
+              <p
+                className="text-text-muted"
+                style={{ fontSize: "13px", lineHeight: 1.6 }}
+              >
+                {r.detail}
+              </p>
+            )}
+          </li>
+        ))}
+      </ol>
+    </BriefSection>
+  );
+}
+
+function SeverityChip({ severity }: { severity: RiskSeverity }) {
+  const tone =
+    severity === "high"
+      ? "border-danger/40 text-danger"
+      : severity === "medium"
+        ? "border-amber/40 text-amber"
+        : "border-mint/40 text-mint";
+  return (
+    <span
+      className={`shrink-0 whitespace-nowrap rounded-pill border px-2 py-0.5 font-mono ${tone}`}
+      style={{
+        fontSize: "10px",
+        letterSpacing: "0.1em",
+        textTransform: "uppercase",
+      }}
+      aria-label={`Severity: ${severity}`}
+    >
+      {severity}
+    </span>
+  );
+}
+
+function DeadlineCard({
+  deadline,
+}: {
+  deadline?: { date?: string | null; note?: string | null } | null;
+}) {
+  if (!deadline || (!deadline.date && !deadline.note)) return null;
+  return (
+    <BriefCard label="Deadline">
+      {deadline.date && (
+        <p className="text-text" style={{ fontSize: "18px", fontWeight: 500 }}>
+          {deadline.date}
+        </p>
+      )}
+      {deadline.note && (
+        <p
+          className="text-text-muted mt-2"
+          style={{ fontSize: "13px", lineHeight: 1.55 }}
+        >
+          {deadline.note}
+        </p>
+      )}
+    </BriefCard>
+  );
+}
+
+function ContractValueCard({
+  value,
+}: {
+  value?: { amount?: string | null; note?: string | null } | null;
+}) {
+  if (!value || (!value.amount && !value.note)) return null;
+  return (
+    <BriefCard label="Contract value">
+      {value.amount && (
+        <p
+          className="display-num text-mint-pale"
+          style={{ fontSize: "24px", lineHeight: 1.2 }}
+        >
+          {value.amount}
+        </p>
+      )}
+      {value.note && (
+        <p
+          className="text-text-muted mt-2"
+          style={{ fontSize: "13px", lineHeight: 1.55 }}
+        >
+          {value.note}
+        </p>
+      )}
+    </BriefCard>
+  );
+}
+
+function BriefCard({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div
+      className="rounded-xl border border-border bg-bg-elevated p-6 backdrop-blur-sm"
+      style={{ borderRadius: "18px" }}
+    >
+      <div
+        className="text-text-dim mb-3"
+        style={{
+          fontSize: "11px",
+          letterSpacing: "0.12em",
+          textTransform: "uppercase",
+          fontWeight: 500,
+        }}
+      >
+        {label}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function MandatoryRequirementsChecklist({ items }: { items: string[] }) {
+  if (!items?.length) return null;
+  return (
+    <BriefSection title="Mandatory requirements">
+      <ul className="space-y-2.5">
+        {items.map((req, i) => (
+          <li
+            key={`${i}-${req}`}
+            className="flex items-start gap-3 text-text"
+            style={{ fontSize: "15px", lineHeight: 1.55 }}
+          >
+            <span
+              className="mt-1 inline-block shrink-0 rounded-sm border border-mint/40 text-mint"
+              style={{
+                width: "14px",
+                height: "14px",
+                fontSize: "10px",
+                lineHeight: "12px",
+                textAlign: "center",
+              }}
+              aria-hidden="true"
+            >
+              ✓
+            </span>
+            <span>{req}</span>
           </li>
         ))}
       </ul>
+    </BriefSection>
+  );
+}
+
+function ScoringBlock({ scoring }: { scoring?: BriefScoring | null }) {
+  if (!scoring) return null;
+  const hasContent =
+    (scoring.summary && scoring.summary.length > 0) ||
+    (scoring.criteria && scoring.criteria.length > 0);
+  if (!hasContent) return null;
+  return (
+    <BriefSection title="Scoring">
+      {scoring.summary && (
+        <p
+          className="text-text mb-4"
+          style={{ fontSize: "15px", lineHeight: 1.6 }}
+        >
+          {scoring.summary}
+        </p>
+      )}
+      {scoring.criteria && scoring.criteria.length > 0 && (
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          {scoring.criteria.map((c, i) => (
+            <div
+              key={`${i}-${c.criterion}`}
+              className="rounded-xl border border-border bg-bg-elevated p-4 backdrop-blur-sm"
+              style={{ borderRadius: "14px" }}
+            >
+              <div className="flex items-baseline justify-between gap-3">
+                <span className="text-text" style={{ fontWeight: 500 }}>
+                  {c.criterion}
+                </span>
+                {c.weight && (
+                  <span
+                    className="display-num text-mint-pale"
+                    style={{ fontSize: "18px" }}
+                  >
+                    {c.weight}
+                  </span>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </BriefSection>
+  );
+}
+
+function BulletList({ title, items }: { title: string; items: string[] }) {
+  if (!items?.length) return null;
+  return (
+    <BriefSection title={title}>
+      <ul className="space-y-2 text-text" style={{ fontSize: "15px", lineHeight: 1.55 }}>
+        {items.map((it, i) => (
+          <li key={`${i}-${it}`} className="flex gap-3">
+            <span className="text-text-dim" aria-hidden="true">·</span>
+            <span>{it}</span>
+          </li>
+        ))}
+      </ul>
+    </BriefSection>
+  );
+}
+
+function BriefSection({
+  title,
+  children,
+}: {
+  title: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="space-y-4">
+      <h3
+        className="font-display text-text"
+        style={{ fontSize: "22px", letterSpacing: "-0.02em" }}
+      >
+        {title}
+      </h3>
+      {children}
     </section>
   );
 }
 
-function classifyDocumentKind(name: string): string {
-  const n = name.toLowerCase();
-  if (/insurance|liability|indemnity/.test(n)) return "insurance";
-  if (/\biso\b|cert(if(ication)?)?/.test(n)) return "iso/cert";
-  if (/policy|policies/.test(n)) return "policy";
-  if (/case\s*stud(y|ies)|reference/.test(n)) return "case study";
-  if (/financ(es|ial)|account|turnover/.test(n)) return "financial";
-  if (/cv|bio|profile/.test(n)) return "cv";
-  if (/method|approach|statement/.test(n)) return "method";
-  return "other";
-}
-
-function QuestionsList({ items }: { items: QuestionToAnswer[] | null }) {
-  if (!items?.length) return null;
+function BriefFooter({ brief }: { brief: TenderBrief }) {
+  const docs = brief.documents_considered ?? [];
+  const included = docs.filter(
+    (d: BriefDocumentConsidered) => d.included !== "omitted",
+  ).length;
+  const truncated = docs.filter(
+    (d: BriefDocumentConsidered) => d.included === "truncated",
+  ).length;
+  const total = docs.length;
   return (
-    <section className="space-y-4">
-      <h3 className="font-display text-text" style={{ fontSize: "22px", letterSpacing: "-0.02em" }}>
-        Questions to answer
-      </h3>
-      <ol className="space-y-4">
-        {items.map((q, i) => (
-          <li
-            key={i}
-            className="border-l-2 border-mint/40 pl-5 space-y-2"
-          >
-            <p className="text-text" style={{ fontSize: "15px", lineHeight: 1.55 }}>
-              {q.question}
-            </p>
-            <div
-              className="flex flex-wrap gap-3 text-text-dim font-mono"
-              style={{ fontSize: "10px", letterSpacing: "0.1em", textTransform: "uppercase" }}
-            >
-              {q.word_limit != null && <span>{q.word_limit} words max</span>}
-              {q.weight != null && <span>weight {q.weight}%</span>}
-              {q.section && <span>section: {q.section}</span>}
-            </div>
-          </li>
-        ))}
-      </ol>
-    </section>
+    <footer
+      className="flex flex-wrap gap-6 border-t border-border pt-6 text-text-dim"
+      style={{
+        fontSize: "11px",
+        letterSpacing: "0.1em",
+        textTransform: "uppercase",
+      }}
+    >
+      {total > 0 && (
+        <span>
+          Based on {included} of {total} documents
+          {truncated > 0 ? ` (${truncated} truncated)` : ""}
+        </span>
+      )}
+      {brief.model && <span>Model: {brief.model}</span>}
+      {brief.generated_at && (
+        <span>Generated: {formatDate(brief.generated_at)}</span>
+      )}
+    </footer>
   );
 }
 
@@ -1147,6 +1372,23 @@ function DocumentRow({ tenderId, file }: { tenderId: number; file: TenderDocumen
             aria-label={`SHA256 ${file.sha256}`}
           >
             {file.sha256.slice(0, 8)}
+          </span>
+        )}
+        {file.content_stored && (
+          <span
+            className="font-mono text-mint-pale"
+            title="Extracted text content is stored — reusable without re-downloading the file"
+            aria-label="Content stored"
+            style={{
+              fontSize: "10px",
+              padding: "3px 7px",
+              border: "1px solid rgba(151, 213, 188, 0.35)",
+              borderRadius: "4px",
+              letterSpacing: "0.08em",
+              textTransform: "uppercase",
+            }}
+          >
+            ✓ Content
           </span>
         )}
       </div>

@@ -930,4 +930,22 @@ class PortalOrchestrator:
             updated=updated,
             deduped=deduped,
         )
+        # Chunk 5: extract & store content NOW so it's queryable without a
+        # second pass at brief-generation time, and reuse kicks in immediately
+        # for tenders that share documents. Errors are swallowed and logged —
+        # they must NOT fail the fetch (a corrupt .dwg shouldn't take down
+        # 21 good files).
+        try:
+            from tender_agent.services.brief.content_store import (
+                ensure_content_extracted,
+            )
+
+            db.refresh(tender)
+            ensure_content_extracted(db, tender)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "orchestrator.content_extract_failed",
+                tender_id=tender.id,
+                error=str(exc),
+            )
         return persisted
