@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useState } from "react";
 import useSWR from "swr";
 
+import FilterChip from "./FilterChip";
 import PillKicker from "./PillKicker";
 import {
   fetcher,
@@ -30,10 +31,13 @@ const PAGE_SIZE = 25;
 interface Draft {
   q: string;
   cpv: string;
-  region: string;
+  // Region is now a multi-select of canonical regions (chunk 8), not free text.
+  region: string[];
   buyer: string;
   valueMin: string;
   valueMax: string;
+  // Off by default: a value range includes null-value tenders unless this is on.
+  valueStatedOnly: boolean;
   deadlineFrom: string;
   deadlineTo: string;
   openOnly: boolean;
@@ -45,10 +49,11 @@ interface Draft {
 const EMPTY_DRAFT: Draft = {
   q: "",
   cpv: "",
-  region: "",
+  region: [],
   buyer: "",
   valueMin: "",
   valueMax: "",
+  valueStatedOnly: false,
   deadlineFrom: "",
   deadlineTo: "",
   openOnly: false,
@@ -65,19 +70,43 @@ function splitList(raw: string): string[] {
 }
 
 function draftToParams(d: Draft): TenderSearchParams {
+  const hasRange = Boolean(d.valueMin.trim() || d.valueMax.trim());
   return {
     q: d.q.trim() || undefined,
     cpv: splitList(d.cpv),
-    region: splitList(d.region),
+    region: d.region,
     buyer: d.buyer.trim() || undefined,
     value_min: d.valueMin.trim() || undefined,
     value_max: d.valueMax.trim() || undefined,
+    // Only meaningful alongside a range; drop it otherwise to keep URLs clean.
+    value_stated_only: hasRange && d.valueStatedOnly ? true : undefined,
     deadline_from: d.deadlineFrom ? `${d.deadlineFrom}T00:00:00` : undefined,
     deadline_to: d.deadlineTo ? `${d.deadlineTo}T23:59:59` : undefined,
     open_only: d.openOnly || undefined,
     status: d.statuses.length ? d.statuses : undefined,
     source: d.sources.length ? d.sources : undefined,
     include_duplicates: d.includeDuplicates,
+  };
+}
+
+// Rebuild the editable draft from applied params — used when an active-filter
+// chip is removed, so the panel stays in lock-step with what's narrowing
+// results.
+function paramsToDraft(p: TenderSearchParams): Draft {
+  return {
+    q: p.q ?? "",
+    cpv: (p.cpv ?? []).join(", "),
+    region: p.region ?? [],
+    buyer: p.buyer ?? "",
+    valueMin: p.value_min != null ? String(p.value_min) : "",
+    valueMax: p.value_max != null ? String(p.value_max) : "",
+    valueStatedOnly: p.value_stated_only ?? false,
+    deadlineFrom: p.deadline_from ? p.deadline_from.slice(0, 10) : "",
+    deadlineTo: p.deadline_to ? p.deadline_to.slice(0, 10) : "",
+    openOnly: p.open_only ?? false,
+    statuses: p.status ?? [],
+    sources: p.source ?? [],
+    includeDuplicates: p.include_duplicates ?? true,
   };
 }
 
@@ -116,7 +145,10 @@ export default function SearchPage() {
   const set = <K extends keyof Draft>(field: K, value: Draft[K]) =>
     setDraft((d) => ({ ...d, [field]: value }));
 
-  const toggleIn = (field: "statuses" | "sources", value: string) =>
+  const toggleIn = (
+    field: "statuses" | "sources" | "region",
+    value: string,
+  ) =>
     setDraft((d) => {
       const has = d[field].includes(value);
       return {
@@ -137,6 +169,17 @@ export default function SearchPage() {
     setDraft(EMPTY_DRAFT);
     setApplied(null);
     setSort("deadline_asc");
+    setPage(1);
+  };
+
+  // Remove one active filter: patch the *applied* params, re-sync the draft so
+  // the panel matches, and re-query from page 1. Re-broadens correctly because
+  // the dropped clause simply leaves the WHERE.
+  const patchApplied = (patch: Partial<TenderSearchParams>) => {
+    if (!applied) return;
+    const next = { ...applied, ...patch };
+    setApplied(next);
+    setDraft(paramsToDraft(next));
     setPage(1);
   };
 
@@ -204,19 +247,13 @@ export default function SearchPage() {
               onChange={(v) => set("buyer", v)}
               placeholder="Bristol City Council"
             />
-            <Field
-              label="Region"
-              value={draft.region}
-              onChange={(v) => set("region", v)}
-              placeholder="London, Manchester"
-              help="Comma-separated"
-              listId="region-suggestions"
+            <RegionDropdown
+              options={facets.data?.regions ?? []}
+              selected={draft.region}
+              onToggle={(v) => toggleIn("region", v)}
+              onClearAll={() => set("region", [])}
+              loading={facets.isLoading}
             />
-            <datalist id="region-suggestions">
-              {(facets.data?.regions ?? []).slice(0, 500).map((r) => (
-                <option key={r} value={r} />
-              ))}
-            </datalist>
           </FieldGroup>
         </Fieldset>
 
@@ -247,15 +284,29 @@ export default function SearchPage() {
               onChange={(v) => set("deadlineTo", v)}
             />
           </FieldGroup>
-          <label className="mt-4 flex w-fit items-center gap-3 text-text-muted text-[13px]">
-            <input
-              type="checkbox"
-              checked={draft.openOnly}
-              onChange={(e) => set("openOnly", e.target.checked)}
-              className="h-4 w-4 cursor-pointer accent-mint"
-            />
-            Open only (live notices — future deadline, still active)
-          </label>
+          <div className="mt-4 space-y-3">
+            <label className="flex w-fit items-center gap-3 text-text-muted text-[13px]">
+              <input
+                type="checkbox"
+                checked={draft.valueStatedOnly}
+                onChange={(e) => set("valueStatedOnly", e.target.checked)}
+                className="h-4 w-4 cursor-pointer accent-mint"
+              />
+              Only tenders with a stated value
+              <span className="text-text-dim">
+                (off: a value range still includes notices with no stated value)
+              </span>
+            </label>
+            <label className="flex w-fit items-center gap-3 text-text-muted text-[13px]">
+              <input
+                type="checkbox"
+                checked={draft.openOnly}
+                onChange={(e) => set("openOnly", e.target.checked)}
+                className="h-4 w-4 cursor-pointer accent-mint"
+              />
+              Open only (live notices — future deadline, still active)
+            </label>
+          </div>
         </Fieldset>
 
         <Fieldset legend="Status">
@@ -304,6 +355,15 @@ export default function SearchPage() {
           </div>
         </div>
       </form>
+
+      {/* Active-filter chips — exactly what's narrowing the results, removable. */}
+      {hasSearched && applied && (
+        <ActiveFilterChips
+          applied={applied}
+          onPatch={patchApplied}
+          onClearAll={onClear}
+        />
+      )}
 
       {/* Results ---------------------------------------------------------- */}
       {!hasSearched ? (
@@ -380,6 +440,8 @@ function resultValue(r: TenderSearchResult): string | null {
 function ResultCard({ result: r }: { result: TenderSearchResult }) {
   const deadline = relativeDeadline(r.deadline_at);
   const value = resultValue(r);
+  // Prefer the raw source locality; fall back to the canonical region (chunk 8).
+  const location = r.buyer_region || r.region;
 
   return (
     <article
@@ -476,9 +538,9 @@ function ResultCard({ result: r }: { result: TenderSearchResult }) {
             {r.buyer_name}
           </span>
         )}
-        {r.buyer_name && r.buyer_region && <span> · </span>}
-        {r.buyer_region && <span>{r.buyer_region}</span>}
-        {!r.buyer_name && !r.buyer_region && (
+        {r.buyer_name && location && <span> · </span>}
+        {location && <span>{location}</span>}
+        {!r.buyer_name && !location && (
           <span className="italic text-text-dim">Buyer not stated</span>
         )}
       </p>
@@ -568,6 +630,223 @@ function Pagination({
         Next →
       </button>
     </nav>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Active-filter chips
+// ---------------------------------------------------------------------------
+
+function ActiveFilterChips({
+  applied,
+  onPatch,
+  onClearAll,
+}: {
+  applied: TenderSearchParams;
+  onPatch: (patch: Partial<TenderSearchParams>) => void;
+  onClearAll: () => void;
+}) {
+  const a = applied;
+  const chips: React.ReactNode[] = [];
+  const money = (v: string | number) => `£${Number(v).toLocaleString("en-GB")}`;
+
+  if (a.q)
+    chips.push(
+      <FilterChip key="q" label="Text" value={a.q} onRemove={() => onPatch({ q: undefined })} />,
+    );
+  for (const code of a.cpv ?? [])
+    chips.push(
+      <FilterChip
+        key={`cpv:${code}`}
+        label="CPV"
+        value={code}
+        onRemove={() => onPatch({ cpv: (a.cpv ?? []).filter((c) => c !== code) })}
+      />,
+    );
+  for (const r of a.region ?? [])
+    chips.push(
+      <FilterChip
+        key={`region:${r}`}
+        label="Region"
+        value={r}
+        onRemove={() => onPatch({ region: (a.region ?? []).filter((x) => x !== r) })}
+      />,
+    );
+  if (a.buyer)
+    chips.push(
+      <FilterChip
+        key="buyer"
+        label="Buyer"
+        value={a.buyer}
+        onRemove={() => onPatch({ buyer: undefined })}
+      />,
+    );
+  if (a.value_min != null || a.value_max != null) {
+    const lo = a.value_min != null ? money(a.value_min) : "";
+    const hi = a.value_max != null ? money(a.value_max) : "";
+    const text = lo && hi ? `${lo}–${hi}` : lo ? `from ${lo}` : `up to ${hi}`;
+    chips.push(
+      <FilterChip
+        key="value"
+        label="Value"
+        value={text}
+        onRemove={() =>
+          onPatch({ value_min: undefined, value_max: undefined, value_stated_only: undefined })
+        }
+      />,
+    );
+  }
+  if (a.value_stated_only)
+    chips.push(
+      <FilterChip
+        key="stated"
+        value="Stated value only"
+        onRemove={() => onPatch({ value_stated_only: undefined })}
+      />,
+    );
+  if (a.deadline_from || a.deadline_to) {
+    const lo = a.deadline_from ? a.deadline_from.slice(0, 10) : "";
+    const hi = a.deadline_to ? a.deadline_to.slice(0, 10) : "";
+    const text = lo && hi ? `${lo} → ${hi}` : lo ? `from ${lo}` : `until ${hi}`;
+    chips.push(
+      <FilterChip
+        key="deadline"
+        label="Deadline"
+        value={text}
+        onRemove={() => onPatch({ deadline_from: undefined, deadline_to: undefined })}
+      />,
+    );
+  }
+  if (a.open_only)
+    chips.push(
+      <FilterChip key="open" value="Open only" onRemove={() => onPatch({ open_only: undefined })} />,
+    );
+  for (const s of a.status ?? [])
+    chips.push(
+      <FilterChip
+        key={`status:${s}`}
+        label="Status"
+        value={statusLabel(s)}
+        onRemove={() => onPatch({ status: (a.status ?? []).filter((x) => x !== s) })}
+      />,
+    );
+  for (const s of a.source ?? [])
+    chips.push(
+      <FilterChip
+        key={`source:${s}`}
+        label="Source"
+        value={sourceLabel(s)}
+        onRemove={() => onPatch({ source: (a.source ?? []).filter((x) => x !== s) })}
+      />,
+    );
+  if (a.include_duplicates === false)
+    chips.push(
+      <FilterChip
+        key="dups"
+        value="Excluding duplicates"
+        onRemove={() => onPatch({ include_duplicates: true })}
+      />,
+    );
+
+  if (chips.length === 0) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-2.5">
+      <span className="section-eyebrow">Filters</span>
+      {chips}
+      <button
+        type="button"
+        onClick={onClearAll}
+        className="text-[13px] text-text-dim underline-offset-4 hover:text-text hover:underline"
+      >
+        Reset all
+      </button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Region multi-select dropdown (canonical regions present, with counts)
+// ---------------------------------------------------------------------------
+
+function RegionDropdown({
+  options,
+  selected,
+  onToggle,
+  onClearAll,
+  loading,
+}: {
+  options: { value: string; count: number }[];
+  selected: string[];
+  onToggle: (v: string) => void;
+  onClearAll: () => void;
+  loading: boolean;
+}) {
+  const summary =
+    selected.length === 0
+      ? "All regions"
+      : selected.length === 1
+        ? selected[0]
+        : `${selected.length} regions`;
+  return (
+    <label className="block">
+      <FieldLabel>Region</FieldLabel>
+      <details className="group relative mt-2">
+        <summary
+          className="flex cursor-pointer list-none items-center justify-between rounded-md border border-border-strong bg-bg-elevated px-3.5 py-2.5 text-[14px] text-text transition-colors hover:border-mint-pale/40 focus-visible:border-mint focus-visible:outline-none [&::-webkit-details-marker]:hidden"
+          aria-label="Select regions"
+        >
+          <span className={selected.length === 0 ? "text-text-dim" : "text-text"}>
+            {summary}
+          </span>
+          <span className="text-text-dim transition-transform group-open:rotate-180" aria-hidden>
+            ▾
+          </span>
+        </summary>
+        <div
+          className="absolute z-20 mt-2 max-h-64 w-full overflow-auto rounded-md border border-border-strong bg-bg-elevated p-1.5 shadow-xl"
+          style={{ background: "rgba(17, 23, 32, 0.98)" }}
+        >
+          {loading ? (
+            <span className="block px-2 py-2 text-[13px] text-text-dim">Loading…</span>
+          ) : options.length === 0 ? (
+            <span className="block px-2 py-2 text-[13px] text-text-dim">
+              No regions yet.
+            </span>
+          ) : (
+            <>
+              {selected.length > 0 && (
+                <button
+                  type="button"
+                  onClick={onClearAll}
+                  className="mb-1 w-full rounded px-2 py-1.5 text-left text-[12px] text-text-dim hover:bg-white/5 hover:text-text"
+                >
+                  Clear region selection
+                </button>
+              )}
+              {options.map((o) => (
+                <label
+                  key={o.value}
+                  className="flex cursor-pointer items-center justify-between gap-3 rounded px-2 py-1.5 hover:bg-white/5"
+                >
+                  <span className="flex items-center gap-2.5 text-[13px] text-text">
+                    <input
+                      type="checkbox"
+                      checked={selected.includes(o.value)}
+                      onChange={() => onToggle(o.value)}
+                      className="h-3.5 w-3.5 cursor-pointer accent-mint"
+                    />
+                    {o.value}
+                  </span>
+                  <span className="font-mono text-[11px] text-text-dim">
+                    {o.count.toLocaleString("en-GB")}
+                  </span>
+                </label>
+              ))}
+            </>
+          )}
+        </div>
+      </details>
+    </label>
   );
 }
 

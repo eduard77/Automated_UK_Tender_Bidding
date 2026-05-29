@@ -16,10 +16,11 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 
-from sqlalchemy import ColumnElement, Select, func, or_, select
+from sqlalchemy import ColumnElement, Select, and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from tender_agent.models import Tender
+from tender_agent.services.regions import CANONICAL_REGIONS
 
 # Status value that represents an "open"/live notice. The table uses
 # active/planned/closed/NULL; "open only" means a live notice still accepting
@@ -47,6 +48,9 @@ class TenderSearchParams:
     buyer: str | None = None
     value_min: Decimal | None = None
     value_max: Decimal | None = None
+    # When a value range is set, null-value tenders are INCLUDED by default
+    # (828/3308 of the table has no stated value). Flip this on to exclude them.
+    value_stated_only: bool = False
     deadline_from: datetime | None = None
     deadline_to: datetime | None = None
     open_only: bool = False
@@ -83,33 +87,46 @@ def _build_conditions(params: TenderSearchParams) -> list[ColumnElement[bool]]:
     if params.cpv:
         conditions.append(Tender.cpv_codes.overlap(params.cpv))
 
-    # Region — OR of contains-matches (buyer_region is messy free text).
+    # Region — exact match against the canonical `region` column (chunk 8),
+    # multi-select OR. buyer_region is messy free text and is no longer the
+    # filter target; `region` is the normalised, canonical value.
     if params.region:
-        conditions.append(
-            or_(*[Tender.buyer_region.ilike(_like(r)) for r in params.region])
-        )
+        conditions.append(Tender.region.in_(params.region))
 
     if params.buyer and params.buyer.strip():
         conditions.append(Tender.buyer_name.ilike(_like(params.buyer.strip())))
 
     # Value range. A tender's band is [low, high] where low/high fall back to
     # value_amount. The requested [value_min, value_max] (either side optional)
-    # matches when the bands overlap. A value filter excludes tenders with no
-    # value at all (documented product decision).
+    # matches when the bands overlap.
+    #
+    # Null-value tenders (no value_amount/min/max at all) are a large share of
+    # the table and are INCLUDED by default so a value range never silently
+    # drops them — they surface marked "Value not stated". The
+    # `value_stated_only` toggle excludes them.
     if params.value_min is not None or params.value_max is not None:
         low = func.coalesce(Tender.value_min, Tender.value_amount)
         high = func.coalesce(Tender.value_max, Tender.value_amount)
-        conditions.append(
-            or_(
-                Tender.value_amount.isnot(None),
-                Tender.value_min.isnot(None),
-                Tender.value_max.isnot(None),
-            )
+        has_value = or_(
+            Tender.value_amount.isnot(None),
+            Tender.value_min.isnot(None),
+            Tender.value_max.isnot(None),
         )
+        range_clauses: list[ColumnElement[bool]] = [has_value]
         if params.value_min is not None:
-            conditions.append(high >= params.value_min)
+            range_clauses.append(high >= params.value_min)
         if params.value_max is not None:
-            conditions.append(low <= params.value_max)
+            range_clauses.append(low <= params.value_max)
+        in_range = and_(*range_clauses)
+        if params.value_stated_only:
+            conditions.append(in_range)
+        else:
+            no_value = and_(
+                Tender.value_amount.is_(None),
+                Tender.value_min.is_(None),
+                Tender.value_max.is_(None),
+            )
+            conditions.append(or_(in_range, no_value))
 
     # Deadline window + "open only" convenience.
     if params.deadline_from is not None:
@@ -165,9 +182,19 @@ def search_tenders(db: Session, params: TenderSearchParams) -> tuple[int, list[T
     return total, rows
 
 
-def tender_facets(db: Session) -> tuple[list[str], list[str], list[str]]:
-    """Distinct sources, statuses, and regions present in the table — drives the
-    filter controls and stays correct as new sources/regions are ingested."""
+_CANONICAL_ORDER = {r: i for i, r in enumerate(CANONICAL_REGIONS)}
+
+
+def tender_facets(
+    db: Session,
+) -> tuple[list[str], list[str], list[tuple[str, int]]]:
+    """Distinct sources/statuses and canonical regions (with counts) present in
+    the table — drives the filter controls and stays correct as new
+    sources/regions are ingested.
+
+    Regions come from the normalised `region` column (chunk 8): each present
+    canonical region with how many tenders carry it, ordered by the canonical
+    list so the dropdown reads North → South, UK-wide first."""
     sources = [
         s
         for (s,) in db.execute(
@@ -182,14 +209,13 @@ def tender_facets(db: Session) -> tuple[list[str], list[str], list[str]]:
         ).all()
         if s
     ]
-    regions = [
-        r
-        for (r,) in db.execute(
-            select(Tender.buyer_region)
-            .where(Tender.buyer_region.isnot(None))
-            .distinct()
-            .order_by(Tender.buyer_region)
-        ).all()
-        if r
-    ]
+    region_rows = db.execute(
+        select(Tender.region, func.count())
+        .where(Tender.region.isnot(None))
+        .group_by(Tender.region)
+    ).all()
+    regions = sorted(
+        ((r, int(c)) for (r, c) in region_rows if r),
+        key=lambda rc: (_CANONICAL_ORDER.get(rc[0], len(_CANONICAL_ORDER)), rc[0]),
+    )
     return sources, statuses, regions

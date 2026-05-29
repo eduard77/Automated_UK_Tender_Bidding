@@ -110,18 +110,24 @@ def test_cpv_overlap(session: Session) -> None:
     assert b.id not in _ids(rows) and c.id not in _ids(rows)
 
 
-def test_region_contains_case_insensitive(session: Session) -> None:
-    a = _t(session, buyer_region="Testshire")
-    b = _t(session, buyer_region="Otherton, LONDON")
+def test_region_exact_match_on_canonical_column(session: Session) -> None:
+    # Region now filters the canonical `region` column by EXACT value (chunk 8),
+    # not buyer_region free text. A tender resolved to North West (e.g. via a
+    # postcode) is found by selecting "North West".
+    nw = _t(session, region="North West", buyer_region="Manchester")
+    london = _t(session, region="London", buyer_region="Westminster")
+    sw = _t(session, region="South West", buyer_region="Bristol")
+    # buyer_region city text must NOT match the region filter.
     _, rows = search_tenders(
-        session, TenderSearchParams(region=["testshire"], source=[MARK])
+        session, TenderSearchParams(region=["North West"], source=[MARK])
     )
-    assert _ids(rows) == {a.id}
-    # multi-value region is OR
+    assert _ids(rows) == {nw.id}
+    assert london.id not in _ids(rows) and sw.id not in _ids(rows)
+    # Multi-select is OR across canonical values.
     _, rows2 = search_tenders(
-        session, TenderSearchParams(region=["testshire", "london"], source=[MARK])
+        session, TenderSearchParams(region=["North West", "London"], source=[MARK])
     )
-    assert _ids(rows2) == {a.id, b.id}
+    assert _ids(rows2) == {nw.id, london.id}
 
 
 def test_buyer_contains(session: Session) -> None:
@@ -133,7 +139,7 @@ def test_buyer_contains(session: Session) -> None:
     assert _ids(rows) == {a.id}
 
 
-def test_value_range_with_band_and_null_handling(session: Session) -> None:
+def test_value_range_includes_null_value_by_default(session: Session) -> None:
     low = _t(session, value_amount=Decimal("50000"))
     mid = _t(session, value_amount=Decimal("200000"))
     band = _t(session, value_min=Decimal("100000"), value_max=Decimal("300000"))
@@ -145,19 +151,50 @@ def test_value_range_with_band_and_null_handling(session: Session) -> None:
             value_min=Decimal("150000"), value_max=Decimal("250000"), source=[MARK]
         ),
     )
-    assert _ids(rows) == {mid.id, band.id}
+    # In-range tenders AND null-value tenders are included by default (chunk 8):
+    # a value range must never silently drop the large null-value population.
+    assert _ids(rows) == {mid.id, band.id, novalue.id}
     assert low.id not in _ids(rows)
-    # A value filter excludes tenders with no value at all (documented decision).
+
+
+def test_value_stated_only_toggle_excludes_null_value(session: Session) -> None:
+    mid = _t(session, value_amount=Decimal("200000"))
+    band = _t(session, value_min=Decimal("100000"), value_max=Decimal("300000"))
+    novalue = _t(session)
+
+    _, rows = search_tenders(
+        session,
+        TenderSearchParams(
+            value_min=Decimal("150000"),
+            value_max=Decimal("250000"),
+            value_stated_only=True,
+            source=[MARK],
+        ),
+    )
+    assert _ids(rows) == {mid.id, band.id}
     assert novalue.id not in _ids(rows)
 
 
-def test_value_min_only_excludes_null_value(session: Session) -> None:
+def test_value_min_only_includes_null_value_by_default(session: Session) -> None:
     hit = _t(session, value_amount=Decimal("500000"))
-    _t(session)  # null value
+    low = _t(session, value_amount=Decimal("1000"))
+    novalue = _t(session)  # null value
     _, rows = search_tenders(
         session, TenderSearchParams(value_min=Decimal("100000"), source=[MARK])
     )
-    assert _ids(rows) == {hit.id}
+    # The "set a value → everything with no value vanishes" failure must not
+    # recur: null-value tenders stay in unless the toggle is set.
+    assert hit.id in _ids(rows)
+    assert novalue.id in _ids(rows)
+    assert low.id not in _ids(rows)
+    # Toggle on → nulls excluded.
+    _, rows2 = search_tenders(
+        session,
+        TenderSearchParams(
+            value_min=Decimal("100000"), value_stated_only=True, source=[MARK]
+        ),
+    )
+    assert _ids(rows2) == {hit.id}
 
 
 def test_deadline_window(session: Session) -> None:
@@ -215,12 +252,12 @@ def test_source_filter(session: Session) -> None:
 
 def test_combined_filters_are_anded(session: Session) -> None:
     token = "combotoken"
-    both = _t(session, title=f"{token} job", buyer_region="Testshire")
-    only_q = _t(session, title=f"{token} job", buyer_region="Elsewhere")
-    only_region = _t(session, title="plain", buyer_region="Testshire")
+    both = _t(session, title=f"{token} job", region="North West")
+    only_q = _t(session, title=f"{token} job", region="London")
+    only_region = _t(session, title="plain", region="North West")
     _, rows = search_tenders(
         session,
-        TenderSearchParams(q=token, region=["testshire"], source=[MARK]),
+        TenderSearchParams(q=token, region=["North West"], source=[MARK]),
     )
     assert _ids(rows) == {both.id}
     assert only_q.id not in _ids(rows) and only_region.id not in _ids(rows)
@@ -368,14 +405,22 @@ def test_search_endpoint_shape_and_routing(client: TestClient, session: Session)
 
 
 def test_facets_endpoint(client: TestClient, session: Session) -> None:
-    _t(session, source="FACET_SRC", status="active", buyer_region="Facetshire")
+    _t(session, source="FACET_SRC", status="active", region="North West")
+    _t(session, source="FACET_SRC", status="active", region="North West")
+    _t(session, source="FACET_SRC", status="active", region="London")
     session.flush()
     resp = client.get("/tenders/facets")
     assert resp.status_code == 200
     body = resp.json()
     assert "FACET_SRC" in body["sources"]
     assert "active" in body["statuses"]
-    assert "Facetshire" in body["regions"]
+    # Regions are canonical values with counts (chunk 8), ordered by the
+    # canonical list (North West before London).
+    by_region = {r["value"]: r["count"] for r in body["regions"]}
+    assert by_region.get("North West", 0) >= 2
+    assert by_region.get("London", 0) >= 1
+    values = [r["value"] for r in body["regions"]]
+    assert values.index("North West") < values.index("London")
 
 
 def test_search_route_not_shadowed_by_detail_route(client: TestClient) -> None:

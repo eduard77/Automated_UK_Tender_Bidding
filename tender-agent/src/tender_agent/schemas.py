@@ -85,6 +85,10 @@ class TenderSearchResult(BaseModel):
     title: str
     buyer_name: str | None
     buyer_region: str | None
+    # Canonical UK region (chunk 8), extracted from raw OCDS delivery-address
+    # data. buyer_region remains the raw source locality; this is the filterable,
+    # normalised value shown as the result's location.
+    region: str | None
     status: str | None
     source_code: str
     source_url: str | None
@@ -111,14 +115,23 @@ class TenderSearchResponse(BaseModel):
     results: list[TenderSearchResult]
 
 
+class RegionFacet(BaseModel):
+    """One canonical region present in the table, with its tender count — drives
+    the search region dropdown (chunk 8)."""
+
+    value: str
+    count: int
+
+
 class TenderFacets(BaseModel):
     """Distinct values for the search filter controls. Populated from whatever
     is actually present in the table, so new sources/regions appear with no
-    code change."""
+    code change. `regions` are canonical UK regions (with counts) from the
+    normalised `region` column."""
 
     sources: list[str]
     statuses: list[str]
-    regions: list[str]
+    regions: list[RegionFacet]
 
 
 class FilterProfileCreate(BaseModel):
