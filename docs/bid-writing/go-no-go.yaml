@@ -1,0 +1,359 @@
+# Go/No-Go Assessment  (ADVISORY — a warning engine, NOT a gate)
+#
+# THE DECISION IS ALWAYS THE CLIENT'S. The platform never decides whether to
+# bid, never refuses a client's money on qualification grounds, and never
+# blocks generation. It produces a clear, honest brief and specific warnings;
+# the client reads them, self-certifies, pays, and we build. Submitting
+# underprepared is the client's choice to make. ("Machines act, humans
+# interpret" — carried all the way to the checkout.)
+#
+# THE FLOW
+#   1. Brief is generated and shown (brief engine, already built). Its
+#      bid/no_bid/conditional view is INFORMATION for the client, produced from
+#      this assessment over the ITT pack + vault — not a verdict the platform
+#      enforces.
+#   2. Client self-certification (see `client_self_certification` below): we ask
+#      plainly — "Do you have all the required documents? Do you qualify for
+#      this contract?" — and show the warnings this assessment generated. The
+#      client answers.
+#   3. If the client proceeds, we take the package fee (0.5% of contract value,
+#      £100-£300) and generate the bidding documents. The warnings are shown,
+#      never enforced. A red warning does NOT block payment or generation.
+#   4. templates.yaml + AGENT_SYSTEM_PROMPT.md then do the actual drafting.
+#
+# SO THE JOB OF THIS FILE is to WARN WELL, not to judge. Every "block" below is
+# really the strongest class of warning — surfaced prominently, then left to the
+# client. Its value is specificity: "this ITT requires £10m PI insurance and
+# £5m turnover — confirm you hold these", "an incumbent is in place", "deadline
+# is in 3 working days".
+#
+# SAME PHILOSOPHY AS THE REST OF THE SYSTEM
+#   - No invention. Every criterion is answered from the ITT, the vault, or the
+#     feedback streams, or marked `unknown` with a reason. Never guessed.
+#   - Human decides — absolutely. The engine warns; it never auto-declines and
+#     never refuses to proceed.
+#   - Tenant isolation. All vault / BidPricingHistory / BidFeedbackRecord reads
+#     are tenant_id filtered, exactly as in cross_cutting_rules.
+#   - Honest over flattering. A blunt warning serves the client better than a
+#     hopeful silence — but it stays a warning, not a veto.
+
+schema_version: "1.0"
+pairs_with_templates_yaml: "1.6"
+loaded_by: brief engine (recommendation) and package gate (pre-payment check)
+
+# =============================================================================
+# INPUTS — gathered before the assessment runs
+# =============================================================================
+
+go_no_go:
+  description: >
+    A standardised, evidence-grounded decision on whether the tenant should
+    pursue a tender. Produces Go / Conditional / No-Go with per-pillar scores,
+    blocking reasons, conditions to resolve, and the information still missing.
+    Inexperienced bidders start writing before reviewing the documents; this
+    gate forces the review first.
+
+  inputs:
+    inherits: shared_inputs        # from templates.yaml (question/criteria not
+                                   # needed here; buyer_context IS)
+    tender_level:
+      contract_value_gbp:
+        type: number
+        note: "from the tender record; may be a range or null"
+      contract_duration_years:
+        type: number
+      submission_deadline:
+        type: date
+      working_days_remaining:
+        type: integer
+        note: "derived from deadline vs today; drives the time hard-block"
+      region:
+        type: string
+      sector:
+        type: string
+      incumbent_present:
+        type: boolean
+        note: "is there a sitting provider? affects winnability"
+      tupe_in_scope:
+        type: boolean
+      mandatory_requirements:
+        type: list[string]
+        note: "verbatim pass/fail gates from the ITT: minimum turnover, required
+               certifications, insurance levels, accreditations, framework
+               membership, etc."
+
+# =============================================================================
+# RED WARNINGS — the strongest class of warning (never a block)
+# =============================================================================
+# These are the conditions most likely to cost the client. They are surfaced
+# PROMINENTLY before payment and feed the client self-certification questions.
+# They do NOT block payment or generation — the client may proceed anyway, and
+# that is their right. "Red" sets the brief's headline tone (e.g. "no_bid")
+# purely as information.
+
+  red_warnings:
+    mandatory_requirement_unmet:
+      test: >
+        For each mandatory_requirement, resolve it against the vault (turnover
+        from accounts, certs with valid expiry, insurance levels, accreditations).
+        If any mandatory requirement appears provably NOT met, raise a red
+        warning naming the specific requirement and ask the client to confirm.
+      grounded_in: [vault, tender.mandatory_requirements]
+      on_unknown: "do NOT assert unmet on unknown; record as missing_info, ask
+                   the client to confirm, downgrade confidence."
+    cannot_deliver_to_standard:
+      test: >
+        No vault evidence of capability/capacity to deliver the core scope to
+        the required standard, and no obvious route to acquire it within the
+        mobilisation window. Warn; the client may know capacity we cannot see.
+      grounded_in: [vault, tender.specification]
+    likely_unprofitable:
+      test: >
+        BidPricingHistory and the cost base suggest the deliverable price may
+        not cover delivered cost at the buyer's likely price point. Warn so the
+        client prices with eyes open; never refuse to proceed.
+      grounded_in: [BidPricingHistory]
+      on_unknown: "if no comparable pricing history, flag profit as unmodelled
+                   and reflect in confidence — do not warn as if proven."
+    tight_deadline:
+      test: >
+        working_days_remaining looks short for a compliant, evidenced response
+        of this size/complexity. Warn with the number of days; the client
+        decides if it is doable.
+      grounded_in: [tender.working_days_remaining, tender.complexity]
+
+# =============================================================================
+# ASSESSMENT — three pillars, each a set of grounded, scored criteria
+# =============================================================================
+# Score each criterion: 2 = yes/strong, 1 = partial/uncertain, 0 = no/weak,
+# null = unknown (with reason; counts against confidence, not against the score).
+
+  assessment:
+
+    pillar_1_strategic_fit:
+      weight_pct: 25
+      description: "Is this worth pursuing at all?"
+      criteria:
+        aligns_with_strategy:
+          question: "Does the scope match what the tenant actually does and wants to win?"
+          grounded_in: [vault.capabilities, tender.specification]
+        wants_this_buyer:
+          question: "Based on reputation/experience, does the tenant want to work with this buyer?"
+          grounded_in: [BidFeedbackRecord, vault.past_contracts]
+        resource_headroom:
+          question: "Can the tenant bid AND deliver this without starving better live opportunities?"
+          grounded_in: [tenant.current_pipeline]
+          on_unknown: "flag; pipeline data may be outside the platform"
+        worth_the_bid_cost:
+          question: "Is expected value (value x realistic win probability) worth the bid effort + package fee?"
+          grounded_in: [tender.contract_value_gbp, pillar_2 score]
+
+    pillar_2_winnability:
+      weight_pct: 35
+      description: "Do we have a realistic chance of winning?"
+      criteria:
+        buyer_relationship:
+          question: "Existing positive relationship with the buyer or decision-maker?"
+          grounded_in: [vault.past_contracts, BidPricingHistory]
+        affordable_compliant_solution:
+          question: "Can the tenant offer a solution that is both suitable AND affordable to the buyer?"
+          grounded_in: [vault.capabilities, BidPricingHistory]
+        competitive_position:
+          question: "How strong is likely competition, and does anyone have a structural edge (incumbent, scale, price)?"
+          grounded_in: [tender.incumbent_present, sector_knowledge]
+          note: "incumbent_present with no differentiator is a strong negative"
+        can_produce_a_compelling_bid:
+          question: "Resources and evidence to WRITE a winning bid (not just deliver)? Vault depth on this question type?"
+          grounded_in: [vault, BidFeedbackRecord]
+        track_record_here:
+          question: "Win rate on comparable work (sector, value band, buyer type)?"
+          grounded_in: [BidPricingHistory]
+          on_unknown: "mark unmodelled; reflect in confidence"
+
+    pillar_3_deliverability:
+      weight_pct: 40
+      description: "Can we deliver what we would promise — to standard, on budget, at a profit?"
+      note: "Highest weight. Two of its concerns (standard, profit) are ALSO hard blocks above; here they are scored for the borderline cases that clear the block but remain weak."
+      criteria:
+        resources_in_place:
+          question: "Does the tenant already have the resources to deliver?"
+          grounded_in: [vault.capabilities, vault.team]
+        resources_obtainable:
+          question: "If not in place, can they be acquired within mobilisation (recruitment, subcontract, TUPE)?"
+          grounded_in: [vault, tender.tupe_in_scope, tender.mobilisation_window]
+        relevant_experience:
+          question: "Demonstrable experience delivering THIS type of service at this scale?"
+          grounded_in: [vault.case_studies]
+          note: "reuse the six-axis case-study relevance match from templates.yaml"
+        deliver_to_standard_and_budget_at_profit:
+          question: "Can deliver to the standard and budget while still making a profit?"
+          grounded_in: [BidPricingHistory, cost_base]
+
+# =============================================================================
+# SCORING — combine pillars into a decision
+# =============================================================================
+
+  scoring:
+    note: >
+      This produces an ADVISORY rating for the brief and the warnings shown to
+      the client. It is never enforced. The client always decides.
+    method: >
+      1. Raise any red_warnings first and attach them to the output. A red
+         warning sets the brief's tone (it may make the headline view "no_bid")
+         but NEVER blocks payment or generation.
+      2. Score each criterion 0/1/2 (null = unknown, excluded from the
+         denominator but recorded). Compute each pillar as a percentage of its
+         achievable points, then a weighted total using the pillar weights.
+      3. Map the weighted total to a recommendation band (information only).
+      4. Apply the confidence rule: the more criteria scored `unknown`, the
+         lower the confidence, regardless of the band.
+    bands:   # advisory labels shown to the client, not enforced
+      go:
+        when: "weighted_total >= 70% AND no pillar below 50% AND no red warning"
+      conditional:
+        when: "weighted_total 50-69%, OR a single resolvable weakness (e.g. one
+               missing-but-obtainable resource, one clarification needed from the
+               buyer). Output the explicit points the client may want to resolve."
+      no_go:
+        when: "weighted_total < 50%, OR any pillar below a viable floor, OR a
+               red warning present. (Still advisory — the client may proceed.)"
+    confidence:
+      high: "few/no unknowns; pricing and win-rate modelled from history"
+      medium: "some unknowns; partial history"
+      low: ">30% of criteria unknown, OR no comparable BidPricingHistory/
+             BidFeedbackRecord at all (new sector for this tenant)"
+
+# =============================================================================
+# EVIDENCE / GROUNDING RULES
+# =============================================================================
+
+  grounding_rules:
+    - "No criterion is answered from training data or assumption. It is answered
+       from the ITT, the vault, BidPricingHistory, or BidFeedbackRecord — or it
+       is `unknown` with a reason."
+    - "Every non-null criterion carries the source(s) it was grounded in, the
+       same way drafts carry vault_citations."
+    - "Unknowns are surfaced as missing_info for the human to resolve, never
+       silently scored as pass or fail."
+    - "All reads are tenant_id filtered. No cross-tenant inference of win rates,
+       pricing, or capability."
+
+# =============================================================================
+# CLIENT SELF-CERTIFICATION — the only gate, and the client owns it
+# =============================================================================
+# After the brief + warnings are shown and BEFORE payment, the client answers a
+# short, plain self-check. Their answers are recorded (audit trail). Saying "no"
+# does not block them — it just means they proceed having seen the warning.
+# Saying "yes" is their certification; we then take payment and generate.
+
+  client_self_certification:
+    shown_with: "the brief recommendation + all red_warnings + missing_info"
+    questions:
+      - id: has_documents
+        ask: "Do you have all the documents and information this tender requires?"
+        type: yes_no
+      - id: qualifies
+        ask: "Do you meet the mandatory requirements to qualify for this contract?"
+        type: yes_no
+        prefill_warning: "if a red_warning flagged a mandatory requirement, name
+                          it here so the client confirms against the specific item"
+      - id: accepts_proceed
+        ask: "You've seen our notes and warnings. Proceed to generate your bid documents?"
+        type: yes_no
+    rule: >
+      The platform never overrides these answers. Any answer permits proceeding.
+      On "proceed", take the package fee and run the drafting agent. Record the
+      certification (answers, timestamp, the warnings shown) for the audit trail.
+      Submitting underprepared is the client's choice.
+
+# =============================================================================
+# VAULT RECONCILIATION — word vs evidence (warns, never blocks)
+# =============================================================================
+# The self-certification above is the client's WORD. This gate checks that word
+# against the EVIDENCE once they populate the vault. If they certified "yes, I
+# qualify" but their uploaded accounts show £3m turnover against a £5m
+# requirement, we surface the contradiction. We never block — they may still
+# proceed — but the mismatch must be shown, and the fact that it was shown is
+# recorded (the client's protection AND the platform's).
+#
+# Runs on EVERY vault change, not once: the vault fills over time and feeds the
+# drafting, so each upload re-checks. A final pass runs at package generation.
+
+  vault_reconciliation:
+    triggers:
+      - "on vault document upload / extraction"
+      - "final pass at package generation"
+    checks:
+      certification_vs_evidence:
+        description: >
+          For each mandatory_requirement that has an extractable value (turnover,
+          insurance limit, certificate validity, accreditation, framework
+          membership), compare what the tender REQUIRES against what the vault
+          now EVIDENCES. If the client certified `qualifies = yes` but the
+          evidence shows a shortfall, raise a contradiction warning.
+        emits:
+          type: contradiction
+          fields: [requirement, required_value, evidenced_value, source_document, client_certified]
+          example: >
+            "You confirmed you qualify, but your uploaded accounts show £3m
+            turnover and this tender requires £5m. Source: Annual Accounts 2025.
+            You can still proceed."
+      expiry_validity:
+        description: "Certificate or insurance evidenced but expiring before the contract delivery period."
+        emits: { type: expiry, fields: [requirement, expiry_date, contract_end] }
+      shortfall_below_threshold:
+        description: "Evidenced value below a stated numeric threshold (insurance limit, turnover, headcount)."
+        emits: { type: shortfall, fields: [requirement, required_value, evidenced_value, source_document] }
+      missing_evidence:
+        description: >
+          Requirement with no vault evidence either way. Do NOT assert unmet —
+          prompt the client to upload or confirm. Stays a request, not a warning.
+        emits: { type: please_confirm, fields: [requirement, note] }
+    rule: >
+      Warnings only. Never blocks payment or generation. The client may proceed
+      against any contradiction. Record each warning shown + the client's choice
+      to proceed (audit trail). Re-runs and updates as the vault changes — a
+      contradiction resolved by a later upload clears automatically.
+
+
+  output:
+    schema: |
+      {
+        "recommendation": "go | conditional | no_go",   // advisory label only
+        "confidence": "high | medium | low",
+        "headline": "one sentence: the rating and the single biggest reason",
+        "weighted_total_pct": 0-100,
+        "pillar_scores": {
+          "strategic_fit_pct": 0-100,
+          "winnability_pct": 0-100,
+          "deliverability_pct": 0-100
+        },
+        "red_warnings": [
+          { "warning": "likely_unprofitable", "detail": "..." }   // shown, never blocks
+        ],
+        "points_to_resolve": [
+          "Confirm subcontractor for X capability before bidding",
+          "Seek buyer clarification on the mandatory turnover threshold"
+        ],
+        "key_reasons": [
+          { "pillar": "winnability", "point": "Incumbent present with no obvious differentiator", "weight": "high" }
+        ],
+        "missing_info": [
+          { "criterion": "track_record_here", "reason": "No comparable bids in vault for this sector/value band" }
+        ],
+        "grounded_sources": [ ... vault / history IDs consulted ... ]
+      }
+
+# =============================================================================
+# FAILURE MODES — how the warning engine goes wrong (final filter)
+# =============================================================================
+
+  failure_modes:
+    - "Optimism bias: rating winnability on hope rather than track record"
+    - "Skipping the profit warning because the contract value looks attractive"
+    - "Treating an unknown as a pass (assuming a mandatory requirement is met without checking the vault)"
+    - "Generic competition assumption not grounded in incumbent/sector reality"
+    - "Blocking, refusing payment, or overriding the client's decision — NEVER do this; warn and let them choose"
+    - "A warning with no specific reason, or a rating with no evidence — every output must be explainable"
+    - "Burying a red warning so the client doesn't see it before paying"
+    - "Hiding a tight deadline or unmet mandatory requirement the client should weigh"
