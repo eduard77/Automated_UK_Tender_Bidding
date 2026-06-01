@@ -81,6 +81,35 @@ class Settings(BaseSettings):
     proactis_discovery_include_closed: bool = False
     proactis_discovery_max_pages: int = 20
 
+    # --- Phase 4 chunk 6: accounts, Stripe, gating ---------------------------
+    # Hard env switch — when set to 'production', the dev override endpoints
+    # refuse to grant entitlements or rewrite plan tiers. Local/dev defaults
+    # to '' (any non-production value) which keeps the override usable.
+    tender_agent_env: str = ""
+
+    # Stripe (test mode). When ANY of these is empty, the billing endpoints
+    # return a clean "payments_not_configured" response and the rest of the
+    # app stays fully usable (gates run off plan + entitlement + dev flag).
+    stripe_secret_key: str = ""
+    stripe_publishable_key: str = ""
+    stripe_webhook_secret: str = ""
+
+    # Pre-created Stripe prices (test mode). These are the IDs handed over for
+    # this build; amounts live in the Stripe dashboard, not in our code.
+    stripe_price_brief_payg: str = "price_1TdURiDFsiLtuBZSzRPop0Rr"
+    stripe_price_plan_100: str = "price_1TdUSTDFsiLtuBZSKmhzgXfy"
+    stripe_price_plan_unlim: str = "price_1TdUSmDFsiLtuBZSihjbMA8k"
+
+    # Where Stripe Checkout should redirect after a successful or cancelled
+    # session. Public dashboard URL; defaults reuse dashboard_base_url.
+    stripe_success_url: str = ""
+    stripe_cancel_url: str = ""
+
+    # Session cookie name + lifetime. The cookie value is opaque — looked up
+    # in account_sessions, NOT a signed JWT — so revocation is just a DELETE.
+    session_cookie_name: str = "tender_agent_session"
+    session_lifetime_days: int = 30
+
 
 @lru_cache
 def get_settings() -> Settings:
