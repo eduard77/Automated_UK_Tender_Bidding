@@ -794,7 +794,11 @@ function LockedBriefPanel({
 
       {json.counts && <BriefPreviewCountsBlock counts={json.counts} />}
 
-      <UnlockOverlay tenderId={tenderId} surface="brief" />
+      <UnlockOverlay
+        tenderId={tenderId}
+        surface="brief"
+        showPackageCta
+      />
 
       <BriefFooter brief={brief} />
       {error && (
