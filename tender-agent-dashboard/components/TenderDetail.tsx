@@ -1,10 +1,11 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import useSWR from "swr";
 
 import PillKicker from "./PillKicker";
+import { UnlockOverlay } from "./UnlockOverlay";
 import {
   ApiError,
   cancelFetch,
@@ -19,6 +20,7 @@ import {
   type BriefDocumentConsidered,
   type BriefJson,
   type BriefKeyRisk,
+  type BriefPreviewCounts,
   type BriefScoring,
   type FetchTask,
   type RiskSeverity,
@@ -26,6 +28,7 @@ import {
   type TenderBrief,
   type TenderDocumentFile,
 } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import {
   absoluteDeadline,
   daysUntil,
@@ -36,6 +39,7 @@ import {
 } from "@/lib/format";
 
 export default function TenderDetail({ id }: { id: number }) {
+  const { me } = useAuth();
   const tender = useSWR<Tender>(`/tenders/${id}`, fetcher, {
     revalidateOnFocus: false,
   });
@@ -49,6 +53,17 @@ export default function TenderDetail({ id }: { id: number }) {
     fetcher,
     { revalidateOnFocus: false },
   );
+
+  // When the user signs in or out the backend gating contract changes
+  // (locked preview ↔ full brief). Re-run the brief fetch so the page
+  // doesn't strand on a stale half-preview after login. Keyed by account
+  // id rather than the whole `me` object so we don't churn on identical
+  // re-renders.
+  const accountId = me?.id ?? null;
+  const briefMutate = brief.mutate;
+  useEffect(() => {
+    void briefMutate();
+  }, [accountId, briefMutate]);
 
   const [fetchTask, setFetchTask] = useState<FetchTask | null>(null);
   const [fetchError, setFetchError] = useState<string | null>(null);
@@ -649,6 +664,22 @@ function BriefComplete({
 }) {
   const json = brief.brief_json;
   if (!json) return null;
+
+  // Server-side gating: the backend strips most fields and sets
+  // `brief_json.locked = true` for anonymous / unentitled callers. The
+  // client never reconstructs the hidden content — it just shows the
+  // preview and lets UnlockOverlay drive the funnel.
+  if (json.locked) {
+    return (
+      <LockedBriefPanel
+        tenderId={brief.tender_id}
+        json={json}
+        brief={brief}
+        error={error}
+      />
+    );
+  }
+
   return (
     <section className="space-y-10">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -664,7 +695,7 @@ function BriefComplete({
       </div>
 
       <RecommendationBanner brief={json} />
-      <KeyRisks risks={json.key_risks} />
+      <KeyRisks risks={json.key_risks ?? []} />
 
       <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
         <DeadlineCard deadline={json.deadline} />
@@ -707,7 +738,147 @@ function BriefComplete({
   );
 }
 
+/**
+ * Half-preview brief panel shown when the backend has redacted the brief
+ * for an anonymous or unentitled caller (`brief_json.locked === true`).
+ *
+ * We only render what the server chose to leak (headline, scope_summary)
+ * and the counts block ("3 key risks identified"). The UnlockOverlay
+ * carries the funnel — it posts to /billing/checkout and redirects.
+ */
+function LockedBriefPanel({
+  tenderId,
+  json,
+  brief,
+  error,
+}: {
+  tenderId: number;
+  json: BriefJson;
+  brief: TenderBrief;
+  error: string | null;
+}) {
+  return (
+    <section className="space-y-8">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="section-eyebrow">Bid brief — preview</div>
+        <PillKicker withDot={false}>
+          <span className="text-amber">🔒 First half · preview</span>
+        </PillKicker>
+      </div>
+
+      {json.headline && (
+        <div
+          className="rounded-2xl border border-amber/30 bg-amber/5 p-7 backdrop-blur-md"
+          style={{ borderRadius: "22px" }}
+        >
+          <div className="section-eyebrow mb-4">Headline</div>
+          <p
+            className="text-text"
+            style={{ fontSize: "18px", lineHeight: 1.55, fontWeight: 500 }}
+          >
+            {json.headline}
+          </p>
+        </div>
+      )}
+
+      {json.scope_summary && (
+        <BriefSection title="Scope summary">
+          <p
+            className="max-w-3xl text-text"
+            style={{ fontSize: "16px", lineHeight: 1.7 }}
+          >
+            {json.scope_summary}
+          </p>
+        </BriefSection>
+      )}
+
+      {json.counts && <BriefPreviewCountsBlock counts={json.counts} />}
+
+      <UnlockOverlay tenderId={tenderId} surface="brief" />
+
+      <BriefFooter brief={brief} />
+      {error && (
+        <p role="alert" className="text-danger" style={{ fontSize: "13px" }}>
+          {error}
+        </p>
+      )}
+    </section>
+  );
+}
+
+/**
+ * The "3 key risks identified · 6 mandatory requirements · …" strip shown
+ * above the unlock overlay. Numbers come straight from the backend's
+ * `counts` block; we never compute them client-side.
+ */
+function BriefPreviewCountsBlock({ counts }: { counts: BriefPreviewCounts }) {
+  const items: Array<{ label: string; value: number }> = [];
+  if (typeof counts.key_risks_count === "number") {
+    items.push({ label: "Key risks identified", value: counts.key_risks_count });
+  }
+  if (typeof counts.mandatory_requirements_count === "number") {
+    items.push({
+      label: "Mandatory requirements",
+      value: counts.mandatory_requirements_count,
+    });
+  }
+  if (typeof counts.scoring_criteria_count === "number") {
+    items.push({
+      label: "Scoring criteria",
+      value: counts.scoring_criteria_count,
+    });
+  }
+  if (typeof counts.notable_conditions_count === "number") {
+    items.push({
+      label: "Notable conditions",
+      value: counts.notable_conditions_count,
+    });
+  }
+  if (typeof counts.missing_or_unclear_count === "number") {
+    items.push({
+      label: "Items to clarify",
+      value: counts.missing_or_unclear_count,
+    });
+  }
+  if (items.length === 0) return null;
+  return (
+    <BriefSection title="What's in the full brief">
+      <div
+        className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3"
+        role="list"
+      >
+        {items.map((item) => (
+          <div
+            key={item.label}
+            role="listitem"
+            className="rounded-xl border border-border bg-bg-elevated p-4 backdrop-blur-sm"
+            style={{ borderRadius: "16px" }}
+          >
+            <div
+              className="font-display text-text"
+              style={{ fontSize: "28px", fontWeight: 500 }}
+            >
+              {item.value}
+            </div>
+            <div
+              className="text-text-muted"
+              style={{ fontSize: "12px", letterSpacing: "0.06em", textTransform: "uppercase" }}
+            >
+              {item.label}
+            </div>
+          </div>
+        ))}
+      </div>
+    </BriefSection>
+  );
+}
+
 function RecommendationBanner({ brief }: { brief: BriefJson }) {
+  // brief_json fields are optional at the wire layer because a locked
+  // preview may omit them. In the unlocked render path the server always
+  // populates these; guard anyway so a malformed payload can't crash the
+  // page.
+  if (!brief.recommendation || !brief.confidence) return null;
   const palette =
     brief.recommendation === "bid"
       ? {

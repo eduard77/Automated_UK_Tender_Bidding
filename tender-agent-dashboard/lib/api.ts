@@ -135,12 +135,38 @@ export interface BriefScoring {
   criteria?: BriefScoringCriterion[];
 }
 
+/**
+ * Counts block the backend includes in a locked brief preview so the UI can
+ * say "3 key risks identified" without leaking the risk text. See
+ * services/accounts/entitlement.redact_brief_json.
+ */
+export interface BriefPreviewCounts {
+  key_risks_count?: number;
+  mandatory_requirements_count?: number;
+  notable_conditions_count?: number;
+  missing_or_unclear_count?: number;
+  scoring_criteria_count?: number;
+}
+
+export interface BriefUnlockHint {
+  reason: string;
+  message: string;
+}
+
 export interface BriefJson {
-  recommendation: BriefRecommendation;
-  confidence: BriefConfidence;
-  headline: string;
-  rationale: string;
-  key_risks: BriefKeyRisk[];
+  // Server-side redaction marker. When true, the rest of this object is the
+  // allow-listed preview shape — most fields will be absent.
+  locked?: boolean;
+  counts?: BriefPreviewCounts;
+  unlock?: BriefUnlockHint;
+
+  // Full-brief fields. All optional at the wire layer because a locked
+  // preview strips most of them out.
+  recommendation?: BriefRecommendation;
+  confidence?: BriefConfidence;
+  headline?: string;
+  rationale?: string;
+  key_risks?: BriefKeyRisk[];
   deadline?: BriefDeadline | null;
   contract_value?: BriefContractValue | null;
   mandatory_requirements?: string[];
