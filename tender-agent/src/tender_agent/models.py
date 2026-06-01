@@ -833,3 +833,111 @@ class SubmissionPackagePayment(Base):
     )
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+
+# ---------------------------------------------------------------------------
+# Submission-package generator (drafting spine).
+# Drafts are NEVER auto-submitted — these tables exist purely to record what
+# the drafting agent produced for a human reviewer. The status enum has no
+# "submitted" state by design; portal submission lives on a different rail
+# (FetchTask + the portal adapters) and is human-gated permanently.
+# ---------------------------------------------------------------------------
+
+
+class SubmissionPackage(Base):
+    """A bundle of question drafts for one tender. Created on the first
+    POST to the draft endpoint and reused by later questions on the same
+    tender."""
+
+    __tablename__ = "submission_packages"
+    __table_args__ = (
+        Index("ix_submission_packages_tender_id", "tender_id"),
+        Index("ix_submission_packages_org_id", "org_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    tender_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("tenders.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    org_id: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # 'drafting' | 'needs_review'
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="drafting")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    drafts: Mapped[list[SubmissionQuestionDraft]] = relationship(
+        back_populates="package",
+        cascade="all, delete-orphan",
+        order_by="SubmissionQuestionDraft.created_at",
+    )
+
+
+class SubmissionQuestionDraft(Base):
+    """One drafted question — the result of running the drafting agent
+    against a single template (technical_capability / methodology_delivery /
+    social_value / quality_management / risk_contingency in this chunk).
+
+    status:
+      'needs_review' — draft passed all blocking validators; human is asked
+                       to review and approve.
+      'incomplete'   — a blocking validator failed and the agent surfaced
+                       it; the draft is stored so the reviewer can see why,
+                       but it is NOT signalled as ready.
+    There is intentionally NO 'submitted' state on this table — submission
+    is a portal-level action behind a Temporal-driven human checkpoint.
+    """
+
+    __tablename__ = "submission_question_drafts"
+    __table_args__ = (
+        Index(
+            "ix_submission_question_drafts_package_id", "package_id"
+        ),
+        Index(
+            "ix_submission_question_drafts_tender_id", "tender_id"
+        ),
+        Index("ix_submission_question_drafts_org_id", "org_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    package_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("submission_packages.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    tender_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("tenders.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    org_id: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    template_id: Mapped[str] = mapped_column(String(48), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(16), nullable=False)
+    # Question reference — label / verbatim text hash. Lets the reviewer
+    # see which question this draft answers without storing the verbatim
+    # ITT text (copyright).
+    question_ref: Mapped[str] = mapped_column(Text, nullable=False)
+    structured_content: Mapped[dict | None] = mapped_column(JSONB)
+    vault_citations: Mapped[list | None] = mapped_column(JSONB)
+    confidence_scores: Mapped[dict | None] = mapped_column(JSONB)
+    unfilled_slots: Mapped[list | None] = mapped_column(JSONB)
+    validation_report: Mapped[dict | None] = mapped_column(JSONB)
+    # 'needs_review' | 'incomplete' — see class docstring.
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="needs_review"
+    )
+    # Optional model + token usage for cost tracking.
+    model: Mapped[str | None] = mapped_column(String(64))
+    input_tokens: Mapped[int | None] = mapped_column(Integer)
+    output_tokens: Mapped[int | None] = mapped_column(Integer)
+    error_detail: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    package: Mapped[SubmissionPackage] = relationship(back_populates="drafts")
+
