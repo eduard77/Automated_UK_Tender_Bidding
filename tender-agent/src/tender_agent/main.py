@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from tender_agent import scheduler
 from tender_agent.api import accounts as accounts_api
@@ -65,6 +66,19 @@ app = FastAPI(
     version="0.1.0",
     description="UK public tender discovery and bid automation agent",
     lifespan=lifespan,
+)
+
+# CORS — explicit allow-list of dashboard origins from settings.
+# The dashboard calls every endpoint with `credentials: "include"` to carry
+# the session cookie, which means the browser will refuse a wildcard
+# `Access-Control-Allow-Origin: *`. Stick to the configured list. See
+# Settings.cors_allow_origins for the env-var override.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_allow_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
