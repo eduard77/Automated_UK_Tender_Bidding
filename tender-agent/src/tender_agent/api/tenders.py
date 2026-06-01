@@ -8,8 +8,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from tender_agent.api.deps import current_account
 from tender_agent.db import get_db
 from tender_agent.models import (
+    Account,
     FilterMatch,
     Tender,
     TenderDocumentContent,
@@ -24,6 +26,10 @@ from tender_agent.schemas import (
     TenderRequirementsRead,
     TenderSearchResponse,
     TenderSearchResult,
+)
+from tender_agent.services.accounts.entitlement import (
+    half_preview_text,
+    is_entitled,
 )
 from tender_agent.services.brief.content_store import EXTRACTOR_VERSION
 from tender_agent.services.tender_search import (
@@ -183,3 +189,69 @@ def get_documents(
         row.content_stored = bool(f.sha256 and f.sha256 in stored)
         out.append(row)
     return out
+
+
+@router.get("/{tender_id}/documents/{doc_id}/content")
+def get_document_content(
+    tender_id: int,
+    doc_id: int,
+    account: Account | None = Depends(current_account),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Extracted-text view (chunk 6 gate).
+
+    Entitled callers receive the FULL extracted text plus `locked=False`.
+    Anonymous / unentitled callers receive the first 50% of the text with a
+    lock marker appended and `locked=True`. The full text is never sent to
+    an unentitled client — test suite asserts the second-half substring is
+    physically absent from the response body.
+    """
+    doc = db.get(TenderDocumentFile, doc_id)
+    if doc is None or doc.tender_id != tender_id:
+        raise HTTPException(status_code=404, detail="document not found")
+
+    # Prefer the canonical TenderDocumentContent row by (sha, extractor_version);
+    # fall back to the file row's inline text_extracted if no content row yet.
+    text: str | None = None
+    if doc.sha256:
+        row = db.execute(
+            select(TenderDocumentContent)
+            .where(TenderDocumentContent.sha256 == doc.sha256)
+            .where(TenderDocumentContent.extractor_version == EXTRACTOR_VERSION)
+            .order_by(TenderDocumentContent.created_at.desc())
+        ).scalars().first()
+        if row is not None:
+            text = row.extracted_text
+    if text is None:
+        text = doc.text_extracted
+
+    full_chars = len(text) if text else 0
+    if is_entitled(db, account=account, tender_id=tender_id):
+        return {
+            "doc_id": doc_id,
+            "tender_id": tender_id,
+            "title": doc.title,
+            "format": doc.format,
+            "locked": False,
+            "char_count": full_chars,
+            "preview_chars": full_chars,
+            "text": text or "",
+        }
+    preview, _truncated = half_preview_text(text)
+    return {
+        "doc_id": doc_id,
+        "tender_id": tender_id,
+        "title": doc.title,
+        "format": doc.format,
+        "locked": True,
+        "char_count": full_chars,
+        "preview_chars": len(preview),
+        "text": preview,
+        "unlock": {
+            "reason": "document_locked",
+            "message": (
+                "Document is locked. Buy a single brief (£10) or subscribe "
+                "to read the full text and download."
+            ),
+        },
+    }

@@ -19,9 +19,11 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from tender_agent.api.deps import current_account
 from tender_agent.config import settings
 from tender_agent.db import SessionLocal, get_db
-from tender_agent.models import FetchTask, Tender, TenderDocumentFile
+from tender_agent.models import Account, FetchTask, Tender, TenderDocumentFile
+from tender_agent.services.accounts.entitlement import is_entitled
 from tender_agent.services.portal_orchestrator import PortalOrchestrator
 from tender_agent.services.portals.contracts_finder import secure_filename
 
@@ -219,8 +221,25 @@ def cancel_fetch(
 
 @router.get("/{tender_id}/documents/{doc_id}/file")
 def serve_document_file(
-    tender_id: int, doc_id: int, db: Session = Depends(get_db)
+    tender_id: int,
+    doc_id: int,
+    account: Account | None = Depends(current_account),
+    db: Session = Depends(get_db),
 ) -> FileResponse:
+    # Gate (chunk 6): the raw download is FULL content, so it requires an
+    # entitlement for this tender. Anonymous + free / unentitled callers get
+    # 402 — they should be hitting the half-preview text endpoint instead.
+    if not is_entitled(db, account=account, tender_id=tender_id):
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "code": "payment_required",
+                "message": (
+                    "Full document download is locked. Buy a single brief "
+                    "(£10) or subscribe to unlock."
+                ),
+            },
+        )
     doc = db.get(TenderDocumentFile, doc_id)
     if doc is None or doc.tender_id != tender_id:
         raise HTTPException(status_code=404, detail="document not found")
