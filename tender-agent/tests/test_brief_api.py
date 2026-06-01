@@ -21,6 +21,7 @@ from tender_agent.models import (
     TenderBrief,
     TenderDocumentFile,
 )
+from tests._auth_helpers import authenticate_unlimited
 
 
 @pytest.fixture()
@@ -38,6 +39,15 @@ def session() -> Session:
 
 @pytest.fixture()
 def client(session: Session, monkeypatch) -> TestClient:
+    """TestClient that is already authenticated as a plan_unlimited account.
+
+    Chunk 6 gates the brief endpoints — anonymous callers receive a 50%
+    teaser (and 401/402 on writes). These tests pre-date the gate and
+    assert the entitled behaviour, so we lift the client past the gate
+    once at fixture level. The dev override is the same path the dashboard
+    will use for local testing before Stripe keys are wired up; it's
+    refused in production (TENDER_AGENT_ENV=production).
+    """
     # Never run real generation during endpoint tests.
     async def _noop(brief_id: int, tender_id: int) -> None:
         return None
@@ -48,8 +58,10 @@ def client(session: Session, monkeypatch) -> TestClient:
         yield session
 
     app.dependency_overrides[get_db] = override
+    tc = TestClient(app)
     try:
-        yield TestClient(app)
+        authenticate_unlimited(tc)
+        yield tc
     finally:
         app.dependency_overrides.pop(get_db, None)
 
