@@ -693,3 +693,143 @@ class FetchTask(Base):
     )
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+
+# ---------------------------------------------------------------------------
+# Phase 4 chunk 6 — accounts, plans, brief entitlements, submission payments.
+# Search stays anonymous; these tables back the optional logged-in tiers and
+# the per-tender unlock model documented in api/accounts.py & services/billing.
+# ---------------------------------------------------------------------------
+
+
+class Account(Base):
+    """A registered user. Email + password (hashed); free alert subscribers
+    have plan='free' and never touch Stripe."""
+
+    __tablename__ = "accounts"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    email: Mapped[str] = mapped_column(String(320), unique=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    # plan = 'free' | 'payg' | 'plan_100' | 'plan_unlimited'.
+    # 'payg' just means "has bought one or more single briefs"; entitlement
+    # rows are the source of truth for what they can SEE — plan only controls
+    # the monthly allowance.
+    plan: Mapped[str] = mapped_column(String(24), nullable=False, default="free")
+    stripe_customer_id: Mapped[str | None] = mapped_column(String(64))
+    current_period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    brief_generations_this_period: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    period_anchor: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    entitlements: Mapped[list[BriefEntitlement]] = relationship(
+        back_populates="account", cascade="all, delete-orphan"
+    )
+    sessions: Mapped[list[AccountSession]] = relationship(
+        back_populates="account", cascade="all, delete-orphan"
+    )
+
+
+class AccountSession(Base):
+    """Server-side session token table. We don't sign cookies — we store the
+    opaque token here and look it up. Tokens are random URL-safe strings."""
+
+    __tablename__ = "account_sessions"
+    __table_args__ = (
+        Index("ix_account_sessions_account_id", "account_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    account_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    token: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+    account: Mapped[Account] = relationship(back_populates="sessions")
+
+
+class BriefEntitlement(Base):
+    """One row = `account` may view the FULL brief + FULL documents for
+    `tender`. PAYG grants exactly one entitlement; plans (plan_100,
+    plan_unlimited) create one on each first-time brief generation.
+
+    Plans do NOT auto-grant access to every tender — they enable on-demand
+    generation. The entitlement is what unlocks viewing later, and survives
+    a plan downgrade so already-bought reads remain visible (we never delete
+    audit history)."""
+
+    __tablename__ = "brief_entitlements"
+    __table_args__ = (
+        UniqueConstraint("account_id", "tender_id", name="uq_brief_entitlement"),
+        Index("ix_brief_entitlements_account_id", "account_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    account_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    tender_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("tenders.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # 'payg' | 'plan' | 'dev'  — dev is only writable when not in production.
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    granted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    account: Mapped[Account] = relationship(back_populates="entitlements")
+
+
+class SubmissionPackagePayment(Base):
+    """Per-tender, per-account record of a paid (or pending) submission-package
+    fee. The fee is dynamic (0.5% of contract_value clamped £100–£300) and
+    charged upfront via a one-off Stripe Checkout Session. Status flips to
+    'paid' on `checkout.session.completed`. NEVER on subscription."""
+
+    __tablename__ = "submission_package_payments"
+    __table_args__ = (
+        Index(
+            "ix_subpkg_account_tender",
+            "account_id",
+            "tender_id",
+        ),
+        Index("ix_subpkg_checkout_session", "stripe_checkout_session_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    account_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    tender_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("tenders.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    amount_pence: Mapped[int] = mapped_column(Integer, nullable=False)
+    currency: Mapped[str] = mapped_column(String(8), nullable=False, default="GBP")
+    # 'pending' | 'paid' | 'cancelled'
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    stripe_checkout_session_id: Mapped[str | None] = mapped_column(String(128))
+    stripe_payment_intent_id: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
