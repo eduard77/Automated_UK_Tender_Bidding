@@ -6,13 +6,23 @@ reasons; new admin endpoints land here.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from tender_agent.config import settings
 from tender_agent.db import get_db
 from tender_agent.models import Tender
 from tender_agent.schemas import TenderRequirementsRead
+from tender_agent.services.discovery.proactis_discovery import (
+    DiscoveryRunResult,
+)
+from tender_agent.services.discovery.proactis_discovery import (
+    run_blocking as run_proactis_discovery_blocking,
+)
+from tender_agent.services.discovery.proactis_filter_config import (
+    ProactisFilterConfig,
+)
 from tender_agent.services.requirements_extractor import extract_requirements
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -74,3 +84,70 @@ def trigger_extract_requirements(
             detail="extractor failed — check logs for requirements.api_error / parse_failed",
         )
     return record
+
+
+# ---------------------------------------------------------------------------
+# Proactis discovery (chunk 9)
+# ---------------------------------------------------------------------------
+
+
+class ProactisDiscoveryTriggerResponse(BaseModel):
+    """Response body for the manual discovery trigger. The endpoint kicks the
+    run off in the background, so this is just an ack — the actual outcome is
+    written to the `poll_runs` row referenced by `poll_run_id_hint` (or
+    inspectable via structured `discovery.proactis.*` log events)."""
+
+    status: str  # "scheduled"
+    detail: str
+
+
+@router.post(
+    "/discovery/proactis/run",
+    status_code=202,
+    response_model=ProactisDiscoveryTriggerResponse,
+)
+def trigger_proactis_discovery(
+    background_tasks: BackgroundTasks,
+) -> ProactisDiscoveryTriggerResponse:
+    """Manually trigger a Proactis (procontract.due-north.com) discovery run.
+
+    Background-only — the run happens in a worker thread so the HTTP response
+    returns immediately (browser-driven discovery takes minutes, not seconds).
+    The bridge must be reachable AND the operator must be logged in at the
+    bridge window; the run logs `discovery.proactis.needs_login` if not and
+    finishes cleanly without raising.
+
+    Filter config comes from `settings.proactis_discovery_*` (Step 1). Step 2
+    will wire the dashboard's main filter page to this same config object.
+    """
+    config = ProactisFilterConfig(
+        keywords=settings.proactis_discovery_keywords,
+        regions=list(settings.proactis_discovery_regions),
+        categories=list(settings.proactis_discovery_categories),
+        portals=list(settings.proactis_discovery_portals),
+        organisations=list(settings.proactis_discovery_organisations),
+        include_closed=settings.proactis_discovery_include_closed,
+        max_pages=settings.proactis_discovery_max_pages,
+    )
+    background_tasks.add_task(_run_proactis_discovery_safely, config)
+    return ProactisDiscoveryTriggerResponse(
+        status="scheduled",
+        detail="Proactis discovery started in the background. Check the "
+        "`discovery.proactis.*` structured logs (or the latest `poll_runs` "
+        "row for source PROACTIS) for the outcome.",
+    )
+
+
+def _run_proactis_discovery_safely(config: ProactisFilterConfig) -> DiscoveryRunResult:
+    """Background-task wrapper. Catches every exception so a discovery
+    failure never propagates back to FastAPI's background-task runner (which
+    would just log it under a generic name); the discovery service already
+    writes structured `discovery.proactis.failed` events with full context.
+    """
+    try:
+        return run_proactis_discovery_blocking(config)
+    except Exception:  # noqa: BLE001
+        # Already logged inside `run()`; the wrapper guarantees no exception
+        # escapes BackgroundTasks. Return a synthetic "error" result so any
+        # in-process caller (tests) gets a typed object back.
+        return DiscoveryRunResult(status="error", error="exception in background task")
