@@ -1,0 +1,793 @@
+"""Proactis (procontract.due-north.com) opportunity discovery — chunk 9.
+
+Pulls Proactis opportunities INTO the `tenders` table so the existing unified
+search (chunk 7) finds them alongside CF/FTS, deduped by `procurement_ref`
+(the "DN…" reference — same shape Proactis prints on the detail page and
+Contracts Finder uses as procurement_ref).
+
+Reuses:
+- `services.portals.adapters.proactis` — PROACTIS_URLS / PROACTIS_SELECTORS,
+  `is_authenticated`, the same single-bridge-session discipline.
+- `services.bridge_client.BridgeClient` — navigate, fill, click, select-option,
+  rendered-html, wait-for-login.
+- `services.ingestion._upsert_tender` — UPSERT + change-hash + first_seen /
+  last_seen.
+- `services.deduplicator.find_duplicate` — cross-source dedup by
+  procurement_ref (+ fuzzy buyer/title/value fallback).
+- `services.regions.resolve_for_tender` — canonical region from buyer_region /
+  raw addresses.
+
+The flow:
+1. ensure_authenticated (reuse adapter's is_authenticated). If not
+   authenticated, wait for human login at the bridge window; if the wait
+   times out, surface as `needs_login` and finish the run.
+2. Navigate to /Opportunities/Index, APPLY the configured filters (keywords,
+   regions, categories, include_closed=False), click Update.
+3. WALK pages: read rows (Title, Buyer, Expression dates, Estimated value,
+   the advertId from the Title link), follow Next until exhausted or
+   `max_pages`.
+4. For EACH opportunity row: open /Supplier/Advert/View?advertId=...,
+   extract the DN reference + Region(s) of supply + Estimated value + dates
+   + categories + description.
+5. Build a `NormalisedTender` and call the SAME `_upsert_tender` CF/FTS use,
+   so dedup and region resolution happen identically.
+6. Record a `PollRun`-style audit row against the Proactis `Source`.
+
+Source code: "PROACTIS" (a new entry alongside FTS/CF/PCS/S2W/NI). The
+`tenders.source_ref` is the advertId (GUID, unique within Proactis);
+`procurement_ref` is the DN reference — that's the cross-source dedup key.
+"""
+from __future__ import annotations
+
+import asyncio
+import re
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime
+from decimal import Decimal, InvalidOperation
+
+import structlog
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from tender_agent.db import SessionLocal
+from tender_agent.models import PollRun, Source, Tender
+from tender_agent.schemas import NormalisedTender
+from tender_agent.services.bridge_client import BridgeClient, BridgeError
+from tender_agent.services.discovery.proactis_filter_config import (
+    ProactisFilterConfig,
+)
+from tender_agent.services.ingestion import _upsert_tender
+from tender_agent.services.portals.adapters.proactis import (
+    OPPORTUNITY_DATE_RE,
+    OPPORTUNITY_ID_RE,
+    OPPORTUNITY_VALUE_RE,
+    PROACTIS_SELECTORS,
+    PROACTIS_URLS,
+)
+
+logger = structlog.get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+#: Tender.source_code value for Proactis-discovered opportunities. Distinct
+#: from the platform_slug "procontract" the document-fetch adapter uses —
+#: source_code identifies the TENDER's origin; platform_slug identifies the
+#: PORTAL adapter that can fetch its documents.
+PROACTIS_SOURCE_CODE = "PROACTIS"
+
+#: Slug passed to the bridge (same as the document-fetch adapter so the
+#: human-supplied login is reused, not stolen).
+PROACTIS_BRIDGE_SLUG = "procontract"
+
+#: How long to wait at the bridge for a human to log in if `is_authenticated`
+#: is False at the start of a run. Beyond this we surface `needs_login`.
+LOGIN_WAIT_TIMEOUT_S = 600
+
+#: How long to wait for the filtered listing to render after Update.
+LISTING_RENDER_TIMEOUT_MS = 15_000
+
+
+# ---------------------------------------------------------------------------
+# Result types
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DiscoveredOpportunity:
+    """Everything the listing + detail page give us about one opportunity.
+
+    Constructed from rendered DOM (listing row) + plain page text (detail
+    page). All fields except `advert_id` are best-effort: a Proactis page that
+    omits the value or hides the buyer behind a logo doesn't break ingestion,
+    it just yields a `NormalisedTender` with fewer fields populated.
+    """
+
+    advert_id: str  # the GUID from the listing link; source_ref
+    dn_reference: str | None  # "DN815596" from the detail page; procurement_ref
+    title: str
+    buyer_name: str | None = None
+    buyer_region: str | None = None  # raw text "Merseyside" / "North West"
+    value_amount: Decimal | None = None
+    value_currency: str = "GBP"
+    expression_start: datetime | None = None
+    expression_end: datetime | None = None
+    contract_start: date | None = None
+    contract_end: date | None = None
+    description: str | None = None
+    categories: list[str] = field(default_factory=list)
+    keywords: list[str] = field(default_factory=list)
+    detail_url: str | None = None
+
+    def is_complete_for_dedup(self) -> bool:
+        """A row is dedup-ready iff it has the DN reference, which is the
+        cross-source key. Listing-only rows (no detail visit) aren't."""
+        return bool(self.dn_reference)
+
+
+@dataclass
+class DiscoveryRunResult:
+    """Summary of a single discovery run. Returned by `run()` and used by both
+    the admin endpoint and the scheduler to build a structured log line."""
+
+    status: str  # "ok" | "needs_login" | "error"
+    pages_walked: int = 0
+    rows_seen: int = 0
+    opportunities_inserted: int = 0
+    opportunities_updated: int = 0
+    opportunities_unchanged: int = 0
+    opportunities_deduped: int = 0  # row had a CF/FTS sibling by procurement_ref
+    error: str | None = None
+    poll_run_id: int | None = None
+
+
+class NeedsLoginError(BridgeError):
+    """Raised internally when the bridge isn't authenticated and the wait
+    timed out. The run captures this as `status=needs_login` rather than
+    re-raising, so the scheduler doesn't trip-line the whole job queue."""
+
+
+# ---------------------------------------------------------------------------
+# Public entrypoint
+# ---------------------------------------------------------------------------
+
+
+async def run(
+    *,
+    config: ProactisFilterConfig,
+    bridge: BridgeClient | None = None,
+    db_factory=SessionLocal,
+) -> DiscoveryRunResult:
+    """Run one Proactis discovery cycle and return a structured summary.
+
+    `bridge` is injectable for tests; production passes None and the default
+    `BridgeClient()` constructor (which reads `settings.bridge_url` +
+    `settings.bridge_token`) is used.
+
+    `db_factory` is injectable for tests; production uses `SessionLocal`.
+    A run owns its own session for the lifetime of the cycle so partial
+    progress is committed per-opportunity (mirrors `poll_source`).
+    """
+    bridge = bridge or BridgeClient()
+    result = DiscoveryRunResult(status="ok")
+
+    # Open a session + PollRun row up front, so even an early failure
+    # (auth, network) is auditable.
+    with db_factory() as db:
+        source = _ensure_proactis_source(db)
+        poll_run = PollRun(source_id=source.id, status="running")
+        db.add(poll_run)
+        db.commit()
+        db.refresh(poll_run)
+        result.poll_run_id = poll_run.id
+
+    logger.info(
+        "discovery.proactis.start",
+        poll_run_id=result.poll_run_id,
+        constrained=config.is_constrained(),
+        max_pages=config.max_pages,
+    )
+
+    try:
+        # --- authenticate ---------------------------------------------------
+        if not await _ensure_authenticated(bridge):
+            result.status = "needs_login"
+            _finalise_poll_run(db_factory, result)
+            logger.info(
+                "discovery.proactis.needs_login",
+                poll_run_id=result.poll_run_id,
+            )
+            return result
+
+        # --- apply filters --------------------------------------------------
+        await _apply_filters(bridge, config)
+
+        # --- walk listing ---------------------------------------------------
+        listing_rows: list[DiscoveredOpportunity] = []
+        async for row in _walk_listing(bridge, config):
+            listing_rows.append(row)
+            result.rows_seen += 1
+        result.pages_walked = _last_walked_pages
+
+        # --- read detail + upsert ------------------------------------------
+        with db_factory() as db:
+            for row in listing_rows:
+                if config.skip_detail_for_known and _already_seen(db, row.advert_id):
+                    # Touch last_seen_at via the same upsert path; we just
+                    # don't hit the detail page.
+                    continue
+                detail = await _read_detail(bridge, row)
+                if not detail.is_complete_for_dedup():
+                    logger.warning(
+                        "discovery.proactis.detail_missing_dn",
+                        advert_id=detail.advert_id,
+                    )
+                action, deduped = _upsert_from_discovered(db, detail)
+                if action == "new":
+                    result.opportunities_inserted += 1
+                elif action == "updated":
+                    result.opportunities_updated += 1
+                else:
+                    result.opportunities_unchanged += 1
+                if deduped:
+                    result.opportunities_deduped += 1
+                db.commit()
+
+    except NeedsLoginError:
+        result.status = "needs_login"
+    except Exception as exc:  # noqa: BLE001 — surfaced via PollRun
+        result.status = "error"
+        result.error = f"{type(exc).__name__}: {exc}"
+        logger.exception(
+            "discovery.proactis.failed", poll_run_id=result.poll_run_id
+        )
+    finally:
+        # Always try to release the bridge session politely. Best-effort.
+        try:
+            await bridge.close_session(PROACTIS_BRIDGE_SLUG)
+        except Exception:  # noqa: BLE001
+            logger.debug("discovery.proactis.close_session_failed")
+        _finalise_poll_run(db_factory, result)
+
+    logger.info(
+        "discovery.proactis.complete",
+        poll_run_id=result.poll_run_id,
+        status=result.status,
+        pages=result.pages_walked,
+        rows=result.rows_seen,
+        inserted=result.opportunities_inserted,
+        updated=result.opportunities_updated,
+        deduped=result.opportunities_deduped,
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Auth + filter application
+# ---------------------------------------------------------------------------
+
+
+async def _ensure_authenticated(bridge: BridgeClient) -> bool:
+    """Open a bridge session if needed and check we're logged in.
+
+    Returns False if the wait-for-login times out (operator hasn't completed
+    the human login at the bridge window). Never submits credentials.
+    """
+    # Make sure a session exists for the slug. Best-effort: open is idempotent
+    # on the bridge side.
+    try:
+        await bridge.open_session(
+            PROACTIS_BRIDGE_SLUG, start_url=PROACTIS_URLS["post_login_home"]
+        )
+    except BridgeError as exc:
+        logger.warning(
+            "discovery.proactis.session_open_failed", error=str(exc)
+        )
+        return False
+
+    # Probe authentication via the supplier home redirect rule.
+    try:
+        await bridge.navigate(
+            PROACTIS_BRIDGE_SLUG, PROACTIS_URLS["post_login_home"]
+        )
+        status = await bridge.session_status(PROACTIS_BRIDGE_SLUG)
+    except BridgeError:
+        return False
+
+    if not _is_login_url(status.get("current_url")):
+        # Already at the supplier home → authenticated.
+        return True
+
+    # Bounced to /Login/Index — wait at the visible bridge window for the
+    # operator to complete login. The pattern is "any URL that's not the
+    # login page", served by Proactis post-auth redirects.
+    logger.info("discovery.proactis.waiting_for_login")
+    try:
+        await bridge.wait_for_login(
+            PROACTIS_BRIDGE_SLUG,
+            success_url_pattern=r"^https://procontract\.due-north\.com/(?!Login).*",
+            login_url=PROACTIS_URLS["login"],
+            timeout_seconds=LOGIN_WAIT_TIMEOUT_S,
+        )
+    except BridgeError:
+        return False
+
+    # Re-probe — the login window may have closed but cookies set; navigating
+    # back to the home should now succeed.
+    try:
+        await bridge.navigate(
+            PROACTIS_BRIDGE_SLUG, PROACTIS_URLS["post_login_home"]
+        )
+        status = await bridge.session_status(PROACTIS_BRIDGE_SLUG)
+    except BridgeError:
+        return False
+    return not _is_login_url(status.get("current_url"))
+
+
+def _is_login_url(url: str | None) -> bool:
+    """A URL is "still on the login page" iff it's the login path. Anything
+    else means Proactis routed us into the authenticated area."""
+    if not url:
+        return False
+    return "/Login" in url
+
+
+async def _apply_filters(
+    bridge: BridgeClient, config: ProactisFilterConfig
+) -> None:
+    """Navigate to Find Opportunities and apply each filter the config asks
+    for. Skips controls the config doesn't constrain (empty list / blank
+    string) so a stale Proactis browser state doesn't carry forward."""
+    await bridge.navigate(PROACTIS_BRIDGE_SLUG, PROACTIS_URLS["opportunities"])
+
+    # Keywords — single text box.
+    if config.keywords.strip():
+        await bridge.fill(
+            PROACTIS_BRIDGE_SLUG,
+            PROACTIS_SELECTORS["opp_keywords_input"],
+            config.keywords.strip(),
+        )
+
+    # Include closed → "No" when we want open-only (the default). The control
+    # is a select; "Yes"/"No" labels are visible to the operator.
+    desired = "Yes" if config.include_closed else "No"
+    try:
+        await bridge.select_option(
+            PROACTIS_BRIDGE_SLUG,
+            PROACTIS_SELECTORS["opp_include_closed_select"],
+            label=desired,
+        )
+    except BridgeError:
+        # Some Proactis variants render this as a radio. Best-effort — the
+        # default ("No") is already correct on most pages.
+        logger.debug("discovery.proactis.include_closed_select_failed")
+
+    # Regions — each adds a chip via the "Add new region" control. The button
+    # opens an input/picker; we type the region name and confirm. Proactis's
+    # control varies (autocomplete input vs select); fill+Enter handles the
+    # common case.
+    for region in config.regions:
+        try:
+            await bridge.click(
+                PROACTIS_BRIDGE_SLUG,
+                PROACTIS_SELECTORS["opp_add_region_button"],
+            )
+            await bridge.fill(
+                PROACTIS_BRIDGE_SLUG,
+                PROACTIS_SELECTORS["opp_region_input"],
+                region,
+            )
+        except BridgeError as exc:
+            logger.warning(
+                "discovery.proactis.region_add_failed",
+                region=region,
+                error=str(exc),
+            )
+
+    for category in config.categories:
+        try:
+            await bridge.click(
+                PROACTIS_BRIDGE_SLUG,
+                PROACTIS_SELECTORS["opp_add_category_button"],
+            )
+            await bridge.fill(
+                PROACTIS_BRIDGE_SLUG,
+                PROACTIS_SELECTORS["opp_category_input"],
+                category,
+            )
+        except BridgeError as exc:
+            logger.warning(
+                "discovery.proactis.category_add_failed",
+                category=category,
+                error=str(exc),
+            )
+
+    # Apply.
+    await bridge.click(
+        PROACTIS_BRIDGE_SLUG, PROACTIS_SELECTORS["opp_update_button"]
+    )
+
+    # Wait for the filtered listing to render before any pagination read.
+    try:
+        await bridge.rendered_html(
+            PROACTIS_BRIDGE_SLUG,
+            wait_for_selector=PROACTIS_SELECTORS["opp_results_table"],
+            timeout_ms=LISTING_RENDER_TIMEOUT_MS,
+        )
+    except BridgeError:
+        # Listing may legitimately be empty (no matches). Fall through; the
+        # walk will yield zero rows and the run records 0 opportunities.
+        logger.debug("discovery.proactis.listing_wait_timeout")
+
+    logger.info(
+        "discovery.proactis.filters_applied",
+        keywords=bool(config.keywords.strip()),
+        regions=len(config.regions),
+        categories=len(config.categories),
+        include_closed=config.include_closed,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Listing walk
+# ---------------------------------------------------------------------------
+
+# Module-level so `run()` can read it after the async generator finishes
+# without a class wrapper. Updated only by `_walk_listing`.
+_last_walked_pages = 0
+
+
+async def _walk_listing(bridge: BridgeClient, config: ProactisFilterConfig):
+    """Yield one `DiscoveredOpportunity` (listing-only fields) per row, across
+    every page up to `max_pages`. Pagination uses Proactis's "Next" link;
+    when it's absent, we're on the last page."""
+    global _last_walked_pages
+    _last_walked_pages = 0
+    seen_advert_ids: set[str] = set()
+
+    for page_index in range(config.max_pages):
+        _last_walked_pages = page_index + 1
+        rendered = await bridge.rendered_html(
+            PROACTIS_BRIDGE_SLUG,
+            wait_for_selector=PROACTIS_SELECTORS["opp_results_table"],
+            timeout_ms=LISTING_RENDER_TIMEOUT_MS,
+        )
+        rows = _parse_listing_rows(rendered.html)
+        # Dedupe within the run — pagination glitches that show the same
+        # page twice shouldn't double-count.
+        new_rows = [r for r in rows if r.advert_id not in seen_advert_ids]
+        for r in new_rows:
+            seen_advert_ids.add(r.advert_id)
+            yield r
+        logger.info(
+            "discovery.proactis.page",
+            page=_last_walked_pages,
+            rows=len(rows),
+            new_rows=len(new_rows),
+        )
+        if not new_rows:
+            # An empty / repeating page means we've fallen off the end.
+            break
+
+        # Try to advance. If there's no Next link, this page was the last.
+        try:
+            has_next = await bridge.element_exists(
+                PROACTIS_BRIDGE_SLUG,
+                PROACTIS_SELECTORS["opp_next_page_link"],
+            )
+        except BridgeError:
+            has_next = False
+        if not has_next:
+            break
+        try:
+            await bridge.click(
+                PROACTIS_BRIDGE_SLUG,
+                PROACTIS_SELECTORS["opp_next_page_link"],
+            )
+        except BridgeError as exc:
+            logger.warning(
+                "discovery.proactis.next_page_failed", error=str(exc)
+            )
+            break
+
+
+_LISTING_ROW_RE = re.compile(
+    # Each row's title cell is a link of the form
+    #   <a href="/Supplier/Advert/View?advertId=GUID">Title text</a>
+    # Sometimes the href is just the path; sometimes absolute. We don't care —
+    # we extract the advertId GUID from the query string.
+    r'<a[^>]+href="[^"]*advertId=(?P<advert_id>[0-9a-fA-F-]{8,})"[^>]*>'
+    r"(?P<title>.*?)</a>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _parse_listing_rows(html: str) -> list[DiscoveredOpportunity]:
+    """Pull (advert_id, title) pairs out of the rendered listing HTML.
+
+    Listing-only fields: just `advert_id` + `title`. Buyer / value /
+    expression dates are stored on the same row but Proactis renders them
+    with markup variations across portals — we read them off the DETAIL page
+    where they're labelled, not from this table. Keeps the listing parser
+    cheap and robust.
+    """
+    rows: list[DiscoveredOpportunity] = []
+    for match in _LISTING_ROW_RE.finditer(html):
+        advert_id = match.group("advert_id")
+        title = _strip_tags(match.group("title")).strip()
+        if not title:
+            continue
+        detail_url = PROACTIS_URLS["advert"] % advert_id
+        rows.append(
+            DiscoveredOpportunity(
+                advert_id=advert_id,
+                dn_reference=None,
+                title=title,
+                detail_url=detail_url,
+            )
+        )
+    return rows
+
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_tags(html: str) -> str:
+    return _TAG_RE.sub("", html)
+
+
+# ---------------------------------------------------------------------------
+# Detail read
+# ---------------------------------------------------------------------------
+
+
+async def _read_detail(
+    bridge: BridgeClient, row: DiscoveredOpportunity
+) -> DiscoveredOpportunity:
+    """Open the detail page for `row` and fill in the remaining fields.
+
+    The detail page is text-heavy and label-driven. We read the plain page
+    text (faster + more robust than HTML scraping) and pick fields out by
+    well-known label proximity.
+    """
+    detail_url = row.detail_url or (PROACTIS_URLS["advert"] % row.advert_id)
+    await bridge.navigate(PROACTIS_BRIDGE_SLUG, detail_url)
+    text = await bridge.page_text(PROACTIS_BRIDGE_SLUG)
+
+    # DN reference — the dedup key.
+    m = OPPORTUNITY_ID_RE.search(text)
+    row.dn_reference = m.group(0) if m else None
+
+    # Estimated value.
+    m_val = OPPORTUNITY_VALUE_RE.search(text)
+    if m_val:
+        with __import__("contextlib").suppress(InvalidOperation):
+            row.value_amount = Decimal(m_val.group(1).replace(",", ""))
+
+    # Region(s) of supply — labelled section. Capture the line that follows.
+    row.buyer_region = _value_after_label(text, "Region(s) of supply") or \
+        _value_after_label(text, "Regions of supply") or \
+        _value_after_label(text, "Region")
+
+    # Buyer — labelled "Buyer" or "Authority" depending on tenant config.
+    row.buyer_name = _value_after_label(text, "Buyer") or \
+        _value_after_label(text, "Authority")
+
+    # Description — sits under a "Description" heading, often multi-line.
+    row.description = _block_after_label(text, "Description", max_chars=2000)
+
+    # Categories + keywords — comma-or-newline-separated under their labels.
+    row.categories = _list_after_label(text, "Categories")
+    row.keywords = _list_after_label(text, "Keywords")
+
+    # Expression-of-interest window dates.
+    row.expression_start = _date_after_label(text, "Expression start")
+    row.expression_end = (
+        _date_after_label(text, "Expression end")
+        or _date_after_label(text, "Closing date")
+        or _date_after_label(text, "Expression of interest end")
+    )
+
+    # Contract dates.
+    cs = _date_after_label(text, "Contract start")
+    ce = _date_after_label(text, "Contract end")
+    row.contract_start = cs.date() if cs else None
+    row.contract_end = ce.date() if ce else None
+
+    return row
+
+
+def _value_after_label(text: str, label: str) -> str | None:
+    """Return the trimmed first non-empty line after `label:` in `text`.
+
+    Proactis renders labels either inline (``"Buyer: Foo Council"``) or on
+    the line above the value. Both shapes are handled.
+    """
+    lower_text = text.lower()
+    lower_label = label.lower()
+    idx = lower_text.find(lower_label)
+    if idx == -1:
+        return None
+    tail = text[idx + len(label):]
+    # Strip optional trailing colon + whitespace.
+    tail = tail.lstrip(":").strip("  \t")
+    # First non-empty line.
+    for line in tail.splitlines():
+        line = line.strip()
+        if line:
+            return line[:512]
+    return None
+
+
+def _block_after_label(text: str, label: str, max_chars: int = 2000) -> str | None:
+    """Like `_value_after_label` but returns up to `max_chars` of trailing
+    text — for multi-line descriptions."""
+    lower_text = text.lower()
+    lower_label = label.lower()
+    idx = lower_text.find(lower_label)
+    if idx == -1:
+        return None
+    tail = text[idx + len(label):].lstrip(":").strip()
+    return tail[:max_chars] or None
+
+
+def _list_after_label(text: str, label: str) -> list[str]:
+    """Comma- or newline-separated values after `label`."""
+    raw = _value_after_label(text, label)
+    if not raw:
+        return []
+    parts = [p.strip() for p in re.split(r"[,\n]", raw) if p.strip()]
+    return parts[:50]  # cap absurd inputs
+
+
+def _date_after_label(text: str, label: str) -> datetime | None:
+    """Find the first dd/mm/yyyy date appearing within 80 chars after `label`."""
+    lower_text = text.lower()
+    lower_label = label.lower()
+    idx = lower_text.find(lower_label)
+    if idx == -1:
+        return None
+    window = text[idx + len(label): idx + len(label) + 200]
+    m = OPPORTUNITY_DATE_RE.search(window)
+    if not m:
+        return None
+    day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    try:
+        return datetime(year, month, day, tzinfo=UTC)
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Upsert
+# ---------------------------------------------------------------------------
+
+
+def _upsert_from_discovered(
+    db: Session, opp: DiscoveredOpportunity
+) -> tuple[str, bool]:
+    """Convert a `DiscoveredOpportunity` into a `NormalisedTender` and feed it
+    through the existing CF/FTS upsert path.
+
+    Returns (action, deduped) where:
+      - action in {"new", "updated", "unchanged"} — from `_upsert_tender`.
+      - deduped is True iff this new row was linked to an existing CF/FTS
+        record via `duplicate_of_id` (cross-source dedup happened).
+    """
+    normalised = NormalisedTender(
+        source_code=PROACTIS_SOURCE_CODE,
+        source_ref=opp.advert_id,
+        source_url=opp.detail_url or (PROACTIS_URLS["advert"] % opp.advert_id),
+        procurement_ref=opp.dn_reference,
+        title=opp.title or "(untitled)",
+        description=opp.description,
+        notice_type="opportunity",
+        status="active",  # listing filters scoped to open-only by default
+        buyer_name=opp.buyer_name,
+        buyer_country="United Kingdom",
+        buyer_region=opp.buyer_region,
+        cpv_codes=[],
+        keywords=opp.keywords,
+        value_amount=opp.value_amount,
+        value_currency=opp.value_currency,
+        deadline_at=opp.expression_end,
+        contract_start=opp.contract_start,
+        contract_end=opp.contract_end,
+        documents=[],
+        raw={
+            "advert_id": opp.advert_id,
+            "dn_reference": opp.dn_reference,
+            "discovered_via": "proactis",
+            "categories": opp.categories,
+            "expression_start": _iso(opp.expression_start),
+            "expression_end": _iso(opp.expression_end),
+        },
+    )
+    tender, action = _upsert_tender(db, normalised)
+    deduped = action == "new" and tender.duplicate_of_id is not None
+    return action, deduped
+
+
+def _iso(dt: datetime | None) -> str | None:
+    return dt.isoformat() if dt is not None else None
+
+
+def _already_seen(db: Session, advert_id: str) -> bool:
+    existing = db.execute(
+        select(Tender.id).where(
+            Tender.source_code == PROACTIS_SOURCE_CODE,
+            Tender.source_ref == advert_id,
+        )
+    ).first()
+    return existing is not None
+
+
+# ---------------------------------------------------------------------------
+# Source row + PollRun bookkeeping
+# ---------------------------------------------------------------------------
+
+
+def _ensure_proactis_source(db: Session) -> Source:
+    """Get-or-create the PROACTIS `Source` row. Proactis isn't in the
+    `ADAPTERS` registry (because it's not an HTTP-poll source), but a Source
+    row gives `PollRun` something to FK to."""
+    existing = db.execute(
+        select(Source).where(Source.code == PROACTIS_SOURCE_CODE)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+    source = Source(
+        code=PROACTIS_SOURCE_CODE,
+        name="Proactis (procontract.due-north.com)",
+        base_url="https://procontract.due-north.com",
+        enabled=True,
+    )
+    db.add(source)
+    db.commit()
+    db.refresh(source)
+    return source
+
+
+def _finalise_poll_run(
+    db_factory, result: DiscoveryRunResult
+) -> None:
+    """Write the result counters back to the PollRun row."""
+    if result.poll_run_id is None:
+        return
+    with db_factory() as db:
+        run = db.get(PollRun, result.poll_run_id)
+        if run is None:
+            return
+        run.finished_at = datetime.now(UTC)
+        run.status = result.status
+        run.fetched = result.rows_seen
+        run.new_count = result.opportunities_inserted
+        run.updated_count = result.opportunities_updated
+        run.error = result.error
+        db.commit()
+
+
+# Re-export the helpers tests want to drive directly.
+__all__ = [
+    "DiscoveredOpportunity",
+    "DiscoveryRunResult",
+    "NeedsLoginError",
+    "PROACTIS_BRIDGE_SLUG",
+    "PROACTIS_SOURCE_CODE",
+    "_apply_filters",
+    "_parse_listing_rows",
+    "_read_detail",
+    "_upsert_from_discovered",
+    "_walk_listing",
+    "run",
+]
+
+
+# Convenience for the admin endpoint: a sync wrapper so a thread-pool
+# handler can fire the coroutine without needing its own event loop dance.
+def run_blocking(config: ProactisFilterConfig) -> DiscoveryRunResult:
+    """Synchronous wrapper for ``run``. Used by the admin manual-trigger
+    endpoint when it executes the discovery in a background thread."""
+    return asyncio.run(run(config=config))

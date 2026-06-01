@@ -12,10 +12,37 @@ from tender_agent.adapters import ADAPTERS
 from tender_agent.config import settings
 from tender_agent.db import SessionLocal
 from tender_agent.models import Source
+from tender_agent.services.discovery.proactis_discovery import (
+    run as run_proactis_discovery,
+)
+from tender_agent.services.discovery.proactis_filter_config import (
+    ProactisFilterConfig,
+)
 from tender_agent.services.ingestion import poll_source
 
 logger = structlog.get_logger(__name__)
 _scheduler: AsyncIOScheduler | None = None
+
+
+async def proactis_discovery_job() -> None:
+    """Background Proactis discovery cycle. Constructs the filter config from
+    settings (Step 1) and runs once. Any uncaught exception is logged here so
+    the APScheduler job doesn't trip-line the whole job queue."""
+    if not settings.proactis_discovery_enabled:
+        return
+    config = ProactisFilterConfig(
+        keywords=settings.proactis_discovery_keywords,
+        regions=list(settings.proactis_discovery_regions),
+        categories=list(settings.proactis_discovery_categories),
+        portals=list(settings.proactis_discovery_portals),
+        organisations=list(settings.proactis_discovery_organisations),
+        include_closed=settings.proactis_discovery_include_closed,
+        max_pages=settings.proactis_discovery_max_pages,
+    )
+    try:
+        await run_proactis_discovery(config=config)
+    except Exception:  # noqa: BLE001
+        logger.exception("scheduler.proactis_discovery_failed")
 
 
 def ensure_sources() -> None:
@@ -62,6 +89,24 @@ def start() -> None:
         coalesce=True,
         max_instances=1,
     )
+    # Proactis discovery — runs on its own interval, only when enabled.
+    # Browser-driven and slower than HTTP polling; runs in the same
+    # AsyncIOScheduler so we get the same coalesce / max_instances safety.
+    if settings.proactis_discovery_enabled:
+        _scheduler.add_job(
+            proactis_discovery_job,
+            trigger=IntervalTrigger(
+                minutes=settings.proactis_discovery_interval_minutes
+            ),
+            id="proactis_discovery",
+            next_run_time=None,
+            coalesce=True,
+            max_instances=1,
+        )
+        logger.info(
+            "scheduler.proactis_discovery_scheduled",
+            interval_minutes=settings.proactis_discovery_interval_minutes,
+        )
     _scheduler.start()
     logger.info("scheduler.started", interval_minutes=settings.poll_interval_minutes)
 
