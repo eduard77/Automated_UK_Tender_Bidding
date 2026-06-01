@@ -64,6 +64,23 @@ class Settings(BaseSettings):
     )
     bridge_download_dir: str = "/app/data/bridge-downloads"
 
+    # --- Proactis discovery (Phase 4 chunk 9) -------------------------------
+    # Filters applied on the Find Opportunities listing for the SCHEDULED
+    # discovery job + the admin manual trigger. Step 2 will wire the
+    # dashboard's filter page to populate these (or a per-user variant);
+    # for Step 1 they're env-driven. Defaults are intentionally
+    # unconstrained-but-open-only so an unset config still does useful work:
+    # walks open opportunities only (include_closed=False).
+    proactis_discovery_enabled: bool = False
+    proactis_discovery_interval_minutes: int = 60
+    proactis_discovery_keywords: str = ""
+    proactis_discovery_regions: list[str] = Field(default_factory=list)
+    proactis_discovery_categories: list[str] = Field(default_factory=list)
+    proactis_discovery_portals: list[str] = Field(default_factory=list)
+    proactis_discovery_organisations: list[str] = Field(default_factory=list)
+    proactis_discovery_include_closed: bool = False
+    proactis_discovery_max_pages: int = 20
+
 
 @lru_cache
 def get_settings() -> Settings:
