@@ -970,3 +970,155 @@ export function formatValue(
   if (abs >= 10_000) return `${symbol}${Math.round(n / 1_000)}k`;
   return `${symbol}${n.toLocaleString("en-GB")}`;
 }
+
+// ---------------------------------------------------------------------------
+// Chunk 6 — accounts, brief gate, Stripe billing.
+// ---------------------------------------------------------------------------
+
+export type PlanCode = "free" | "payg" | "plan_100" | "plan_unlimited";
+
+export interface Me {
+  id: number;
+  email: string;
+  plan: PlanCode;
+  plan_limit: number | null;
+  plan_used: number;
+  is_plan_active: boolean;
+  has_unlimited: boolean;
+}
+
+export interface BillingStatus {
+  payments_configured: boolean;
+  publishable_key: string | null;
+  plan_prices: Record<string, string>;
+}
+
+export interface SubmissionFeeQuote {
+  tender_id: number;
+  amount_pence: number;
+  amount_gbp: number;
+  currency: string;
+  payments_configured: boolean;
+  already_paid: boolean;
+}
+
+export interface CheckoutResponse {
+  status: "ok" | "payments_not_configured";
+  url?: string | null;
+  session_id?: string | null;
+  amount_pence?: number | null;
+  message?: string | null;
+}
+
+/** Anonymous-friendly. Returns null when not logged in. */
+export async function fetchMe(): Promise<Me | null> {
+  const res = await fetch(`${API_BASE}/me`, { credentials: "include" });
+  if (!res.ok) return null;
+  return (await res.json()) as Me | null;
+}
+
+export async function signup(
+  email: string,
+  password: string,
+): Promise<Me> {
+  const res = await fetch(`${API_BASE}/accounts/signup`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return (await res.json()) as Me;
+}
+
+export async function login(email: string, password: string): Promise<Me> {
+  const res = await fetch(`${API_BASE}/accounts/login`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return (await res.json()) as Me;
+}
+
+export async function logout(): Promise<void> {
+  await fetch(`${API_BASE}/accounts/logout`, {
+    method: "POST",
+    credentials: "include",
+  });
+}
+
+export async function freeAlertsSignup(
+  email: string,
+  password: string,
+): Promise<{ message: string }> {
+  const res = await fetch(`${API_BASE}/accounts/free-alerts`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return (await res.json()) as { message: string };
+}
+
+export async function fetchBillingStatus(): Promise<BillingStatus> {
+  const res = await fetch(`${API_BASE}/billing/status`, {
+    credentials: "include",
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return (await res.json()) as BillingStatus;
+}
+
+export async function fetchSubmissionFee(
+  tenderId: number,
+): Promise<SubmissionFeeQuote | null> {
+  const res = await fetch(`${API_BASE}/billing/submission-fee/${tenderId}`, {
+    credentials: "include",
+  });
+  if (res.status === 401) return null;
+  if (!res.ok) throw new Error(await res.text());
+  return (await res.json()) as SubmissionFeeQuote;
+}
+
+export async function startCheckout(
+  kind: "payg_brief" | "plan_100" | "plan_unlimited" | "submission_package",
+  tenderId?: number,
+): Promise<CheckoutResponse> {
+  const res = await fetch(`${API_BASE}/billing/checkout`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      kind,
+      tender_id: tenderId,
+    }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return (await res.json()) as CheckoutResponse;
+}
+
+export interface DocumentContent {
+  doc_id: number;
+  tender_id: number;
+  title: string | null;
+  format: string | null;
+  locked: boolean;
+  char_count: number;
+  preview_chars: number;
+  text: string;
+  unlock?: { reason: string; message: string };
+}
+
+export async function fetchDocumentContent(
+  tenderId: number,
+  docId: number,
+): Promise<DocumentContent> {
+  const res = await fetch(
+    `${API_BASE}/tenders/${tenderId}/documents/${docId}/content`,
+    { credentials: "include" },
+  );
+  if (!res.ok) throw new Error(await res.text());
+  return (await res.json()) as DocumentContent;
+}

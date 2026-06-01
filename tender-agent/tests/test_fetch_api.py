@@ -15,6 +15,7 @@ from tender_agent.api import tender_fetch as tf_mod
 from tender_agent.db import engine, get_db
 from tender_agent.main import app
 from tender_agent.models import Tender, TenderDocumentFile
+from tests._auth_helpers import authenticate_unlimited
 
 
 @pytest.fixture()
@@ -32,6 +33,15 @@ def session() -> Session:
 
 @pytest.fixture()
 def client(session: Session, monkeypatch) -> TestClient:
+    """TestClient that is already authenticated as a plan_unlimited account.
+
+    Chunk 6 added a server-side gate on the document file-serve endpoint
+    (`/tenders/{id}/documents/{id}/file` returns 402 for unentitled
+    callers). These tests pre-date the gate and assert the original
+    file-serve behaviour (200/404/409), so we lift the client past the
+    gate at fixture level. The other endpoints in this file (start/status
+    on fetch tasks) aren't gated; authenticating is harmless to them.
+    """
     # Never run real orchestration during endpoint tests.
     async def _noop(task_id: str, tender_id: int) -> None:
         return None
@@ -42,8 +52,10 @@ def client(session: Session, monkeypatch) -> TestClient:
         yield session
 
     app.dependency_overrides[get_db] = override
+    tc = TestClient(app)
     try:
-        yield TestClient(app)
+        authenticate_unlimited(tc)
+        yield tc
     finally:
         app.dependency_overrides.pop(get_db, None)
 
