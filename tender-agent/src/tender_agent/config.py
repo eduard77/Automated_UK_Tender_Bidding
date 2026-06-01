@@ -14,6 +14,19 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
 
+    # CORS — explicit allow-list of dashboard origins. The defaults cover
+    # local-dev (Next.js on :3000) so a fresh checkout works out of the box.
+    # In any non-dev deployment, set CORS_ALLOW_ORIGINS to the deployed
+    # dashboard origin(s); NEVER use "*" — browsers reject wildcard origins
+    # on credentialed requests, and the dashboard sends the session cookie
+    # via credentials: "include".
+    cors_allow_origins: list[str] = Field(
+        default_factory=lambda: [
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+        ],
+    )
+
     poll_interval_minutes: int = 30
     lookback_days_initial: int = 7
 
