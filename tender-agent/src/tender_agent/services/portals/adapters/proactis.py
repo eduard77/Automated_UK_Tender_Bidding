@@ -97,6 +97,14 @@ PROACTIS_URLS = {
     # CONFIRMED — the activity (RfxResponse) page; %s = rfxId. The two document
     # sections live here.
     "activity": f"{PROACTIS_BASE}/RfxResponse?rfxId=%s",
+    # CONFIRMED — Find Opportunities listing (chunk 9 discovery). Filters live
+    # on this page; pagination is server-rendered.
+    "opportunities": (
+        f"{PROACTIS_BASE}/Opportunities/Index?tabName=opportunities"
+    ),
+    # CONFIRMED — opportunity detail page (chunk 9 discovery). %s = advertId
+    # (GUID). The DN reference + region(s) of supply + value + dates live here.
+    "advert": f"{PROACTIS_BASE}/Supplier/Advert/View?advertId=%s",
     # BEST-EFFORT — supplier logout, used to release the session politely.
     "logout": f"{PROACTIS_BASE}/Login/Logout",
 }
@@ -121,7 +129,62 @@ PROACTIS_SELECTORS = {
         "input[type='submit'][value*='Express interest' i]"
     ),
     "express_interest_button_text": "EXPRESS INTEREST",
+    # --- chunk 9 discovery selectors --------------------------------------
+    # CONFIRM SELECTOR — Find Opportunities filter controls. Names below
+    # match the visible labels on the "Narrow your results" panel; Proactis
+    # renders these as ASP.NET-generated inputs whose IDs aren't stable, so
+    # we use label-anchored selectors that survive minor markup churn.
+    "opp_keywords_input": (
+        "input[name*='Keyword' i], input[id*='Keyword' i], "
+        "input[aria-label*='Keyword' i]"
+    ),
+    "opp_include_closed_select": (
+        "select[name*='IncludeClosed' i], select[id*='IncludeClosed' i], "
+        "select[aria-label*='Include closed' i]"
+    ),
+    "opp_add_region_button": (
+        "button:has-text('Add new region'), a:has-text('Add new region')"
+    ),
+    "opp_region_input": (
+        "input[name*='Region' i]:not([type='hidden']), "
+        "select[name*='Region' i]"
+    ),
+    "opp_add_category_button": (
+        "button:has-text('Add'), a:has-text('Add')"
+    ),
+    "opp_category_input": (
+        "input[name*='Categor' i]:not([type='hidden']), "
+        "select[name*='Categor' i]"
+    ),
+    "opp_update_button": (
+        "button:has-text('Update'), input[type='submit'][value*='Update' i]"
+    ),
+    # The results table itself — title link in each row carries advertId.
+    "opp_results_table": (
+        "table.opportunities, table#opportunities, table:has(th:has-text('Title'))"
+    ),
+    "opp_result_rows": (
+        "table.opportunities tbody tr, table#opportunities tbody tr, "
+        "table:has(th:has-text('Title')) tbody tr"
+    ),
+    "opp_next_page_link": (
+        "a:has-text('Next'), a[aria-label*='Next' i], "
+        "a.pagination-next, li.next a"
+    ),
 }
+
+# --- chunk 9 discovery: detail-page markers + regex patterns ------------
+# CONFIRMED — the DN reference on /Supplier/Advert/View follows this shape.
+# Matches "DN815596" anywhere on the page, with optional whitespace between
+# the label ("Opportunity Id") and the value.
+OPPORTUNITY_ID_RE = re.compile(r"\bDN\d{4,}\b")
+# Money: "£192,000.00" / "£192,000" / "£192000" — currency symbol + digits + optional decimals.
+OPPORTUNITY_VALUE_RE = re.compile(
+    r"£\s*([\d,]+(?:\.\d+)?)"  # £192,000.00
+)
+# dd/mm/yyyy or dd-mm-yyyy. Discovery only persists the year-month-day, never
+# the wall-clock — Proactis doesn't expose tz, so we treat dates as UK-local.
+OPPORTUNITY_DATE_RE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b")
 
 # Section headings used to slice the activity page into its TWO document areas.
 # The text is matched case-insensitively as a substring (real headings carry a
