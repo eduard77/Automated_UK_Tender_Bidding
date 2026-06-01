@@ -17,6 +17,7 @@ from tender_agent.api import filters as filters_api
 from tender_agent.api import platforms as platforms_api
 from tender_agent.api import portals as portals_api
 from tender_agent.api import push as push_api
+from tender_agent.api import submission as submission_api
 from tender_agent.api import system as system_api
 from tender_agent.api import tender_brief as tender_brief_api
 from tender_agent.api import tender_fetch as tender_fetch_api
@@ -86,3 +87,4 @@ app.include_router(system_api.router)
 app.include_router(accounts_api.router)
 app.include_router(accounts_api.me_router)
 app.include_router(billing_api.router)
+app.include_router(submission_api.router)
