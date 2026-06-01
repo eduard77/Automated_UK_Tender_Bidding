@@ -8,6 +8,7 @@ import { AuthProvider, planLabel, useAuth } from "@/lib/auth";
 
 import BridgeIndicator from "./BridgeIndicator";
 import PushBell from "./PushBell";
+import { SignInModal } from "./SignInModal";
 
 type NavLink = { href: string; label: string; matches?: (p: string) => boolean };
 
@@ -38,9 +39,17 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 
 function AppShellInner({ children }: { children: React.ReactNode }) {
   const pathname = usePathname() ?? "/";
+  const { refresh } = useAuth();
   const [mobileOpen, setMobileOpen] = useState(false);
-  // SignInModal is mounted in the next commit; this state opens it.
-  const [, setSignInOpen] = useState(false);
+  const [signInOpen, setSignInOpen] = useState(false);
+  const [signInMode, setSignInMode] = useState<"login" | "signup" | "alerts">(
+    "signup",
+  );
+
+  const openSignIn = (mode: "login" | "signup" | "alerts" = "signup") => {
+    setSignInMode(mode);
+    setSignInOpen(true);
+  };
 
   const isActive = (link: NavLink) =>
     link.matches ? link.matches(pathname) : pathname === link.href;
@@ -87,7 +96,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
         <div className="flex items-center gap-4">
           <BridgeIndicator />
           <PushBell />
-          <AccountSlot onOpenSignIn={() => setSignInOpen(true)} />
+          <AccountSlot onOpenSignIn={openSignIn} />
           {/* Mobile menu trigger */}
           <button
             type="button"
@@ -174,6 +183,15 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
           </div>
         </div>
       </footer>
+
+      <SignInModal
+        open={signInOpen}
+        initialMode={signInMode}
+        onClose={() => setSignInOpen(false)}
+        onAuthed={() => {
+          void refresh();
+        }}
+      />
     </div>
   );
 }
@@ -184,7 +202,11 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
  * is mounted by AppShellInner in the next commit; this component only
  * triggers `onOpenSignIn`.
  */
-function AccountSlot({ onOpenSignIn }: { onOpenSignIn: () => void }) {
+function AccountSlot({
+  onOpenSignIn,
+}: {
+  onOpenSignIn: (mode?: "login" | "signup" | "alerts") => void;
+}) {
   const { me, loading, logout } = useAuth();
 
   if (loading) {
@@ -200,7 +222,7 @@ function AccountSlot({ onOpenSignIn }: { onOpenSignIn: () => void }) {
     return (
       <button
         type="button"
-        onClick={onOpenSignIn}
+        onClick={() => onOpenSignIn("login")}
         className="rounded-full border border-border-strong bg-bg-elevated px-4 py-2 text-sm text-text-muted transition-colors hover:text-text"
       >
         Sign in
