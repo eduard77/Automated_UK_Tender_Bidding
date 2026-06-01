@@ -172,9 +172,10 @@ async def test_walk_listing_respects_max_pages_cap() -> None:
     # would short-circuit before we hit the cap. So generate distinct advertIds
     # per page; we want to prove the cap stops us even when the source has more.
     def _page(n: int) -> str:
+        advert_id = f"cccc1111-bbbb-cccc-dddd-eeeeffff000{n}"
         return (
             '<table class="opportunities"><tbody>'
-            f'<tr><td><a href="/Supplier/Advert/View?advertId=cccc1111-bbbb-cccc-dddd-eeeeffff000{n}">'
+            f'<tr><td><a href="/Supplier/Advert/View?advertId={advert_id}">'
             f'Row page {n}</a></td><td>Buyer {n}</td><td>£100,000.00</td></tr>'
             '</tbody></table>'
         )
