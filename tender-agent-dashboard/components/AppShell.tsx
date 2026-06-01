@@ -4,8 +4,11 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useState } from "react";
 
+import { AuthProvider, planLabel, useAuth } from "@/lib/auth";
+
 import BridgeIndicator from "./BridgeIndicator";
 import PushBell from "./PushBell";
+import { SignInModal } from "./SignInModal";
 
 type NavLink = { href: string; label: string; matches?: (p: string) => boolean };
 
@@ -27,8 +30,26 @@ const SOFT_LINKS: NavLink[] = [
 ];
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
+  return (
+    <AuthProvider>
+      <AppShellInner>{children}</AppShellInner>
+    </AuthProvider>
+  );
+}
+
+function AppShellInner({ children }: { children: React.ReactNode }) {
   const pathname = usePathname() ?? "/";
+  const { refresh } = useAuth();
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [signInOpen, setSignInOpen] = useState(false);
+  const [signInMode, setSignInMode] = useState<"login" | "signup" | "alerts">(
+    "signup",
+  );
+
+  const openSignIn = (mode: "login" | "signup" | "alerts" = "signup") => {
+    setSignInMode(mode);
+    setSignInOpen(true);
+  };
 
   const isActive = (link: NavLink) =>
     link.matches ? link.matches(pathname) : pathname === link.href;
@@ -75,16 +96,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         <div className="flex items-center gap-4">
           <BridgeIndicator />
           <PushBell />
-          <div
-            className="flex h-10 w-10 items-center justify-center rounded-full border border-border-strong font-display text-sm font-medium text-mint-pale"
-            style={{
-              background: "linear-gradient(135deg, #1a2a3a, #0f1820)",
-            }}
-            aria-label="Profile"
-            title="Profile"
-          >
-            ES
-          </div>
+          <AccountSlot onOpenSignIn={openSignIn} />
           {/* Mobile menu trigger */}
           <button
             type="button"
@@ -168,12 +180,87 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             <a href="#privacy" className="transition-colors hover:text-text">
               Privacy
             </a>
-            <a href="#signout" className="transition-colors hover:text-text">
-              Sign out
-            </a>
           </div>
         </div>
       </footer>
+
+      <SignInModal
+        open={signInOpen}
+        initialMode={signInMode}
+        onClose={() => setSignInOpen(false)}
+        onAuthed={() => {
+          void refresh();
+        }}
+      />
     </div>
   );
 }
+
+/**
+ * Right-hand header slot: shows a "Sign in" button when anonymous, or the
+ * caller's email + plan chip + Sign out when logged in. The full SignInModal
+ * is mounted by AppShellInner in the next commit; this component only
+ * triggers `onOpenSignIn`.
+ */
+function AccountSlot({
+  onOpenSignIn,
+}: {
+  onOpenSignIn: (mode?: "login" | "signup" | "alerts") => void;
+}) {
+  const { me, loading, logout } = useAuth();
+
+  if (loading) {
+    return (
+      <div
+        className="h-10 w-24 rounded-full border border-border bg-bg-elevated"
+        aria-hidden="true"
+      />
+    );
+  }
+
+  if (!me) {
+    return (
+      <button
+        type="button"
+        onClick={() => onOpenSignIn("login")}
+        className="rounded-full border border-border-strong bg-bg-elevated px-4 py-2 text-sm text-text-muted transition-colors hover:text-text"
+      >
+        Sign in
+      </button>
+    );
+  }
+
+  return (
+    <div className="flex items-center gap-3">
+      <div className="hidden flex-col items-end leading-tight md:flex">
+        <span
+          className="font-mono text-text"
+          style={{ fontSize: "12px", letterSpacing: "0.04em" }}
+          title={me.email}
+        >
+          {me.email}
+        </span>
+        <span
+          className="text-mint-pale"
+          style={{
+            fontSize: "10px",
+            letterSpacing: "0.1em",
+            textTransform: "uppercase",
+          }}
+        >
+          {planLabel(me.plan)}
+        </span>
+      </div>
+      <button
+        type="button"
+        onClick={() => {
+          void logout();
+        }}
+        className="rounded-full border border-border bg-bg-elevated px-3 py-2 text-xs text-text-muted transition-colors hover:text-text"
+      >
+        Sign out
+      </button>
+    </div>
+  );
+}
+
