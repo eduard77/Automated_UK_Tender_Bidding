@@ -1,0 +1,88 @@
+name: Deploy dashboard to Azure App Service
+
+# The Azure Deployment Center wizard is broken for this account
+# ("Cannot find SourceControlToken"), so we drive the deploy from here using
+# the publish profile secret already added to the repo:
+#   AZURE_WEBAPP_PUBLISH_PROFILE
+#
+# Triggers
+#   - push to main that touches tender-agent-dashboard/**
+#   - manual via the Actions tab (workflow_dispatch)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "tender-agent-dashboard/**"
+      - ".github/workflows/deploy-dashboard.yml"
+  workflow_dispatch:
+
+# Single in-flight deploy; if a newer commit lands while one is running,
+# cancel the older run so we never deploy stale .next bundles.
+concurrency:
+  group: deploy-dashboard
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-deploy:
+    name: Build and deploy Next.js dashboard
+    runs-on: ubuntu-latest
+
+    env:
+      # Next.js bakes NEXT_PUBLIC_* values into the client bundle at build
+      # time, so this has to be set before `next build` — NOT at runtime.
+      NEXT_PUBLIC_API_BASE_URL: https://generatender-gqbgaye9fmdfc4c6.ukwest-01.azurewebsites.net
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 22 with npm cache
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: tender-agent-dashboard/package-lock.json
+
+      - name: Install dependencies (clean)
+        working-directory: tender-agent-dashboard
+        run: npm ci
+
+      - name: Build Next.js (production)
+        working-directory: tender-agent-dashboard
+        # NEXT_PUBLIC_API_BASE_URL is taken from the job-level env block above
+        # so Next.js inlines it into the client bundle during `next build`.
+        run: npm run build
+
+      # The app is `next start` (NOT static export). To let App Service run
+      # `npm start` directly from /home/site/wwwroot with no install step,
+      # we ship a fully self-contained package: .next + public + config +
+      # package.json + package-lock.json + a PRUNED node_modules.
+      #
+      # `npm prune --omit=dev` removes devDependencies (test/lint/types)
+      # but keeps everything `next start` needs at runtime. The build
+      # already produced .next, so dropping dev deps is safe here.
+      - name: Prune dev dependencies for runtime
+        working-directory: tender-agent-dashboard
+        run: npm prune --omit=dev
+
+      # Optional: drop the build cache. It's not needed at runtime, only on
+      # subsequent rebuilds, and it can be tens of MB.
+      - name: Strip .next/cache (not needed at runtime)
+        working-directory: tender-agent-dashboard
+        run: rm -rf .next/cache
+
+      - name: Deploy to Azure App Service
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: genera-tenders-dashboard
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+          # Path to the directory the action will zip and upload to
+          # /home/site/wwwroot. Everything `next start` needs (the pruned
+          # node_modules, .next, public, package.json, next.config.mjs) is
+          # already in here.
+          package: tender-agent-dashboard
