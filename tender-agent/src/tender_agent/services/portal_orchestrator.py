@@ -33,7 +33,7 @@ from tender_agent.models import (
     TenderDocumentFile,
 )
 from tender_agent.services import preflight, push
-from tender_agent.services.bridge_client import BridgeClient
+from tender_agent.services.bridge_client import BridgeClient, make_bridge_client
 from tender_agent.services.credentials import CredentialsStore
 from tender_agent.services.portals.base import (
     Credentials,
@@ -183,7 +183,7 @@ class PortalOrchestrator:
         self.pause_on_already_registered = pause_on_already_registered
 
     def _get_bridge(self) -> BridgeClient:
-        return self._bridge if self._bridge is not None else BridgeClient()
+        return self._bridge if self._bridge is not None else make_bridge_client()
 
     def _store(self) -> CredentialsStore | None:
         if self._creds_store is not None:
