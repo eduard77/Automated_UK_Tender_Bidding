@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from tender_agent import scheduler
 from tender_agent.api import accounts as accounts_api
 from tender_agent.api import admin as admin_api
+from tender_agent.api import admin_portals as admin_portals_api
 from tender_agent.api import billing as billing_api
 from tender_agent.api import credentials as credentials_api
 from tender_agent.api import filters as filters_api
@@ -101,6 +102,7 @@ app.include_router(tenders_api.router)
 app.include_router(filters_api.router)
 app.include_router(push_api.router)
 app.include_router(admin_api.router)
+app.include_router(admin_portals_api.router)
 app.include_router(vault_api.router)
 app.include_router(portals_api.router)
 app.include_router(platforms_api.router)
