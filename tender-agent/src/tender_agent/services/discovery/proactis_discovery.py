@@ -52,7 +52,11 @@ from sqlalchemy.orm import Session
 from tender_agent.db import SessionLocal
 from tender_agent.models import PollRun, Source, Tender
 from tender_agent.schemas import NormalisedTender
-from tender_agent.services.bridge_client import BridgeClient, BridgeError
+from tender_agent.services.bridge_client import (
+    BridgeClient,
+    BridgeError,
+    make_bridge_client,
+)
 from tender_agent.services.discovery.proactis_filter_config import (
     ProactisFilterConfig,
 )
@@ -170,7 +174,7 @@ async def run(
     A run owns its own session for the lifetime of the cycle so partial
     progress is committed per-opportunity (mirrors `poll_source`).
     """
-    bridge = bridge or BridgeClient()
+    bridge = bridge or make_bridge_client()
     result = DiscoveryRunResult(status="ok")
 
     # Open a session + PollRun row up front, so even an early failure

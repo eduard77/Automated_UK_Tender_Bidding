@@ -22,7 +22,7 @@ from pathlib import Path
 import structlog
 
 from tender_agent.config import settings
-from tender_agent.services.bridge_client import BridgeClient
+from tender_agent.services.bridge_client import make_bridge_client
 
 logger = structlog.get_logger(__name__)
 
@@ -78,7 +78,7 @@ async def check_bridge_reachable() -> tuple[bool, str]:
     """Best-effort, short-timeout probe of the bridge /health endpoint. Down is
     reported but never treated as fatal — the bridge runs on demand."""
     try:
-        available = await BridgeClient().bridge_available()
+        available = await make_bridge_client().bridge_available()
     except Exception as exc:  # noqa: BLE001
         return False, f"Bridge health probe failed ({type(exc).__name__}: {exc})."
     if available:

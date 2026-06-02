@@ -8,7 +8,7 @@ import json
 import pytest
 
 from tender_agent.services import bridge_client as bc_mod
-from tender_agent.services.bridge_client import BridgeClient
+from tender_agent.services.bridge_client import HttpBridgeClient
 
 
 class _FakeResponse:
@@ -69,7 +69,7 @@ async def test_open_session_endpoint_and_token():
     _FakeClient.next_response = _FakeResponse(
         200, {"session_id": "delta", "current_url": "x", "authenticated_guess": False}
     )
-    out = await BridgeClient().open_session("delta", "https://x")
+    out = await HttpBridgeClient().open_session("delta", "https://x")
     call = _last()
     assert call["url"] == "http://bridge.test:8765/session/open"
     assert call["headers"]["X-Bridge-Token"] == "secret-token"
@@ -82,7 +82,7 @@ async def test_wait_for_login_endpoint():
     _FakeClient.next_response = _FakeResponse(
         200, {"status": "logged_in", "current_url": "x"}
     )
-    out = await BridgeClient().wait_for_login(
+    out = await HttpBridgeClient().wait_for_login(
         "delta", r"/secure", login_url="https://l", timeout_seconds=30
     )
     call = _last()
@@ -97,16 +97,16 @@ async def test_navigate_and_page_text_and_find_links():
     _FakeClient.next_response = _FakeResponse(
         200, {"current_url": "u", "status_code": 200, "title": "T"}
     )
-    await BridgeClient().navigate("delta", "https://u")
+    await HttpBridgeClient().navigate("delta", "https://u")
     assert _last()["url"].endswith("/session/delta/navigate")
 
     _FakeClient.next_response = _FakeResponse(200, {"text": "hello", "current_url": "u"})
-    text = await BridgeClient().page_text("delta")
+    text = await HttpBridgeClient().page_text("delta")
     assert text == "hello"
     assert _last()["url"].endswith("/session/delta/page-text")
 
     _FakeClient.next_response = _FakeResponse(200, {"links": ["https://a/x.pdf"]})
-    links = await BridgeClient().find_links("delta", r"\.pdf")
+    links = await HttpBridgeClient().find_links("delta", r"\.pdf")
     assert links == ["https://a/x.pdf"]
     assert _last()["url"].endswith("/session/delta/find-links")
 
@@ -117,7 +117,7 @@ async def test_rendered_html_endpoint_and_payload():
         200,
         {"current_url": "u", "html": "<html>rows</html>", "wait_satisfied": True},
     )
-    out = await BridgeClient().rendered_html(
+    out = await HttpBridgeClient().rendered_html(
         "delta", wait_for_text="downloadDocument", timeout_ms=15000
     )
     call = _last()
@@ -136,7 +136,7 @@ async def test_rendered_html_selector_and_unsatisfied_wait():
     _FakeClient.next_response = _FakeResponse(
         200, {"html": "<html>shell</html>"}
     )
-    out = await BridgeClient().rendered_html(
+    out = await HttpBridgeClient().rendered_html(
         "delta", wait_for_selector="table#documents", timeout_ms=8000
     )
     assert _last()["json"] == {
@@ -149,7 +149,7 @@ async def test_rendered_html_selector_and_unsatisfied_wait():
 @pytest.mark.asyncio
 async def test_fill_endpoint_and_payload():
     _FakeClient.next_response = _FakeResponse(200, {"ok": True, "current_url": "u"})
-    await BridgeClient().fill("delta", "input#accessCode", "286EVX23TV")
+    await HttpBridgeClient().fill("delta", "input#accessCode", "286EVX23TV")
     call = _last()
     assert call["url"].endswith("/session/delta/fill")
     assert call["json"] == {"selector": "input#accessCode", "value": "286EVX23TV"}
@@ -159,7 +159,7 @@ async def test_fill_endpoint_and_payload():
 @pytest.mark.asyncio
 async def test_click_endpoint_and_payload():
     _FakeClient.next_response = _FakeResponse(200, {"ok": True, "current_url": "u"})
-    await BridgeClient().click("delta", "button[type='submit']")
+    await HttpBridgeClient().click("delta", "button[type='submit']")
     call = _last()
     assert call["url"].endswith("/session/delta/click")
     assert call["json"] == {"selector": "button[type='submit']"}
@@ -168,29 +168,29 @@ async def test_click_endpoint_and_payload():
 @pytest.mark.asyncio
 async def test_element_exists_returns_bool():
     _FakeClient.next_response = _FakeResponse(200, {"exists": True})
-    assert await BridgeClient().element_exists("delta", "table#responses") is True
+    assert await HttpBridgeClient().element_exists("delta", "table#responses") is True
     assert _last()["url"].endswith("/session/delta/element-exists")
 
     _FakeClient.next_response = _FakeResponse(200, {"exists": False})
-    assert await BridgeClient().element_exists("delta", "table#responses") is False
+    assert await HttpBridgeClient().element_exists("delta", "table#responses") is False
 
     # Missing key degrades to False rather than raising.
     _FakeClient.next_response = _FakeResponse(200, {})
-    assert await BridgeClient().element_exists("delta", "x") is False
+    assert await HttpBridgeClient().element_exists("delta", "x") is False
 
 
 @pytest.mark.asyncio
 async def test_select_option_endpoint_and_payload():
     _FakeClient.next_response = _FakeResponse(200, {"ok": True, "current_url": "u"})
     # index=-1 picks the last option (used to maximise a page-size dropdown).
-    await BridgeClient().select_option("delta", "select.page-size", index=-1)
+    await HttpBridgeClient().select_option("delta", "select.page-size", index=-1)
     call = _last()
     assert call["url"].endswith("/session/delta/select-option")
     assert call["json"] == {"selector": "select.page-size", "index": -1}
 
     # value/label are only sent when provided (omitted keys stay out of payload).
     _FakeClient.next_response = _FakeResponse(200, {"ok": True})
-    await BridgeClient().select_option("delta", "select.page-size", value="100")
+    await HttpBridgeClient().select_option("delta", "select.page-size", value="100")
     assert _last()["json"] == {"selector": "select.page-size", "value": "100"}
 
 
@@ -199,7 +199,7 @@ async def test_download_returns_bridge_file():
     _FakeClient.next_response = _FakeResponse(
         200, {"path": "abc.pdf", "size_bytes": 123, "mime_type": "application/pdf"}
     )
-    bf = await BridgeClient().download("delta", "https://a/x.pdf", "abc.pdf")
+    bf = await HttpBridgeClient().download("delta", "https://a/x.pdf", "abc.pdf")
     assert bf.path == "abc.pdf"
     assert bf.size_bytes == 123
     assert bf.mime_type == "application/pdf"
@@ -218,7 +218,7 @@ async def test_click_download_in_row_endpoint_and_payload():
             "mime_type": "application/pdf",
         },
     )
-    out = await BridgeClient().click_download_in_row(
+    out = await HttpBridgeClient().click_download_in_row(
         "delta",
         table_selector="table#document",
         row_index=0,
@@ -249,7 +249,7 @@ async def test_click_download_in_row_error_status_raises():
 
     _FakeClient.next_response = _FakeResponse(502, {"detail": "no download captured"})
     with pytest.raises(BridgeError):
-        await BridgeClient().click_download_in_row(
+        await HttpBridgeClient().click_download_in_row(
             "delta",
             table_selector="table#document",
             row_index=3,
@@ -264,24 +264,24 @@ async def test_error_status_raises():
 
     _FakeClient.next_response = _FakeResponse(500, {"detail": "boom"})
     with pytest.raises(BridgeError):
-        await BridgeClient().navigate("delta", "https://u")
+        await HttpBridgeClient().navigate("delta", "https://u")
 
 
 @pytest.mark.asyncio
 async def test_bridge_available_true():
     _FakeClient.next_response = _FakeResponse(200, {"status": "ok"})
-    assert await BridgeClient().bridge_available() is True
+    assert await HttpBridgeClient().bridge_available() is True
 
 
 @pytest.mark.asyncio
 async def test_bridge_available_false_when_down():
     _FakeClient.raise_on_get = ConnectionError("refused")
-    assert await BridgeClient().bridge_available() is False
+    assert await HttpBridgeClient().bridge_available() is False
 
 
 @pytest.mark.asyncio
 async def test_close_session():
     _FakeClient.next_response = _FakeResponse(200, {"closed": True})
-    out = await BridgeClient().close_session("delta")
+    out = await HttpBridgeClient().close_session("delta")
     assert out == {"closed": True}
     assert _last()["url"].endswith("/session/delta/close")

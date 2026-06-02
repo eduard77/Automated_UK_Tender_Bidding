@@ -12,25 +12,28 @@ def client():
     return TestClient(app)
 
 
-def test_bridge_health_up(monkeypatch, client):
-    async def _up(self):
-        return True
+def _patch_bridge(monkeypatch, module_path: str, available: bool) -> None:
+    """Stand-in for the bridge: monkeypatch the module's
+    `make_bridge_client` so it returns a fake whose `bridge_available()`
+    yields the requested bool. Works for both HTTP and in-process
+    implementations — the endpoint only cares about that bool."""
 
-    monkeypatch.setattr(
-        "tender_agent.api.system.BridgeClient.bridge_available", _up
-    )
+    class _Fake:
+        async def bridge_available(self):
+            return available
+
+    monkeypatch.setattr(module_path, lambda: _Fake())
+
+
+def test_bridge_health_up(monkeypatch, client):
+    _patch_bridge(monkeypatch, "tender_agent.api.system.make_bridge_client", True)
     resp = client.get("/system/bridge-health")
     assert resp.status_code == 200
     assert resp.json() == {"available": True}
 
 
 def test_bridge_health_down(monkeypatch, client):
-    async def _down(self):
-        return False
-
-    monkeypatch.setattr(
-        "tender_agent.api.system.BridgeClient.bridge_available", _down
-    )
+    _patch_bridge(monkeypatch, "tender_agent.api.system.make_bridge_client", False)
     resp = client.get("/system/bridge-health")
     assert resp.status_code == 200
     assert resp.json() == {"available": False}
@@ -44,12 +47,8 @@ def test_preflight_endpoint_returns_structured_result(monkeypatch, client, tmp_p
     monkeypatch.setattr(
         "tender_agent.services.preflight.settings.bridge_token", "TA-secret"
     )
-
-    async def _up(self):
-        return True
-
-    monkeypatch.setattr(
-        "tender_agent.services.preflight.BridgeClient.bridge_available", _up
+    _patch_bridge(
+        monkeypatch, "tender_agent.services.preflight.make_bridge_client", True
     )
     resp = client.get("/system/preflight")
     assert resp.status_code == 200

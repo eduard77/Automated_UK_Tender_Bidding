@@ -60,6 +60,15 @@ async def lifespan(_app: FastAPI):
         yield
     finally:
         scheduler.stop()
+        # Close any in-process Playwright contexts cleanly. Idempotent and a
+        # no-op when the in-process driver was never used (HTTP-bridge mode
+        # or no portal traffic this run).
+        with contextlib.suppress(Exception):
+            from tender_agent.services.bridge_in_process import (
+                shutdown_in_process_bridge,
+            )
+
+            await shutdown_in_process_bridge()
 
 
 app = FastAPI(

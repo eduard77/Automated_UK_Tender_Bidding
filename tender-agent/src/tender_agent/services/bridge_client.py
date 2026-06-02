@@ -1,12 +1,19 @@
-"""Async client for the native Windows browser bridge.
+"""Bridge client surface — HTTP and in-process implementations.
 
-The backend runs in Docker; the bridge runs on the Windows host. The container
-reaches the host at host.docker.internal. Every call carries the shared token.
+Historically the bridge ran as its own service over HTTP (Windows host +
+Linux container). Delta cloud stage 2 collapses both sides into the same
+process when `settings.bridge_url` is empty — see `bridge_in_process.py`.
+The HTTP client below still works for local-dev users who already run the
+standalone bridge; `make_bridge_client()` picks the right implementation.
+
+The dataclasses (BridgeError / BridgeFile / BridgeRowDownload / RenderedPage)
+are shared between both implementations, so the orchestrator and the Delta
+adapter import them from here exactly as before.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 import structlog
@@ -17,21 +24,21 @@ logger = structlog.get_logger(__name__)
 
 
 class BridgeError(RuntimeError):
-    """Raised when the bridge returns an error or is unreachable."""
+    """Raised when a bridge call fails (HTTP or in-process)."""
 
 
 @dataclass
 class BridgeFile:
-    path: str  # relative to the shared download dir
+    path: str  # filename inside the bridge download dir
     size_bytes: int
     mime_type: str | None = None
 
 
 @dataclass
 class BridgeRowDownload:
-    """Result of /click-download-in-row: the captured file (path relative to the
-    shared download dir) plus the browser's suggested filename, which the caller
-    uses to name the document and derive its extension."""
+    """Result of click-download-in-row: the captured file (relative to the
+    bridge download dir) plus the browser's suggested filename, which the
+    caller uses to name the document and derive its extension."""
 
     path: str
     suggested_filename: str | None = None
@@ -41,16 +48,107 @@ class BridgeRowDownload:
 
 @dataclass
 class RenderedPage:
-    """Result of /rendered-html: the rendered DOM plus whether the wait
-    condition (selector/text) was satisfied before the read. wait_satisfied is
-    False when the wait timed out — the html is still whatever had rendered."""
+    """Rendered DOM plus whether the wait condition was satisfied before the
+    read. wait_satisfied=False means the wait timed out — the html is still
+    whatever rendered."""
 
     html: str
     wait_satisfied: bool
     current_url: str | None = None
 
 
-class BridgeClient:
+class BridgeClient(Protocol):
+    """The surface every caller uses (orchestrator, Delta adapter, Proactis
+    discovery, preflight, the system API). Both `HttpBridgeClient` and
+    `bridge_in_process.InProcessBridgeClient` satisfy this Protocol.
+
+    Annotate parameters and return types with `BridgeClient` and let
+    `make_bridge_client()` pick the implementation at runtime.
+    """
+
+    async def bridge_available(self) -> bool: ...
+    async def open_session(
+        self, platform_slug: str, start_url: str | None
+    ) -> dict: ...
+    async def session_status(self, slug: str) -> dict: ...
+    async def wait_for_login(
+        self,
+        slug: str,
+        success_url_pattern: str,
+        login_url: str | None = None,
+        timeout_seconds: int = 600,
+    ) -> dict: ...
+    async def navigate(self, slug: str, url: str) -> dict: ...
+    async def fill(self, slug: str, selector: str, value: str) -> dict: ...
+    async def click(self, slug: str, selector: str) -> dict: ...
+    async def element_exists(self, slug: str, selector: str) -> bool: ...
+    async def select_option(
+        self,
+        slug: str,
+        selector: str,
+        value: str | None = None,
+        label: str | None = None,
+        index: int | None = None,
+    ) -> dict: ...
+    async def page_text(self, slug: str) -> str: ...
+    async def page_html(self, slug: str) -> str: ...
+    async def rendered_html(
+        self,
+        slug: str,
+        *,
+        wait_for_selector: str | None = None,
+        wait_for_text: str | None = None,
+        timeout_ms: int = 15000,
+    ) -> RenderedPage: ...
+    async def find_links(self, slug: str, pattern: str) -> list[str]: ...
+    async def download(
+        self, slug: str, url: str, dest_filename: str | None = None
+    ) -> BridgeFile: ...
+    async def click_download(
+        self, slug: str, selector: str, dest_filename: str | None = None
+    ) -> BridgeFile: ...
+    async def click_download_in_row(
+        self,
+        slug: str,
+        *,
+        table_selector: str,
+        row_index: int,
+        menu_trigger_selector: str,
+        download_item_text: str,
+        timeout_ms: int = 30000,
+    ) -> BridgeRowDownload: ...
+    async def screenshot(self, slug: str, label: str = "screenshot") -> dict: ...
+    async def close_session(self, slug: str) -> dict: ...
+
+
+def make_bridge_client(
+    base_url: str | None = None,
+    token: str | None = None,
+    timeout: float | None = None,
+) -> BridgeClient:
+    """Factory — returns the HTTP client when `TENDER_AGENT_BRIDGE_URL` is
+    set (back-compat for local-dev users with the standalone Windows bridge
+    still running), otherwise the in-process Playwright driver.
+
+    Caller-passed `base_url` overrides settings.bridge_url, useful for tests.
+    """
+    chosen_url = base_url if base_url is not None else settings.bridge_url
+    if chosen_url:
+        return HttpBridgeClient(
+            base_url=base_url, token=token, timeout=timeout
+        )
+    # Lazy import — keeps `services.bridge_client` import-clean for unit
+    # tests that monkeypatch httpx and never touch Playwright.
+    from tender_agent.services.bridge_in_process import (  # noqa: PLC0415
+        InProcessBridgeClient,
+    )
+
+    return InProcessBridgeClient(
+        base_url=base_url, token=token, timeout=timeout
+    )
+
+
+class HttpBridgeClient:
     def __init__(
         self,
         base_url: str | None = None,
