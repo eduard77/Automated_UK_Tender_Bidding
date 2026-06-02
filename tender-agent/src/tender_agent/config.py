@@ -61,21 +61,35 @@ class Settings(BaseSettings):
     # Dashboard origin — used as the base for notification `url` paths.
     dashboard_base_url: str = "http://localhost:3000"
 
-    # Browser bridge (native Windows helper, outside Docker). The container
-    # reaches the host at host.docker.internal. The token MUST match the
-    # bridge's TENDER_AGENT_BRIDGE_TOKEN (browser-bridge/.env) — that is the
-    # canonical env name shared by both sides, so we read it here too (the bare
-    # BRIDGE_URL/BRIDGE_TOKEN names stay accepted as a fallback). The download
-    # dir is the in-container mount of the host folder the bridge writes to.
+    # Browser bridge. There are TWO modes (Delta cloud stage 2):
+    #   1. In-process Playwright (default in cloud) — `bridge_url=""`. The
+    #      backend drives Chromium directly via `bridge_in_process.py`. No
+    #      separate service, no shared volume, no HTTP boundary.
+    #   2. HTTP to a standalone bridge — set `TENDER_AGENT_BRIDGE_URL` to
+    #      something like `http://host.docker.internal:8765`. Existing local
+    #      Windows dev users with the standalone bridge running keep that
+    #      workflow; the orchestrator surface is identical either way.
+    # `bridge_url` defaults EMPTY so the cloud deployment lands in-process
+    # without needing extra env vars; `make_bridge_client()` picks the
+    # implementation based on this value. The token only matters in HTTP mode.
     bridge_url: str = Field(
-        default="http://host.docker.internal:8765",
+        default="",
         validation_alias=AliasChoices("TENDER_AGENT_BRIDGE_URL", "BRIDGE_URL"),
     )
     bridge_token: str = Field(
         default="",
         validation_alias=AliasChoices("TENDER_AGENT_BRIDGE_TOKEN", "BRIDGE_TOKEN"),
     )
+    # Where Chromium writes captured downloads. In HTTP mode this used to be
+    # the in-container mount of the host folder the bridge wrote into; in the
+    # in-process mode the backend writes and reads the same dir itself, so the
+    # default just needs to be writable.
     bridge_download_dir: str = "/app/data/bridge-downloads"
+    # Persistent Playwright `user_data_dir` for the in-process driver. Stage 3
+    # will drop an operator-exported `storage_state.json` for a given slug
+    # under `<bridge_state_dir>/<slug>/` so Delta picks up the session without
+    # the user typing a password.
+    bridge_state_dir: str = "/app/data/bridge-sessions"
 
     # --- Proactis discovery (Phase 4 chunk 9) -------------------------------
     # Filters applied on the Find Opportunities listing for the SCHEDULED
