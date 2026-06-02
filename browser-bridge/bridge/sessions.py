@@ -46,15 +46,28 @@ class SessionManager:
 
         pw = await async_playwright().start()
         user_data_dir = str(config.session_dir(slug))
+        headless = config.headless()
+        # Existing args — used in every mode, all platforms. The headed Windows
+        # path the operator uses for first-time login is unchanged.
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ]
+        # Container-only hardening: --no-sandbox lets Chromium start under the
+        # default root user in Microsoft's Playwright Python image (or any other
+        # Linux container that doesn't drop to pwuser); --disable-dev-shm-usage
+        # routes Chromium's scratch space to /tmp, avoiding the small default
+        # /dev/shm that crashes the renderer on Linux container hosts. Both are
+        # no-ops on Windows/macOS headed runs, so we only set them when headless
+        # is on — keeps the local-dev Windows path identical.
+        if headless:
+            launch_args.extend(["--no-sandbox", "--disable-dev-shm-usage"])
         context = await pw.chromium.launch_persistent_context(
             user_data_dir,
-            headless=config.headless(),
+            headless=headless,
             accept_downloads=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-first-run",
-                "--no-default-browser-check",
-            ],
+            args=launch_args,
         )
         page = context.pages[0] if context.pages else await context.new_page()
         return BridgeSession(slug=slug, playwright=pw, context=context, page=page)
