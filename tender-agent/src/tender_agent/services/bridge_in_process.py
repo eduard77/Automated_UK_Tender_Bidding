@@ -22,14 +22,22 @@ and just forwards to that shared manager — re-entry from many orchestrator
 tasks is safe. Shutdown is plumbed via `services.bridge_runtime.shutdown()`
 which the FastAPI lifespan calls.
 
-Stage 3 seam (NOT built here)
------------------------------
-Login model B is operator-exported `storage_state.json`. Today the persistent
-context is initialised against `bridge_state_dir/<slug>/`. Stage 3 will add an
-endpoint that drops a `storage_state.json` into that directory before
-`/session/open` is called for the slug; this driver already loads any state it
-finds because Playwright's `launch_persistent_context` reads the user_data_dir
-contents on start.
+Stage 3 — login model B (operator-supplied storage_state)
+---------------------------------------------------------
+The operator logs into Delta in their own browser, exports the session as a
+Playwright `storage_state.json`, and uploads it via the admin endpoint
+(`api/admin_portals.py`), which writes it to `bridge_state_dir/<slug>/`.
+
+IMPORTANT correction to the original seam note: `launch_persistent_context`
+does NOT read a `storage_state.json` on its own — that format is consumed only
+by `new_context(storage_state=...)`. A persistent profile keeps cookies in its
+own SQLite store, and Delta's auth cookie is a *session* cookie Chromium never
+flushes to disk, so it would not survive a container restart regardless. We
+therefore APPLY the uploaded state explicitly on every cold launch (see
+`_apply_storage_state`): cookies via `add_cookies`, localStorage best-effort via
+an init script. The operator re-uploads when the session expires — there is no
+password and no automated login. None of this touches the Delta adapter
+selectors, the orchestrator state machine, or the human-pause gate.
 
 Single-Delta-session lease (stage 5)
 ------------------------------------
@@ -43,6 +51,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import mimetypes
 import os
 import re
@@ -137,6 +146,10 @@ class _GlobalManager:
             downloads_path=str(downloads_root),
             args=launch_args,
         )
+        # Login model B (stage 3): if the operator uploaded a storage_state for
+        # this slug, apply it to the freshly launched context so the headless
+        # fetch is authenticated. No-op when no upload exists.
+        await _apply_storage_state(context, user_data_dir, slug)
         page = context.pages[0] if context.pages else await context.new_page()
         logger.info("bridge.in_process.session_opened", slug=slug, headless=headless)
         return _Session(slug=slug, playwright=pw, context=context, page=page)
@@ -183,15 +196,99 @@ async def shutdown_in_process_bridge() -> None:
 # ---------------------------------------------------------------------------
 
 
+# Filename of the operator-uploaded Playwright storage_state inside a slug's
+# persistent-context dir (login model B, stage 3). Kept here so the upload
+# endpoint and the apply-on-launch logic agree on one name.
+STORAGE_STATE_FILENAME = "storage_state.json"
+
+
 def _state_dir_for_slug(slug: str) -> Path:
     """Per-slug Playwright user_data_dir. Cookies + localStorage live here;
-    stage 3 will land `storage_state.json` here for Delta."""
+    the operator-uploaded `storage_state.json` (login model B) also lands here
+    and is applied on launch by `_apply_storage_state`."""
     base = Path(getattr(settings, "bridge_state_dir", "/data/bridge-sessions"))
     base.mkdir(parents=True, exist_ok=True)
     safe = "".join(c for c in (slug or "default") if c.isalnum() or c in "-_") or "default"
     d = base / safe
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def state_dir_for_slug(slug: str) -> Path:
+    """Public accessor for a slug's persistent-context dir (login model B)."""
+    return _state_dir_for_slug(slug)
+
+
+def storage_state_path(slug: str) -> Path:
+    """Path of the operator-uploaded Playwright storage_state for a slug."""
+    return _state_dir_for_slug(slug) / STORAGE_STATE_FILENAME
+
+
+async def _apply_storage_state(context: Any, user_data_dir: Path, slug: str) -> None:
+    """Apply an operator-uploaded Playwright storage_state to a freshly launched
+    persistent context (login model B, stage 3).
+
+    See the module docstring for WHY this is explicit rather than implicit:
+    `launch_persistent_context` ignores `storage_state.json`, and Delta's auth
+    cookie is a session cookie that never persists in the profile, so we
+    re-apply on every cold launch. Cookies are applied via `add_cookies`;
+    localStorage is seeded best-effort via an origin-scoped init script.
+
+    Best-effort and non-fatal — a missing/corrupt file just means "no session".
+    NEVER logs cookie names or values; counts only.
+    """
+    path = user_data_dir / STORAGE_STATE_FILENAME
+    if not path.exists():
+        return
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("bridge.storage_state.parse_failed", slug=slug, error=str(exc))
+        return
+    if not isinstance(state, dict):
+        logger.warning("bridge.storage_state.not_object", slug=slug)
+        return
+
+    cookies = state.get("cookies")
+    applied_cookies = 0
+    if isinstance(cookies, list) and cookies:
+        try:
+            await context.add_cookies(cookies)
+            applied_cookies = len(cookies)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("bridge.storage_state.cookies_failed", slug=slug, error=str(exc))
+
+    origins = state.get("origins")
+    applied_origins = 0
+    if isinstance(origins, list) and origins:
+        seed = {
+            o["origin"]: o.get("localStorage", [])
+            for o in origins
+            if isinstance(o, dict) and isinstance(o.get("origin"), str)
+        }
+        if seed:
+            # An origin-scoped init script seeds localStorage only on a page
+            # whose origin matches — it never navigates and never touches other
+            # origins. Best-effort: wrapped so a failure can't break launch.
+            script = (
+                "(() => { try {"
+                " const seed = " + json.dumps(seed) + ";"
+                " const items = seed[window.location.origin];"
+                " if (items) { for (const it of items) {"
+                "   try { window.localStorage.setItem(it.name, it.value); }"
+                "   catch (e) {} } }"
+                "} catch (e) {} })();"
+            )
+            with contextlib.suppress(Exception):
+                await context.add_init_script(script)
+            applied_origins = len(seed)
+
+    logger.info(
+        "bridge.storage_state.applied",
+        slug=slug,
+        cookies=applied_cookies,
+        origins=applied_origins,
+    )
 
 
 def _download_dir() -> Path:
