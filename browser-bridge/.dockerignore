@@ -1,0 +1,30 @@
+# Keep the image small.
+
+# Local Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Operator / dev artefacts that should never end up in the image
+.env
+*.local
+*.swp
+.DS_Store
+
+# Local-only launcher (Windows). The container's CMD is uvicorn directly.
+start-bridge.ps1
+
+# Tests + dev configs aren't needed at runtime
+tests/
+.dockerignore
+Dockerfile
+
+# In case anyone has run the bridge locally before building the image
+.tender-agent/
+bridge-sessions/
+bridge-downloads/
