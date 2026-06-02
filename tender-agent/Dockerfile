@@ -1,11 +1,18 @@
 # syntax=docker/dockerfile:1.7
 
 # ---------------------------------------------------------------------------
-# Stage 1: build a wheel + install dependencies into a clean virtualenv.
-# Anything we install during the build (build-essential, dev headers, pip
-# cache) stays in this stage and never touches the runtime image.
+# Delta cloud stage 2: the backend image now carries the Playwright Chromium
+# runtime so the in-process bridge driver (services/bridge_in_process.py) can
+# drive a real browser without a separate `browser-bridge` service. Chromium
+# adds ~1 GB to the image vs python:3.12-slim, the only material trade-off.
+#
+# Base: Microsoft's official Playwright Python image, pinned to v1.47.0 to
+# match the floor in tender-agent/pyproject.toml + browser-bridge's own
+# version. Chromium + every Linux .so the headless browser needs ships in the
+# base — DO NOT swap to vanilla python:3.12 or you'll spend the afternoon
+# chasing libnss / libasound errors.
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim AS builder
+FROM mcr.microsoft.com/playwright/python:v1.47.0-noble AS builder
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -19,7 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# Install dependencies first (the longest-changing layer) so that source-only
+# Install dependencies first (the longest-changing layer) so source-only
 # rebuilds reuse this cached layer.
 COPY pyproject.toml ./
 RUN python -m venv /opt/venv \
@@ -33,17 +40,18 @@ COPY alembic.ini ./
 RUN /opt/venv/bin/pip install .
 
 # ---------------------------------------------------------------------------
-# Stage 2: minimal runtime. No compilers, no dev headers, no pip cache.
+# Runtime: same Playwright base (so Chromium is present) but no compilers,
+# no dev headers, no pip cache.
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim AS runtime
+FROM mcr.microsoft.com/playwright/python:v1.47.0-noble AS runtime
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH" \
     PYTHONPATH=/app/src
 
-# curl: ECS container health check curls http://localhost:8000/health
-# tini: PID 1 with signal forwarding, so SIGTERM from ECS shuts uvicorn cleanly
+# curl: container health check curls http://localhost:8000/health
+# tini: PID 1 with signal forwarding, so SIGTERM shuts uvicorn cleanly
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     tini \
@@ -57,17 +65,18 @@ COPY --from=builder /opt/venv /opt/venv
 COPY --chown=app:app alembic ./alembic
 COPY --chown=app:app alembic.ini ./
 COPY --chown=app:app src ./src
-# Operator scripts (backfill_portal_discovery.py et al.) must ship in the image
-# so they're runnable via `docker compose exec app python scripts/<name>.py`
-# without a manual `docker cp`.
 COPY --chown=app:app scripts ./scripts
 
-# Pre-create the data dirs the app writes to (documents + bridge downloads) and
-# own them as the app user. docker-compose bind-mounts the host folders over
-# these subdirs at runtime; pre-creating /app/data app-owned means /app/data is
-# never left root-owned (which is what made the old relative 'data' write fail
-# with PermissionError) and writes succeed whether or not the mounts are present.
-RUN mkdir -p /app/data/documents /app/data/bridge-downloads \
+# Pre-create the data dirs the app writes to and own them as the app user.
+# The bridge in-process driver lays persistent contexts under
+# /app/data/bridge-sessions/<slug>/ and writes downloads to
+# /app/data/bridge-downloads — same paths the Delta adapter's
+# `_ingest_bridge_file` reads. In Azure these will be Azure Files mounts so
+# cookies + downloads survive a container restart.
+RUN mkdir -p \
+        /app/data/documents \
+        /app/data/bridge-downloads \
+        /app/data/bridge-sessions \
     && chown -R app:app /app/data
 
 USER app

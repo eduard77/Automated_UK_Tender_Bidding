@@ -10,6 +10,20 @@ import pytest
 
 from tender_agent.services import preflight as pf
 
+
+def _install_fake_bridge_available(monkeypatch, coro_returning_bool):
+    """Replace `pf.make_bridge_client` with a factory that returns an object
+    whose `bridge_available()` defers to the supplied coroutine. Works for
+    either the HTTP or in-process implementation — the test only cares
+    about the bool the preflight sees."""
+
+    class _Fake:
+        async def bridge_available(self):
+            return await coro_returning_bool(self)
+
+    monkeypatch.setattr(pf, "make_bridge_client", lambda: _Fake())
+
+
 # --- documents dir writability -----------------------------------------
 
 
@@ -62,7 +76,7 @@ async def test_bridge_reachable_up(monkeypatch):
     async def _up(self):
         return True
 
-    monkeypatch.setattr(pf.BridgeClient, "bridge_available", _up)
+    _install_fake_bridge_available(monkeypatch, _up)
     ok, detail = await pf.check_bridge_reachable()
     assert ok is True
     assert "reachable" in detail
@@ -73,7 +87,7 @@ async def test_bridge_reachable_down(monkeypatch):
     async def _down(self):
         return False
 
-    monkeypatch.setattr(pf.BridgeClient, "bridge_available", _down)
+    _install_fake_bridge_available(monkeypatch, _down)
     ok, detail = await pf.check_bridge_reachable()
     assert ok is False
     assert "not reachable" in detail
@@ -90,7 +104,7 @@ async def test_run_preflight_all_ok(tmp_path, monkeypatch):
     async def _up(self):
         return True
 
-    monkeypatch.setattr(pf.BridgeClient, "bridge_available", _up)
+    _install_fake_bridge_available(monkeypatch, _up)
     res = await pf.run_preflight(check_bridge=True)
     d = res.as_dict()
     assert d["documents_dir_writable"] is True
@@ -107,7 +121,7 @@ async def test_run_preflight_bridge_down_not_fatal(tmp_path, monkeypatch):
     async def _down(self):
         return False
 
-    monkeypatch.setattr(pf.BridgeClient, "bridge_available", _down)
+    _install_fake_bridge_available(monkeypatch, _down)
     # Must return (not raise) even though the bridge is down.
     res = await pf.run_preflight(check_bridge=True)
     assert res.documents_dir_writable is True
