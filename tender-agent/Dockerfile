@@ -19,9 +19,14 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_ROOT_USER_ACTION=ignore
 
+# python3.12-venv: the Playwright/Noble base ships a working Python + pip but
+# NOT the venv module's bootstrap pieces (ensurepip), so `python -m venv` fails
+# without it. We keep the venv because it's what lets the runtime stage pull the
+# whole dependency tree in one `COPY --from=builder /opt/venv` with no compilers.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libffi-dev \
+    python3.12-venv \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
