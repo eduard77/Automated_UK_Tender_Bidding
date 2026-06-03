@@ -246,9 +246,42 @@ async def test_test_session_reports_logged_in_without_state_change():
     res = await delta_session.test_session(bridge=fake)
     assert res["available"] is True
     assert res["logged_in"] is True
+    # Backward-compatible richer diagnostics are present (added, not removed).
+    for key in ("current_url", "title", "redirected_to_login",
+                "frames_checked", "markers"):
+        assert key in res
     # Session was opened and cleanly closed; no state-changing calls happened.
     assert ("close_session", delta_session.DELTA_SLUG) in fake.calls
     assert "click" not in [c if isinstance(c, str) else c[0] for c in fake.calls]
+
+
+class _RichFakeBridge(_FakeBridge):
+    """A bridge exposing the frame-aware logged_in_marker_report so test_session
+    surfaces per-marker diagnostics (which alt was found, in which frame)."""
+
+    async def logged_in_marker_report(self, slug, selectors, timeout_ms=8000):
+        self.calls.append(("logged_in_marker_report", len(selectors)))
+        return {
+            "title": "Activity Centre | Delta",
+            "current_url": "https://www.delta-esourcing.com/delta/mainMenu.html",
+            "frames_checked": 2,
+            "any_visible": True,
+            "markers": [
+                {"selector": selectors[0], "found": True, "frame": "main",
+                 "matches": 1, "error": None},
+            ],
+        }
+
+
+async def test_test_session_surfaces_marker_diagnostics():
+    fake = _RichFakeBridge(logged_in=True)
+    res = await delta_session.test_session(bridge=fake)
+    assert res["logged_in"] is True
+    assert res["title"] == "Activity Centre | Delta"
+    assert res["frames_checked"] == 2
+    assert res["markers"][0]["found"] is True
+    # No cookie values anywhere in the payload.
+    assert "fake-session-token" not in json.dumps(res)
 
 
 async def test_test_session_reports_not_logged_in():

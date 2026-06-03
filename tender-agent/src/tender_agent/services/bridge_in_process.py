@@ -308,6 +308,104 @@ def _headless() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Robust, frame-aware marker visibility (login-model-B parity with the local
+# capture helper — see scripts/connect_delta.py). page.wait_for_selector only
+# inspects the main frame and resolves on the FIRST match's state, so a hidden
+# first match (or a menu inside an iframe) reads as "not logged in" even when
+# the supplier menu is plainly visible. This checks EVERY match in the page AND
+# every frame, and reports which alternative was found (and where) without ever
+# touching cookies.
+# ---------------------------------------------------------------------------
+
+
+def _frame_label(frame: Any, page: Any) -> str:
+    """A short, secret-free label for a frame ("main", a name, or a URL with the
+    query string stripped so a tokened URL is never echoed)."""
+    with contextlib.suppress(Exception):
+        if frame is getattr(page, "main_frame", None):
+            return "main"
+    for attr in ("name", "url"):
+        with contextlib.suppress(Exception):
+            value = getattr(frame, attr)
+            if value:
+                return str(value).split("?", 1)[0]
+    return "frame"
+
+
+async def _evaluate_marker_report(
+    page: Any, selectors: list[str], timeout_ms: int = 8000
+) -> dict[str, Any]:
+    """Return a frame-aware visibility report for each marker alternative.
+
+    For each selector we scan the page's frames (main + children), counting
+    matches and checking EVERY match's visibility (not just `.first`). Returns
+    page title, current_url, frames_checked, any_visible, and a per-selector
+    list of {found, frame, matches, error}. Never reads or returns cookies.
+    """
+    combined = ", ".join(selectors)
+    # Give the JS chrome a moment to attach (best-effort; we still report on
+    # timeout). state="attached" avoids the first-match-visible trap for the wait.
+    if combined:
+        with contextlib.suppress(Exception):
+            await page.wait_for_selector(
+                combined, timeout=max(0, timeout_ms), state="attached"
+            )
+
+    title = ""
+    with contextlib.suppress(Exception):
+        title = await page.title()
+
+    try:
+        frames = list(page.frames)
+    except Exception:  # noqa: BLE001
+        frames = []
+    if not frames:
+        frames = [page]  # degrade: treat the page itself as the only scope
+
+    markers: list[dict[str, Any]] = []
+    any_visible = False
+    for sel in selectors:
+        found = False
+        where: str | None = None
+        matches = 0
+        err: str | None = None
+        for frame in frames:
+            try:
+                loc = frame.locator(sel)
+                count = await loc.count()
+            except Exception as exc:  # noqa: BLE001
+                err = repr(exc)
+                continue
+            matches += count
+            for i in range(min(count, 20)):
+                try:
+                    if await loc.nth(i).is_visible():
+                        found = True
+                        where = _frame_label(frame, page)
+                        break
+                except Exception as exc:  # noqa: BLE001
+                    err = repr(exc)
+            if found:
+                break
+        any_visible = any_visible or found
+        markers.append(
+            {"selector": sel, "found": found, "frame": where,
+             "matches": matches, "error": err}
+        )
+
+    current_url: str | None = None
+    with contextlib.suppress(Exception):
+        current_url = page.url
+    return {
+        "title": title,
+        "current_url": current_url,
+        "frames_checked": len(frames),
+        "any_visible": any_visible,
+        "markers": markers,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Public driver — same surface as services.bridge_client.HttpBridgeClient
 # ---------------------------------------------------------------------------
 
@@ -522,6 +620,17 @@ class InProcessBridgeClient:
                 html = ""
         return RenderedPage(
             html=html, wait_satisfied=wait_satisfied, current_url=page.url
+        )
+
+    async def logged_in_marker_report(
+        self, slug: str, selectors: list[str], timeout_ms: int = 8000
+    ) -> dict[str, Any]:
+        """Frame-aware, every-match visibility report for a logged-in marker.
+        Used by the Delta probe so the cloud and the local capture helper detect
+        login identically. Returns diagnostics only — never cookie values."""
+        session = self._require(slug)
+        return await _evaluate_marker_report(
+            session.page, list(selectors), timeout_ms
         )
 
     async def find_links(self, slug: str, pattern: str) -> list[str]:

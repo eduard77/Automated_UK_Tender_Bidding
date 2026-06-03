@@ -215,6 +215,24 @@ async def test_session(
             bridge=bridge,
             platform_slug=slug,
         )
+        # Prefer the rich, frame-aware diagnostics when the adapter exposes them
+        # (Delta does) so a `logged_in: false` tells us WHY — which marker
+        # alternatives were found, in which frame, and the page title. Falls back
+        # to the plain boolean for adapters without it. Never includes cookies.
+        diag_fn = getattr(adapter, "login_diagnostics", None)
+        if diag_fn is not None:
+            diag = await diag_fn(ctx)
+            result: dict[str, Any] = {
+                "available": True,
+                "logged_in": bool(diag.get("logged_in")),
+                "current_url": diag.get("current_url"),
+                "title": diag.get("title"),
+                "redirected_to_login": bool(diag.get("redirected_to_login")),
+                "frames_checked": diag.get("frames_checked", 0),
+                "markers": diag.get("markers", []),
+            }
+            return result
+
         logged_in = await adapter.is_authenticated(ctx)
         current_url: str | None = None
         with contextlib.suppress(Exception):

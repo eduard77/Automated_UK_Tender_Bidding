@@ -18,10 +18,12 @@ from tender_agent.services.bridge_client import BridgeError, BridgeRowDownload, 
 from tender_agent.services.portals.adapters.delta_esourcing import (
     ALREADY_REGISTERED_DETAIL,
     CONCURRENT_LOGIN_DETAIL,
+    DELTA_LOGGED_IN_MARKERS,
     DELTA_LOGIN_SUCCESS_PATTERN,
     DELTA_SELECTORS,
     DELTA_URLS,
     DeltaEsourcingAdapter,
+    _split_or_selectors,
     extract_access_code,
 )
 from tender_agent.services.portals.base import Credentials, PortalContext
@@ -427,6 +429,128 @@ def test_login_success_pattern_matches_mainmenu_not_login():
         "https://www.delta-esourcing.com/delta/suppliers/select/addToList.html"
     )
     assert not rx.search("https://www.delta-esourcing.com/delta/login.html")
+
+
+# --- frame-aware probe (port of the #92 helper fixes into the backend) ------
+
+
+def test_split_or_selectors_top_level_only():
+    # Splits at top-level commas; preserves commas inside :has-text('...').
+    parts = _split_or_selectors(
+        "a:has-text('Response Manager'), header:has-text('A, B'), #x"
+    )
+    assert parts == [
+        "a:has-text('Response Manager')",
+        "header:has-text('A, B')",
+        "#x",
+    ]
+
+
+def test_logged_in_markers_split_from_selector():
+    # Each alternative of the real marker is available independently.
+    assert "a:has-text('Response Manager')" in DELTA_LOGGED_IN_MARKERS
+    assert any("Supplier Administrator" in m for m in DELTA_LOGGED_IN_MARKERS)
+    assert len(DELTA_LOGGED_IN_MARKERS) >= 4
+
+
+class _RichBridge:
+    """A bridge exposing the frame-aware `logged_in_marker_report`. Tracks
+    whether the rich path (not rendered_html) was used."""
+
+    def __init__(self, *, current_url: str, report: dict | None = None) -> None:
+        self._current_url = current_url
+        self._report = report
+        self.report_called = False
+        self.rendered_called = False
+        self.navigated: list[str] = []
+
+    async def navigate(self, slug, url):
+        self.navigated.append(url)
+        return {"current_url": self._current_url}
+
+    async def session_status(self, slug):
+        return {"current_url": self._current_url}
+
+    async def logged_in_marker_report(self, slug, selectors, timeout_ms=8000):
+        self.report_called = True
+        return self._report
+
+    async def rendered_html(self, slug, **kwargs):
+        self.rendered_called = True
+        return RenderedPage(html="", wait_satisfied=False,
+                            current_url=self._current_url)
+
+
+@pytest.mark.asyncio
+async def test_login_diagnostics_uses_frame_aware_report_when_present():
+    report = {
+        "title": "Activity Centre | Delta",
+        "current_url": "https://www.delta-esourcing.com/delta/mainMenu.html",
+        "frames_checked": 2,
+        "any_visible": True,
+        "markers": [
+            {"selector": "a:has-text('Response Manager')", "found": True,
+             "frame": "main", "matches": 1, "error": None},
+        ],
+    }
+    bridge = _RichBridge(
+        current_url="https://www.delta-esourcing.com/delta/mainMenu.html",
+        report=report,
+    )
+    diag = await DeltaEsourcingAdapter().login_diagnostics(_ctx(bridge))
+    assert bridge.report_called is True
+    assert bridge.rendered_called is False  # rich path, not the old wait
+    assert diag["logged_in"] is True
+    assert diag["title"] == "Activity Centre | Delta"
+    assert diag["frames_checked"] == 2
+    assert diag["markers"][0]["found"] is True
+    # is_authenticated is the boolean view of the same path.
+    assert await DeltaEsourcingAdapter().is_authenticated(_ctx(bridge)) is True
+
+
+@pytest.mark.asyncio
+async def test_login_diagnostics_not_logged_in_reports_markers():
+    report = {
+        "title": "Delta eSourcing",
+        "current_url": "https://www.delta-esourcing.com/delta/mainMenu.html",
+        "frames_checked": 1,
+        "any_visible": False,
+        "markers": [
+            {"selector": "a:has-text('Response Manager')", "found": False,
+             "frame": None, "matches": 0, "error": None},
+        ],
+    }
+    bridge = _RichBridge(
+        current_url="https://www.delta-esourcing.com/delta/mainMenu.html",
+        report=report,
+    )
+    diag = await DeltaEsourcingAdapter().login_diagnostics(_ctx(bridge))
+    assert diag["logged_in"] is False
+    assert diag["markers"][0]["found"] is False
+    assert diag["title"] == "Delta eSourcing"
+
+
+@pytest.mark.asyncio
+async def test_login_diagnostics_redirected_to_login_skips_marker_report():
+    bridge = _RichBridge(
+        current_url="https://www.delta-esourcing.com/delta/login.html",
+    )
+    diag = await DeltaEsourcingAdapter().login_diagnostics(_ctx(bridge))
+    assert diag["logged_in"] is False
+    assert diag["redirected_to_login"] is True
+    assert bridge.report_called is False  # short-circuit before the marker check
+
+
+@pytest.mark.asyncio
+async def test_login_diagnostics_falls_back_without_rich_method():
+    # A bridge WITHOUT logged_in_marker_report (e.g. HTTP) still works via the
+    # original rendered_html wait — existing behaviour is preserved.
+    bridge = FakeBridge(
+        current_url="https://www.delta-esourcing.com/delta/mainMenu.html",
+        present_selectors={DELTA_SELECTORS["logged_in_marker"]},
+    )
+    diag = await DeltaEsourcingAdapter().login_diagnostics(_ctx(bridge))
+    assert diag["logged_in"] is True
 
 
 @pytest.mark.asyncio

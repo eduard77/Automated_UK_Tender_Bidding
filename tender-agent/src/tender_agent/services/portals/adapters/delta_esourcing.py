@@ -36,6 +36,7 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import structlog
@@ -176,6 +177,45 @@ DELTA_SELECTORS = {
 }
 
 _STAGE_ONE_LINK_RE = re.compile(DELTA_SELECTORS["STAGE_ONE_LINK_REGEX"], re.IGNORECASE)
+
+
+def _split_or_selectors(css: str) -> list[str]:
+    """Split a comma-separated CSS OR-selector into its alternatives at
+    TOP-LEVEL commas only — commas inside quotes or brackets (e.g.
+    `:has-text('a, b')`) are preserved. Used so the probe can check each
+    logged-in-marker alternative independently and report which one matched."""
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    quote: str | None = None
+    for ch in css:
+        if quote is not None:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+        elif ch in "([":
+            depth += 1
+            buf.append(ch)
+        elif ch in ")]":
+            depth = max(0, depth - 1)
+            buf.append(ch)
+        elif ch == "," and depth == 0:
+            parts.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        parts.append("".join(buf).strip())
+    return [p for p in parts if p]
+
+
+# The logged-in marker as a list of independent alternatives — so the frame-aware
+# probe (login_diagnostics) can test and REPORT each one, not just OR them.
+DELTA_LOGGED_IN_MARKERS = _split_or_selectors(DELTA_SELECTORS["logged_in_marker"])
 
 # Login-success URL pattern for wait-for-login: after the human logs in (and
 # clears Microsoft Authenticator) Delta lands them in the authenticated app —
@@ -477,34 +517,87 @@ class DeltaEsourcingAdapter(PortalAdapter):
         return (ctx.source_url, ctx.description, *ctx.candidate_urls, ctx.tender_ref)
 
     async def is_authenticated(self, ctx: PortalContext) -> bool:
-        """Navigate to the authenticated landing (mainMenu / "Activity Centre");
+        """Whether the bridge session is a logged-in Delta supplier. Thin wrapper
+        over `login_diagnostics` so the boolean and the rich /session/test report
+        come from ONE code path (and one definition of "logged in")."""
+        return bool((await self.login_diagnostics(ctx)).get("logged_in"))
+
+    async def login_diagnostics(self, ctx: PortalContext) -> dict[str, Any]:
+        """Frame-aware authenticated-session probe shared by `is_authenticated`
+        and the /admin/portals/delta/session/test endpoint.
+
+        Navigate to the authenticated landing (mainMenu / "Activity Centre");
         authenticated if we're not bounced to login and the logged-in supplier
-        menu is present.
+        menu is visible. mainMenu.html is the CONFIRMED post-login page (an
+        unauthenticated hit redirects to login); the local capture helper checks
+        the very same page and markers, so capture and this probe agree.
 
-        mainMenu.html is the CONFIRMED post-login page (an unauthenticated hit
-        redirects to login); the local capture helper checks the very same page
-        and markers, so capture and this probe agree on what "logged in" means.
-
-        The supplier menu is part of the JS-rendered chrome, so we WAIT for the
-        marker in the rendered DOM (a real element wait) rather than probing the
-        current DOM once — an already-authenticated session that renders the menu
-        a beat late used to read as "fresh login required" and either re-prompt
-        or hang waiting_for_login (chunk 4h). Logs reuse vs fresh-login."""
+        The supplier menu is JS-rendered chrome, so we WAIT for it. Crucially the
+        marker check searches the page AND every frame and tests EVERY match of
+        each alternative (not just `.first`) — a hidden first match or an
+        iframe-hosted menu otherwise reads as "not logged in" even when the menu
+        is plainly visible (the cloud false-negative this fixes). Returns rich
+        diagnostics (title, per-marker found/where) and never touches cookies.
+        """
+        diag: dict[str, Any] = {
+            "logged_in": False,
+            "current_url": None,
+            "title": None,
+            "redirected_to_login": False,
+            "frames_checked": 0,
+            "markers": [],
+        }
         bridge, slug = ctx.bridge, ctx.platform_slug
         if bridge is None or slug is None:
-            return False
+            return diag
         try:
             await bridge.navigate(slug, DELTA_URLS["main_menu"])
             status = await bridge.session_status(slug)
         except Exception as exc:  # noqa: BLE001
             logger.info("delta.fresh_login_required", reason="navigate_failed",
                         error=str(exc))
-            return False
-        current = (status.get("current_url") or "").lower()
-        if "login" in current:
+            diag["error"] = str(exc)
+            return diag
+        current = status.get("current_url") or ""
+        diag["current_url"] = current
+        if "login" in current.lower():
             logger.info("delta.fresh_login_required", reason="redirected_to_login")
-            return False
-        # Wait for the logged-in marker to render (robust to a slow menu render).
+            diag["redirected_to_login"] = True
+            return diag
+
+        # Preferred: the bridge's frame-aware, every-match marker report.
+        report_fn = getattr(bridge, "logged_in_marker_report", None)
+        if report_fn is not None:
+            try:
+                rep = await report_fn(
+                    slug, DELTA_LOGGED_IN_MARKERS, DELTA_AUTH_MARKER_WAIT_MS
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.info("delta.marker_report_failed", error=str(exc))
+                rep = None
+            if rep is not None:
+                diag["logged_in"] = bool(rep.get("any_visible"))
+                diag["current_url"] = rep.get("current_url") or current
+                diag["title"] = rep.get("title")
+                diag["frames_checked"] = rep.get("frames_checked", 0)
+                diag["markers"] = rep.get("markers", [])
+                if not diag["logged_in"] and "login" in (
+                    diag["current_url"] or ""
+                ).lower():
+                    diag["redirected_to_login"] = True
+                logger.info(
+                    "delta.session_probe",
+                    slug=slug,
+                    logged_in=diag["logged_in"],
+                    markers_found=sum(
+                        1 for m in diag["markers"] if m.get("found")
+                    ),
+                    frames_checked=diag["frames_checked"],
+                )
+                return diag
+
+        # Fallback (HTTP bridge / fakes without the rich method): the original
+        # single-frame rendered_html wait. Keeps non-cloud paths working.
         try:
             res = await bridge.rendered_html(
                 slug,
@@ -512,17 +605,15 @@ class DeltaEsourcingAdapter(PortalAdapter):
                 timeout_ms=DELTA_AUTH_MARKER_WAIT_MS,
             )
             marker = res.wait_satisfied
-            # A late client-side bounce to login still means not authenticated.
+            diag["current_url"] = res.current_url or current
             if not marker and "login" in (res.current_url or "").lower():
-                logger.info("delta.fresh_login_required", reason="redirected_to_login")
-                return False
+                diag["redirected_to_login"] = True
         except Exception:  # noqa: BLE001
             marker = False
-        if marker:
-            logger.info("delta.session_reused", slug=slug)
-            return True
-        logger.info("delta.fresh_login_required", reason="no_logged_in_marker")
-        return False
+        diag["logged_in"] = bool(marker)
+        logger.info("delta.session_probe", slug=slug, logged_in=diag["logged_in"],
+                    path="fallback")
+        return diag
 
     async def authenticate(
         self, ctx: PortalContext, creds: Credentials | None

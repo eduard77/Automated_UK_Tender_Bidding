@@ -128,3 +128,118 @@ def test_headless_default_true():
 def test_headless_env_off(monkeypatch):
     monkeypatch.setenv("TENDER_AGENT_BRIDGE_HEADLESS", "false")
     assert bip._headless() is False
+
+
+# --- frame-aware marker report (no real Chromium; async fakes) --------------
+
+
+class _FakeMatch:
+    def __init__(self, visible: bool) -> None:
+        self._visible = visible
+
+    async def is_visible(self) -> bool:
+        return self._visible
+
+
+class _FakeLoc:
+    def __init__(self, visibilities: list[bool], raises: bool = False) -> None:
+        self._vis = visibilities
+        self._raises = raises
+
+    async def count(self) -> int:
+        if self._raises:
+            raise RuntimeError("locator exploded")
+        return len(self._vis)
+
+    def nth(self, i: int) -> _FakeMatch:
+        return _FakeMatch(self._vis[i])
+
+
+class _FakeFrame:
+    def __init__(self, sel_map: dict[str, list[bool]], *, name="", url="") -> None:
+        # sel_map: selector -> per-match visibility list. Missing selector = none.
+        self._sel_map = sel_map
+        self.name = name
+        self.url = url
+
+    def locator(self, selector: str) -> _FakeLoc:
+        return _FakeLoc(self._sel_map.get(selector, []))
+
+
+class _FakePage:
+    def __init__(self, frames: list, *, url="https://x/delta/mainMenu.html",
+                 title="Activity Centre | Delta") -> None:
+        self._frames = frames
+        self.main_frame = frames[0]
+        self.url = url
+        self._title = title
+
+    @property
+    def frames(self) -> list:
+        return self._frames
+
+    async def wait_for_selector(self, selector, timeout=0, state="attached"):
+        return None
+
+    async def title(self) -> str:
+        return self._title
+
+
+@pytest.mark.asyncio
+async def test_evaluate_marker_report_finds_marker_in_a_child_frame():
+    # The main frame has no visible marker; a child frame does.
+    main = _FakeFrame({}, name="main")
+    child = _FakeFrame(
+        {"a:has-text('Response Manager')": [True]}, name="menu", url="https://x/menu",
+    )
+    page = _FakePage([main, child])
+    rep = await bip._evaluate_marker_report(
+        page, ["a:has-text('Response Manager')", "#missing"]
+    )
+    assert rep["any_visible"] is True
+    assert rep["frames_checked"] == 2
+    assert rep["title"] == "Activity Centre | Delta"
+    rm = next(m for m in rep["markers"] if "Response Manager" in m["selector"])
+    assert rm["found"] is True
+    assert rm["frame"] == "menu"  # reported which frame it was found in
+
+
+@pytest.mark.asyncio
+async def test_evaluate_marker_report_ignores_hidden_first_match():
+    # First match hidden, a later one visible — .first would have missed it.
+    main = _FakeFrame({"a:has-text('Settings')": [False, False, True]}, name="main")
+    page = _FakePage([main])
+    rep = await bip._evaluate_marker_report(page, ["a:has-text('Settings')"])
+    assert rep["any_visible"] is True
+    assert rep["markers"][0]["found"] is True
+    assert rep["markers"][0]["frame"] == "main"
+
+
+@pytest.mark.asyncio
+async def test_evaluate_marker_report_surfaces_locator_error():
+    main = _FakeFrame({}, name="main")
+    main.locator = lambda sel: _FakeLoc([], raises=True)  # type: ignore[assignment]
+    page = _FakePage([main])
+    rep = await bip._evaluate_marker_report(page, ["a:has-text('x')"])
+    assert rep["any_visible"] is False
+    assert "exploded" in (rep["markers"][0]["error"] or "")
+
+
+@pytest.mark.asyncio
+async def test_evaluate_marker_report_not_found_reports_false():
+    main = _FakeFrame({}, name="main")
+    page = _FakePage([main])
+    rep = await bip._evaluate_marker_report(page, ["a:has-text('Response Manager')"])
+    assert rep["any_visible"] is False
+    assert rep["markers"][0]["found"] is False
+
+
+def test_frame_label_strips_query_string():
+    class _F:
+        name = ""
+        url = "https://x/delta/menu.html?token=secret"
+
+    class _P:
+        main_frame = object()
+
+    assert bip._frame_label(_F(), _P()) == "https://x/delta/menu.html"
