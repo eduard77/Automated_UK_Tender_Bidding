@@ -27,7 +27,12 @@ dependencies = [
     "pgvector>=0.3.6",
     "cryptography>=43.0.0",
     "keyring>=25.0.0",
-    "playwright>=1.47.0",
+    # Hard-pinned to match the Playwright base image (v1.47.0-noble) in the
+    # Dockerfile EXACTLY. A floor (>=) let pip resolve 1.60.0 at build time,
+    # whose Chromium revision isn't present in the 1.47.0 image — the backend
+    # then 500s on launch ("Executable doesn't exist at .../chromium...-1223").
+    # The library and the image base must agree to the patch version.
+    "playwright==1.47.0",
     "bcrypt>=4.2.0",
     "stripe>=11.0.0",
     "email-validator>=2.2.0",
