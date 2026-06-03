@@ -75,18 +75,21 @@ DEFAULT_LOGIN_TIMEOUT_S = 600
 # with tender-agent/src/tender_agent/services/portals/adapters/delta_esourcing.py
 # ---------------------------------------------------------------------------
 
-# Where to point the visible window. Delta redirects an unauthenticated user
-# from the Response Manager to its real login page automatically.
-_FALLBACK_LOGIN_URL = (
-    "https://www.delta-esourcing.com/delta/suppliers/select/addToList.html"
-)
-# A left-menu item that only renders for an authenticated supplier.
+# Where to point the visible window AND where to re-confirm login. This is the
+# CONFIRMED authenticated landing (mainMenu / "Activity Centre"); an
+# unauthenticated hit redirects to Delta's real login page automatically.
+_FALLBACK_LOGIN_URL = "https://www.delta-esourcing.com/delta/mainMenu.html"
+# Left-nav items + header role that only render for an authenticated supplier
+# (confirmed live on mainMenu.html). "Resources" is omitted — it can appear in
+# public chrome too.
 _FALLBACK_LOGGED_IN_MARKER = (
     "a:has-text('Response Manager'), a:has-text('Profile Manager'), "
-    "a:has-text('Select Accredit'), #supplierMenu, nav a:has-text('Resources')"
+    "a:has-text('Select Accredit'), a:has-text('Settings'), "
+    "header:has-text('Supplier Administrator')"
 )
-# After login Delta lands the supplier under /delta/suppliers/.
-_FALLBACK_SUCCESS_URL_PATTERN = r"delta-esourcing\.com/delta/suppliers/"
+# After login Delta lands the supplier on /delta/mainMenu.html — match any
+# authenticated /delta/ page while excluding the login page. NOT /delta/suppliers/.
+_FALLBACK_SUCCESS_URL_PATTERN = r"delta-esourcing\.com/delta/(?!login)"
 
 
 def _load_delta_markers() -> tuple[str, str, str]:
@@ -106,7 +109,7 @@ def _load_delta_markers() -> tuple[str, str, str]:
         )
 
         return (
-            DELTA_URLS["response_manager"],
+            DELTA_URLS["main_menu"],
             DELTA_SELECTORS["logged_in_marker"],
             DELTA_LOGIN_SUCCESS_PATTERN,
         )

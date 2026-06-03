@@ -18,6 +18,7 @@ from tender_agent.services.bridge_client import BridgeError, BridgeRowDownload, 
 from tender_agent.services.portals.adapters.delta_esourcing import (
     ALREADY_REGISTERED_DETAIL,
     CONCURRENT_LOGIN_DETAIL,
+    DELTA_LOGIN_SUCCESS_PATTERN,
     DELTA_SELECTORS,
     DELTA_URLS,
     DeltaEsourcingAdapter,
@@ -401,6 +402,31 @@ async def test_is_authenticated_false_on_login_redirect():
 async def test_is_authenticated_false_without_marker():
     bridge = FakeBridge(present_selectors=set())
     assert await DeltaEsourcingAdapter().is_authenticated(_ctx(bridge)) is False
+
+
+@pytest.mark.asyncio
+async def test_is_authenticated_probes_main_menu():
+    # The probe must navigate to the CONFIRMED authenticated landing
+    # (/delta/mainMenu.html) — the same page the local capture helper verifies —
+    # so capture and /session/test agree on what "logged in" means.
+    bridge = FakeBridge(
+        current_url="https://www.delta-esourcing.com/delta/mainMenu.html",
+        present_selectors={DELTA_SELECTORS["logged_in_marker"]},
+    )
+    assert await DeltaEsourcingAdapter().is_authenticated(_ctx(bridge)) is True
+    assert any("mainMenu.html" in u for u in bridge.navigated)
+    assert DELTA_URLS["main_menu"].endswith("/delta/mainMenu.html")
+
+
+def test_login_success_pattern_matches_mainmenu_not_login():
+    # Matches the real logged-in landing; rejects the login page; does NOT
+    # require /delta/suppliers/.
+    rx = re.compile(DELTA_LOGIN_SUCCESS_PATTERN)
+    assert rx.search("https://www.delta-esourcing.com/delta/mainMenu.html")
+    assert rx.search(
+        "https://www.delta-esourcing.com/delta/suppliers/select/addToList.html"
+    )
+    assert not rx.search("https://www.delta-esourcing.com/delta/login.html")
 
 
 @pytest.mark.asyncio

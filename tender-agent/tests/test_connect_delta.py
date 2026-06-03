@@ -96,7 +96,13 @@ def test_delta_markers_loaded_and_sane():
     # Whether from the canonical adapter or the inlined mirror, these must be set.
     assert "delta-esourcing.com" in cd.DELTA_LOGIN_URL
     assert "Response Manager" in cd.DELTA_LOGGED_IN_MARKER
-    assert "suppliers" in cd.DELTA_SUCCESS_URL_PATTERN
+    # The success pattern must match the CONFIRMED logged-in landing (mainMenu)
+    # and reject the login page — and must NOT require /delta/suppliers/.
+    import re as _re
+
+    rx = _re.compile(cd.DELTA_SUCCESS_URL_PATTERN, _re.IGNORECASE)
+    assert rx.search("https://www.delta-esourcing.com/delta/mainMenu.html")
+    assert not rx.search("https://www.delta-esourcing.com/delta/login.html")
 
 
 def test_markers_match_canonical_adapter():
@@ -112,7 +118,7 @@ def test_markers_match_canonical_adapter():
         DELTA_URLS,
     )
 
-    assert DELTA_URLS["response_manager"] == cd.DELTA_LOGIN_URL
+    assert DELTA_URLS["main_menu"] == cd.DELTA_LOGIN_URL
     assert DELTA_SELECTORS["logged_in_marker"] == cd.DELTA_LOGGED_IN_MARKER
     assert cd.DELTA_SUCCESS_URL_PATTERN == DELTA_LOGIN_SUCCESS_PATTERN
 
@@ -263,11 +269,16 @@ def test_parse_args_defaults(monkeypatch):
 
 # ---------------------------------------------------------------------------
 # Login detection — the capture must mirror the adapter's is_authenticated:
-# supplier-area URL + NOT login + marker visible, plus a real Delta cookie.
+# authenticated /delta area (the CONFIRMED mainMenu landing) + NOT login +
+# marker visible, plus a real Delta cookie.
 # ---------------------------------------------------------------------------
 
 import re  # noqa: E402
 
+# The CONFIRMED logged-in landing — Delta lands here after login + MFA, NOT
+# under /delta/suppliers/. This is the exact URL the earlier (too-strict) guard
+# rejected, so it's the key regression case.
+_MAINMENU_URL = "https://www.delta-esourcing.com/delta/mainMenu.html"
 _SUPPLIER_URL = (
     "https://www.delta-esourcing.com/delta/suppliers/select/addToList.html"
 )
@@ -327,42 +338,53 @@ class _FakeContext:
 # --- _looks_authenticated (cheap, non-navigating gate) ---------------------
 
 
+def test_looks_authenticated_accepts_real_mainmenu_landing():
+    # REGRESSION: a fully logged-in supplier lands on /delta/mainMenu.html (not
+    # /delta/suppliers/). The old guard required "suppliers" and never matched.
+    page = _FakePage(_MAINMENU_URL, marker_visible=True)
+    assert cd._looks_authenticated(page, _SUCCESS_RE) is True
+
+
 def test_looks_authenticated_rejects_login_page_even_with_marker():
-    # The exact bug we're fixing: marker visible but we're on the login page.
+    # The other bug: marker visible but we're on the login page.
     page = _FakePage(_LOGIN_URL, marker_visible=True)
     assert cd._looks_authenticated(page, _SUCCESS_RE) is False
 
 
-def test_looks_authenticated_rejects_non_supplier_url():
+def test_looks_authenticated_rejects_non_app_url():
     page = _FakePage("https://www.delta-esourcing.com/", marker_visible=True)
     assert cd._looks_authenticated(page, _SUCCESS_RE) is False
 
 
-def test_looks_authenticated_requires_marker_in_supplier_area():
+def test_looks_authenticated_requires_marker_in_app_area():
+    assert cd._looks_authenticated(
+        _FakePage(_MAINMENU_URL, marker_visible=True), _SUCCESS_RE
+    ) is True
+    assert cd._looks_authenticated(
+        _FakePage(_MAINMENU_URL, marker_visible=False), _SUCCESS_RE
+    ) is False
+    # Supplier-area pages still count as authenticated.
     assert cd._looks_authenticated(
         _FakePage(_SUPPLIER_URL, marker_visible=True), _SUCCESS_RE
     ) is True
-    assert cd._looks_authenticated(
-        _FakePage(_SUPPLIER_URL, marker_visible=False), _SUCCESS_RE
-    ) is False
 
 
 # --- _confirm_authenticated (authoritative, navigates like the probe) ------
 
 
-def test_confirm_authenticated_true_when_supplier_and_marker():
-    page = _FakePage(_LOGIN_URL, marker_visible=True, goto_url=_SUPPLIER_URL)
+def test_confirm_authenticated_true_when_mainmenu_and_marker():
+    page = _FakePage(_LOGIN_URL, marker_visible=True, goto_url=_MAINMENU_URL)
     assert cd._confirm_authenticated(page, _SUCCESS_RE) is True
 
 
 def test_confirm_authenticated_false_when_bounced_to_login():
-    page = _FakePage(_SUPPLIER_URL, marker_visible=True, goto_url=_LOGIN_URL)
+    page = _FakePage(_MAINMENU_URL, marker_visible=True, goto_url=_LOGIN_URL)
     assert cd._confirm_authenticated(page, _SUCCESS_RE) is False
 
 
 def test_confirm_authenticated_false_when_marker_never_renders():
     page = _FakePage(
-        _LOGIN_URL, marker_visible=False, marker_raises=True, goto_url=_SUPPLIER_URL
+        _LOGIN_URL, marker_visible=False, marker_raises=True, goto_url=_MAINMENU_URL
     )
     assert cd._confirm_authenticated(page, _SUCCESS_RE) is False
 
