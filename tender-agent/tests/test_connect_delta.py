@@ -259,3 +259,141 @@ def test_parse_args_defaults(monkeypatch):
     assert args.email is None
     assert args.timeout == cd.DEFAULT_LOGIN_TIMEOUT_S
     assert args.keep_open is False
+
+
+# ---------------------------------------------------------------------------
+# Login detection — the capture must mirror the adapter's is_authenticated:
+# supplier-area URL + NOT login + marker visible, plus a real Delta cookie.
+# ---------------------------------------------------------------------------
+
+import re  # noqa: E402
+
+_SUPPLIER_URL = (
+    "https://www.delta-esourcing.com/delta/suppliers/select/addToList.html"
+)
+_LOGIN_URL = "https://www.delta-esourcing.com/delta/login.html"
+_SUCCESS_RE = re.compile(cd.DELTA_SUCCESS_URL_PATTERN, re.IGNORECASE)
+
+
+class _FakeLocator:
+    def __init__(self, visible: bool, raises: bool) -> None:
+        self._visible = visible
+        self._raises = raises
+        self.first = self
+
+    def is_visible(self, timeout: int = 0) -> bool:
+        if self._raises:
+            raise RuntimeError("boom")
+        return self._visible
+
+    def wait_for(self, state: str = "visible", timeout: int = 0) -> None:
+        if self._raises or not self._visible:
+            raise RuntimeError("not visible")
+
+
+class _FakePage:
+    def __init__(
+        self,
+        url: str,
+        *,
+        marker_visible: bool = True,
+        marker_raises: bool = False,
+        goto_url: str | None = None,
+    ) -> None:
+        self._url = url
+        self._marker_visible = marker_visible
+        self._marker_raises = marker_raises
+        self._goto_url = goto_url
+
+    @property
+    def url(self) -> str:
+        return self._url
+
+    def goto(self, url: str, **kw: object) -> None:
+        self._url = self._goto_url if self._goto_url is not None else url
+
+    def locator(self, selector: str) -> _FakeLocator:
+        return _FakeLocator(self._marker_visible, self._marker_raises)
+
+
+class _FakeContext:
+    def __init__(self, cookies: list[dict]) -> None:
+        self._cookies = cookies
+
+    def cookies(self) -> list[dict]:
+        return self._cookies
+
+
+# --- _looks_authenticated (cheap, non-navigating gate) ---------------------
+
+
+def test_looks_authenticated_rejects_login_page_even_with_marker():
+    # The exact bug we're fixing: marker visible but we're on the login page.
+    page = _FakePage(_LOGIN_URL, marker_visible=True)
+    assert cd._looks_authenticated(page, _SUCCESS_RE) is False
+
+
+def test_looks_authenticated_rejects_non_supplier_url():
+    page = _FakePage("https://www.delta-esourcing.com/", marker_visible=True)
+    assert cd._looks_authenticated(page, _SUCCESS_RE) is False
+
+
+def test_looks_authenticated_requires_marker_in_supplier_area():
+    assert cd._looks_authenticated(
+        _FakePage(_SUPPLIER_URL, marker_visible=True), _SUCCESS_RE
+    ) is True
+    assert cd._looks_authenticated(
+        _FakePage(_SUPPLIER_URL, marker_visible=False), _SUCCESS_RE
+    ) is False
+
+
+# --- _confirm_authenticated (authoritative, navigates like the probe) ------
+
+
+def test_confirm_authenticated_true_when_supplier_and_marker():
+    page = _FakePage(_LOGIN_URL, marker_visible=True, goto_url=_SUPPLIER_URL)
+    assert cd._confirm_authenticated(page, _SUCCESS_RE) is True
+
+
+def test_confirm_authenticated_false_when_bounced_to_login():
+    page = _FakePage(_SUPPLIER_URL, marker_visible=True, goto_url=_LOGIN_URL)
+    assert cd._confirm_authenticated(page, _SUCCESS_RE) is False
+
+
+def test_confirm_authenticated_false_when_marker_never_renders():
+    page = _FakePage(
+        _LOGIN_URL, marker_visible=False, marker_raises=True, goto_url=_SUPPLIER_URL
+    )
+    assert cd._confirm_authenticated(page, _SUCCESS_RE) is False
+
+
+# --- _delta_session_cookie_present (safety net) ----------------------------
+
+
+def _cookie(name: str, domain: str, value: str = "x") -> dict:
+    return {"name": name, "domain": domain, "value": value}
+
+
+def test_cookie_gate_true_for_jsessionid_on_delta_domain():
+    ctx = _FakeContext([_cookie("JSESSIONID", "www.delta-esourcing.com")])
+    assert cd._delta_session_cookie_present(ctx) is True
+
+
+def test_cookie_gate_true_for_any_session_named_delta_cookie():
+    ctx = _FakeContext([_cookie("DeltaSessionToken", ".delta-esourcing.com")])
+    assert cd._delta_session_cookie_present(ctx) is True
+
+
+def test_cookie_gate_false_for_loadbalancer_cookie_only():
+    # An anonymous capture often still has LB cookies but no session cookie.
+    ctx = _FakeContext([_cookie("AWSALB", "www.delta-esourcing.com")])
+    assert cd._delta_session_cookie_present(ctx) is False
+
+
+def test_cookie_gate_false_for_session_cookie_on_other_domain():
+    ctx = _FakeContext([_cookie("JSESSIONID", "login.microsoftonline.com")])
+    assert cd._delta_session_cookie_present(ctx) is False
+
+
+def test_cookie_gate_false_when_empty():
+    assert cd._delta_session_cookie_present(_FakeContext([])) is False
