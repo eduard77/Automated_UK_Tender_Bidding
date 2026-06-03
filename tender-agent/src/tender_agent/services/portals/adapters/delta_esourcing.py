@@ -71,7 +71,16 @@ DELTA_URLS = {
     # CONFIRMED — supplier login starts from the homepage; Delta redirects an
     # unauthenticated user to login when they hit a supplier page.
     "login": "https://www.delta-esourcing.com/",
-    # CONFIRMED — Response Manager, used only as an authenticated-session probe.
+    # CONFIRMED (live, logged-in supplier) — the authenticated landing reached
+    # after login + MFA. Page title "Activity Centre | Delta", heading "Welcome
+    # to Delta"; left nav shows Profile Manager / Response Manager / Select
+    # Accredit / Resources / Settings and the header shows the user's name +
+    # "Supplier Administrator". This is the authenticated-session probe target
+    # (is_authenticated) — an unauthenticated hit redirects to login. NOTE: the
+    # logged-in URL is /delta/mainMenu.html, NOT under /delta/suppliers/.
+    "main_menu": "https://www.delta-esourcing.com/delta/mainMenu.html",
+    # CONFIRMED — Response Manager / supplier select page, used by the response
+    # operations below (register-interest, downloads, concurrent-login check).
     "response_manager": (
         "https://www.delta-esourcing.com/delta/suppliers/select/addToList.html"
     ),
@@ -108,11 +117,15 @@ DELTA_SELECTORS = {
     # CONFIRMED — open/closed banner text on the notice page.
     "open_marker_text": "currently OPEN",
     "closed_marker_text": "not currently open",
-    # CONFIRM SELECTOR — a stable left-menu item that only renders for an
-    # authenticated supplier (Profile Manager / Response Manager / etc.).
+    # CONFIRMED (live, logged-in supplier on /delta/mainMenu.html) — left-nav
+    # items + header role that only render for an authenticated supplier. We OR
+    # several together (and the caller also checks the URL is the authenticated
+    # area, not a login page) so one selector drifting doesn't break detection.
+    # "Resources" is intentionally omitted — it can appear in public chrome too.
     "logged_in_marker": (
         "a:has-text('Response Manager'), a:has-text('Profile Manager'), "
-        "a:has-text('Select Accredit'), #supplierMenu, nav a:has-text('Resources')"
+        "a:has-text('Select Accredit'), a:has-text('Settings'), "
+        "header:has-text('Supplier Administrator')"
     ),
     # CONFIRMED (live DOM, tender 3169) — the Stage One documents table is
     # <table id="document" class="dataTable ..." role="grid"> inside
@@ -165,9 +178,12 @@ DELTA_SELECTORS = {
 _STAGE_ONE_LINK_RE = re.compile(DELTA_SELECTORS["STAGE_ONE_LINK_REGEX"], re.IGNORECASE)
 
 # Login-success URL pattern for wait-for-login: after the human logs in (and
-# clears Microsoft Authenticator) Delta lands them in the supplier area. The
+# clears Microsoft Authenticator) Delta lands them in the authenticated app —
+# CONFIRMED to be /delta/mainMenu.html (the "Activity Centre"), NOT under
+# /delta/suppliers/. So match any authenticated /delta/ page (mainMenu, the
+# suppliers area, respond pages, …) while EXCLUDING the login page. The
 # orchestrator also falls back to is_authenticated(), so this is a hint.
-DELTA_LOGIN_SUCCESS_PATTERN = r"delta-esourcing\.com/delta/suppliers/"
+DELTA_LOGIN_SUCCESS_PATTERN = r"delta-esourcing\.com/delta/(?!login)"
 
 DELTA_DOMAIN_RE = re.compile(r"(^|\.)delta-esourcing\.com$", re.IGNORECASE)
 
@@ -461,8 +477,13 @@ class DeltaEsourcingAdapter(PortalAdapter):
         return (ctx.source_url, ctx.description, *ctx.candidate_urls, ctx.tender_ref)
 
     async def is_authenticated(self, ctx: PortalContext) -> bool:
-        """Navigate to the Response Manager; authenticated if we're not bounced
-        to login and the logged-in supplier menu is present.
+        """Navigate to the authenticated landing (mainMenu / "Activity Centre");
+        authenticated if we're not bounced to login and the logged-in supplier
+        menu is present.
+
+        mainMenu.html is the CONFIRMED post-login page (an unauthenticated hit
+        redirects to login); the local capture helper checks the very same page
+        and markers, so capture and this probe agree on what "logged in" means.
 
         The supplier menu is part of the JS-rendered chrome, so we WAIT for the
         marker in the rendered DOM (a real element wait) rather than probing the
@@ -473,7 +494,7 @@ class DeltaEsourcingAdapter(PortalAdapter):
         if bridge is None or slug is None:
             return False
         try:
-            await bridge.navigate(slug, DELTA_URLS["response_manager"])
+            await bridge.navigate(slug, DELTA_URLS["main_menu"])
             status = await bridge.session_status(slug)
         except Exception as exc:  # noqa: BLE001
             logger.info("delta.fresh_login_required", reason="navigate_failed",
