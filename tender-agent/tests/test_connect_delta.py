@@ -265,6 +265,8 @@ def test_parse_args_defaults(monkeypatch):
     assert args.email is None
     assert args.timeout == cd.DEFAULT_LOGIN_TIMEOUT_S
     assert args.keep_open is False
+    assert args.debug is False
+    assert cd.parse_args(["--debug"]).debug is True
 
 
 # ---------------------------------------------------------------------------
@@ -286,20 +288,44 @@ _LOGIN_URL = "https://www.delta-esourcing.com/delta/login.html"
 _SUCCESS_RE = re.compile(cd.DELTA_SUCCESS_URL_PATTERN, re.IGNORECASE)
 
 
-class _FakeLocator:
-    def __init__(self, visible: bool, raises: bool) -> None:
+class _FakeMatch:
+    def __init__(self, visible: bool) -> None:
         self._visible = visible
-        self._raises = raises
-        self.first = self
 
     def is_visible(self, timeout: int = 0) -> bool:
-        if self._raises:
-            raise RuntimeError("boom")
         return self._visible
 
-    def wait_for(self, state: str = "visible", timeout: int = 0) -> None:
-        if self._raises or not self._visible:
-            raise RuntimeError("not visible")
+
+class _FakeLocator:
+    """Models a selector with N matches (each with a visibility flag). `raises`
+    makes .count() blow up, to exercise the silent-exception surfacing."""
+
+    def __init__(self, matches: list[bool], raises: bool = False) -> None:
+        self._matches = matches
+        self._raises = raises
+        self.first = self  # legacy attribute; new code uses count()/nth()
+
+    def count(self) -> int:
+        if self._raises:
+            raise RuntimeError("locator boom")
+        return len(self._matches)
+
+    def nth(self, i: int) -> _FakeMatch:
+        return _FakeMatch(self._matches[i])
+
+    def is_visible(self, timeout: int = 0) -> bool:  # legacy .first.is_visible
+        if self._raises:
+            raise RuntimeError("boom")
+        return any(self._matches)
+
+
+class _FakeFrame:
+    def __init__(self, matches: list[bool], raises: bool = False) -> None:
+        self._matches = matches
+        self._raises = raises
+
+    def locator(self, selector: str) -> _FakeLocator:
+        return _FakeLocator(self._matches, self._raises)
 
 
 class _FakePage:
@@ -309,27 +335,43 @@ class _FakePage:
         *,
         marker_visible: bool = True,
         marker_raises: bool = False,
+        marker_matches: list[bool] | None = None,
         goto_url: str | None = None,
+        frames: list | None = None,
+        closed: bool = False,
     ) -> None:
         self._url = url
-        self._marker_visible = marker_visible
+        # marker_matches takes precedence; else a single match = marker_visible.
+        self._matches = (
+            marker_matches if marker_matches is not None else [marker_visible]
+        )
         self._marker_raises = marker_raises
         self._goto_url = goto_url
+        self._frames = frames or []
+        self._closed = closed
 
     @property
     def url(self) -> str:
         return self._url
 
+    @property
+    def frames(self) -> list:
+        return self._frames
+
+    def is_closed(self) -> bool:
+        return self._closed
+
     def goto(self, url: str, **kw: object) -> None:
         self._url = self._goto_url if self._goto_url is not None else url
 
     def locator(self, selector: str) -> _FakeLocator:
-        return _FakeLocator(self._marker_visible, self._marker_raises)
+        return _FakeLocator(self._matches, self._marker_raises)
 
 
 class _FakeContext:
-    def __init__(self, cookies: list[dict]) -> None:
+    def __init__(self, cookies: list[dict], pages: list | None = None) -> None:
         self._cookies = cookies
+        self.pages = pages or []
 
     def cookies(self) -> list[dict]:
         return self._cookies
@@ -386,7 +428,70 @@ def test_confirm_authenticated_false_when_marker_never_renders():
     page = _FakePage(
         _LOGIN_URL, marker_visible=False, marker_raises=True, goto_url=_MAINMENU_URL
     )
-    assert cd._confirm_authenticated(page, _SUCCESS_RE) is False
+    # confirm_wait_s=0 → one check then give up (no real 8s wait in the test).
+    assert cd._confirm_authenticated(page, _SUCCESS_RE, confirm_wait_s=0) is False
+
+
+# --- multi-tab / frames / hidden-match — the #92 root-cause fixes -----------
+
+
+def test_scan_finds_authenticated_tab_among_many():
+    # ROOT CAUSE: login (SSO) lands mainMenu in a SECOND tab; the original tab
+    # is parked on the login page. Scanning all tabs must find the logged-in one.
+    login_tab = _FakePage(_LOGIN_URL, marker_visible=True)
+    main_tab = _FakePage(_MAINMENU_URL, marker_visible=True)
+    found = cd._scan_for_authenticated_page([login_tab, main_tab], _SUCCESS_RE)
+    assert found is main_tab
+
+
+def test_scan_returns_none_when_no_tab_authenticated():
+    tabs = [
+        _FakePage(_LOGIN_URL, marker_visible=True),
+        _FakePage(_MAINMENU_URL, marker_visible=False),
+    ]
+    assert cd._scan_for_authenticated_page(tabs, _SUCCESS_RE) is None
+
+
+def test_scan_skips_closed_tabs():
+    closed_main = _FakePage(_MAINMENU_URL, marker_visible=True, closed=True)
+    assert cd._scan_for_authenticated_page([closed_main], _SUCCESS_RE) is None
+
+
+def test_marker_found_inside_a_frame():
+    # FRAMES: the page DOM has no visible marker, but a frame does.
+    page = _FakePage(
+        _MAINMENU_URL,
+        marker_visible=False,
+        frames=[_FakeFrame(matches=[True])],
+    )
+    assert cd._looks_authenticated(page, _SUCCESS_RE) is True
+
+
+def test_marker_scan_ignores_hidden_first_match():
+    # HIDDEN .first: the first OR-match is hidden, a later one is visible. The
+    # old `.first.is_visible()` would read the hidden one and miss the menu.
+    page = _FakePage(_MAINMENU_URL, marker_matches=[False, False, True])
+    assert cd._looks_authenticated(page, _SUCCESS_RE) is True
+
+
+def test_page_authenticated_surfaces_marker_error_in_detail():
+    # SILENT EXCEPTIONS: a locator error is reported (for --debug), not swallowed.
+    page = _FakePage(_MAINMENU_URL, marker_raises=True)
+    ok, detail = cd._page_authenticated(page, _SUCCESS_RE)
+    assert ok is False
+    assert "err=" in detail and "boom" in detail
+
+
+def test_scan_debug_sink_lists_every_tab():
+    tabs = [
+        _FakePage(_LOGIN_URL, marker_visible=True),
+        _FakePage(_MAINMENU_URL, marker_visible=True),
+    ]
+    sink: list[str] = []
+    cd._scan_for_authenticated_page(tabs, _SUCCESS_RE, sink)
+    assert len(sink) == 2  # debug enumerates ALL tabs, not just up to the match
+    assert any("url_ok=False" in line for line in sink)  # the login tab
+    assert any("marker=True" in line for line in sink)   # the mainMenu tab
 
 
 # --- _delta_session_cookie_present (safety net) ----------------------------
