@@ -122,6 +122,17 @@ DELTA_LOGIN_URL, DELTA_LOGGED_IN_MARKER, DELTA_SUCCESS_URL_PATTERN = (
     _load_delta_markers()
 )
 
+# Delta's authenticated session rides on a cookie. Delta eSourcing is a Java
+# servlet app, so the session cookie is JSESSIONID; we also accept any other
+# *session*-named cookie on the Delta domain so a server-side rename can't
+# silently break capture. This is a SAFETY NET to ensure there's actually a
+# session cookie to persist — the URL+marker check (mirroring the adapter's
+# is_authenticated) is what proves the session is *authenticated*, not anonymous.
+# NOTE: a Java app sets JSESSIONID even before login, so cookie presence alone
+# is necessary-but-not-sufficient; both gates must pass before we capture.
+DELTA_COOKIE_DOMAIN_SUBSTR = "delta-esourcing.com"
+DELTA_KNOWN_AUTH_COOKIES = ("JSESSIONID",)
+
 
 # ---------------------------------------------------------------------------
 # Friendly console output (no colour codes — works in any Windows terminal).
@@ -269,15 +280,70 @@ def upload_session(
 # ---------------------------------------------------------------------------
 
 
-def _is_logged_in(page: Any, success_re: re.Pattern[str]) -> bool:
-    """True once the supplier menu marker is visible, or the URL has landed in
-    the authenticated supplier area. Mirrors the adapter's is_authenticated."""
-    with contextlib.suppress(Exception):
-        if page.locator(DELTA_LOGGED_IN_MARKER).first.is_visible(timeout=500):
-            return True
-    with contextlib.suppress(Exception):
-        url = page.url or ""
-        if success_re.search(url) and "login" not in url.lower():
+def _looks_authenticated(page: Any, success_re: re.Pattern[str]) -> bool:
+    """Cheap, NON-navigating poll of the page the human's flow has landed on.
+
+    Mirrors the URL guard the adapter applies BEFORE it trusts the marker
+    (delta_esourcing.py:482-485): we only believe the supplier-menu marker when
+    we're already in the supplier area AND NOT on a login page. The old check
+    trusted the marker on any page, so Delta's pre-login chrome (e.g. a generic
+    `nav a:has-text('Resources')`) could trip it and capture an anonymous state.
+    """
+    try:
+        url = (page.url or "").lower()
+    except Exception:  # noqa: BLE001
+        return False
+    if "login" in url or not success_re.search(url):
+        return False
+    try:
+        return page.locator(DELTA_LOGGED_IN_MARKER).first.is_visible(timeout=500)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _confirm_authenticated(page: Any, success_re: re.Pattern[str]) -> bool:
+    """Authoritative confirmation — the SAME thing the cloud probe does.
+
+    Navigate to the Response Manager (the exact URL `is_authenticated` checks),
+    require that Delta did NOT bounce us to login and the URL is in the supplier
+    area, then WAIT for the logged-in supplier marker to render. Only when this
+    passes is the session genuinely logged in (not a half-set/anonymous state).
+    """
+    try:
+        page.goto(DELTA_LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
+    except Exception:  # noqa: BLE001
+        return False
+    url = (page.url or "").lower()
+    if "login" in url or not success_re.search(url):
+        return False
+    try:
+        page.locator(DELTA_LOGGED_IN_MARKER).first.wait_for(
+            state="visible", timeout=8_000
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+def _delta_session_cookie_present(context: Any) -> bool:
+    """True iff the context holds a genuine Delta session cookie to persist.
+
+    Reads cookie NAMES + domains only — values are never inspected or printed.
+    Requires a session-named cookie (JSESSIONID, or any `*session*` cookie) on
+    the delta-esourcing.com domain, so we never write a cookieless/empty state.
+    """
+    try:
+        cookies = context.cookies()
+    except Exception:  # noqa: BLE001
+        return False
+    for c in cookies:
+        domain = str(c.get("domain", "")).lower()
+        name = str(c.get("name", ""))
+        if (
+            DELTA_COOKIE_DOMAIN_SUBSTR in domain
+            and c.get("value")
+            and (name in DELTA_KNOWN_AUTH_COOKIES or "session" in name.lower())
+        ):
             return True
     return False
 
@@ -332,7 +398,17 @@ def capture_storage_state(
                     "The browser window was closed before login finished.\n"
                     "  → Run the command again and complete the Delta login."
                 )
-            if _is_logged_in(page, success_re):
+            # Two gates, both required, before we trust the session:
+            #   1. cheap non-navigating signal that we're in the supplier area
+            #      (not the login page) with the supplier menu showing;
+            #   2. authoritative re-check on the Response Manager (same as the
+            #      cloud probe) PLUS a real Delta session cookie in the jar.
+            # This prevents capturing an anonymous, not-fully-authenticated state.
+            if (
+                _looks_authenticated(page, success_re)
+                and _confirm_authenticated(page, success_re)
+                and _delta_session_cookie_present(context)
+            ):
                 logged_in = True
                 break
             now = time.monotonic()
@@ -347,14 +423,14 @@ def capture_storage_state(
                 if not keep_open:
                     browser.close()
             raise ConnectError(
-                "Timed out waiting for login — I didn't see a logged-in Delta "
-                "session.\n"
+                "Timed out waiting for a fully logged-in Delta session.\n"
                 "  → Make sure you finished signing in (and the Authenticator "
-                "prompt) in the browser window, then run the command again. "
-                "You can allow more time with --timeout 900."
+                "prompt) so Delta shows your supplier menu, then run the command "
+                "again. You can allow more time with --timeout 900."
             )
 
-        say("   Login detected — capturing your session...")
+        say("   Login confirmed (supplier menu + Delta session cookie) —")
+        say("   capturing your session...")
         # storage_state(path=...) writes cookies + localStorage to disk.
         context.storage_state(path=str(state_path))
 
