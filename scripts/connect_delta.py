@@ -29,6 +29,9 @@ OPTIONS (rarely needed)
     --timeout SECONDS   How long to wait for you to finish logging in
                         (default: 600 = 10 minutes).
     --keep-open         Leave the browser open after capture (debugging).
+    --debug             Print per-iteration diagnostics (open tabs + URLs, the
+                        marker result per tab/frame, the cookie gate) if login
+                        is never detected.
 
 Backend auth: the upload endpoint (POST /admin/portals/delta/session) is behind
 `require_account`, so we first POST your email/password to /accounts/login,
@@ -283,49 +286,125 @@ def upload_session(
 # ---------------------------------------------------------------------------
 
 
-def _looks_authenticated(page: Any, success_re: re.Pattern[str]) -> bool:
-    """Cheap, NON-navigating poll of the page the human's flow has landed on.
+def _is_closed(page: Any) -> bool:
+    try:
+        return bool(page.is_closed())
+    except Exception:  # noqa: BLE001
+        return True
 
-    Mirrors the URL guard the adapter applies BEFORE it trusts the marker
-    (delta_esourcing.py:482-485): we only believe the supplier-menu marker when
-    we're already in the supplier area AND NOT on a login page. The old check
-    trusted the marker on any page, so Delta's pre-login chrome (e.g. a generic
-    `nav a:has-text('Resources')`) could trip it and capture an anonymous state.
+
+def _scopes(page: Any) -> list:
+    """The page itself plus all its frames — so a marker living inside an iframe
+    is found, not only one in the top document (suspect #2)."""
+    scopes = [page]
+    try:
+        scopes.extend(list(page.frames or []))
+    except Exception:  # noqa: BLE001
+        pass
+    return scopes
+
+
+def _marker_visible(scope: Any) -> tuple[bool, str | None]:
+    """Whether the logged-in marker is visible in this page/frame.
+
+    Checks EVERY match, not just `.first` — Delta's mainMenu has several elements
+    matching the OR-selector (e.g. a hidden "Settings" before a visible "Response
+    Manager"), and `.first.is_visible()` would read the hidden one and miss the
+    real menu. Returns (visible, last_error_repr_or_None); the error is surfaced
+    by --debug instead of being silently swallowed (suspect #3).
     """
+    try:
+        loc = scope.locator(DELTA_LOGGED_IN_MARKER)
+        count = loc.count()
+    except Exception as exc:  # noqa: BLE001
+        return False, repr(exc)
+    err: str | None = None
+    for i in range(min(count, 20)):
+        try:
+            if loc.nth(i).is_visible():
+                return True, None
+        except Exception as exc:  # noqa: BLE001
+            err = repr(exc)
+    return False, err
+
+
+def _page_authenticated(page: Any, success_re: re.Pattern[str]) -> tuple[bool, str]:
+    """Is THIS page/tab a logged-in Delta session? Same strict criteria as #91 —
+    the URL is in the authenticated app area AND not a login page, AND the
+    supplier-menu marker is visible (now searched across the page's frames too).
+    Returns (ok, a human-readable detail string for --debug)."""
+    try:
+        url = page.url or ""
+    except Exception as exc:  # noqa: BLE001
+        return False, f"url-error={exc!r}"
+    if "login" in url.lower() or not success_re.search(url):
+        return False, f"url={url!r} url_ok=False marker=skipped"
+    err: str | None = None
+    for scope in _scopes(page):
+        visible, scope_err = _marker_visible(scope)
+        if visible:
+            return True, f"url={url!r} url_ok=True marker=True"
+        if scope_err:
+            err = scope_err
+    return False, (
+        f"url={url!r} url_ok=True marker=False" + (f" err={err}" if err else "")
+    )
+
+
+def _looks_authenticated(page: Any, success_re: re.Pattern[str]) -> bool:
+    """Boolean form of `_page_authenticated` (kept for callers and tests)."""
+    return _page_authenticated(page, success_re)[0]
+
+
+def _scan_for_authenticated_page(
+    pages: list, success_re: re.Pattern[str], debug_sink: list | None = None
+) -> Any | None:
+    """THE ROOT-CAUSE FIX (suspect #1): scan EVERY open tab, not just the page we
+    opened. Delta's login — including the Microsoft SSO hop — can land the
+    authenticated mainMenu.html in a different tab/window, so the original page
+    object never reaches the logged-in URL. Returns the first authenticated
+    page/tab, or None. In --debug mode it records every tab it inspected."""
+    candidate = None
+    for page in pages:
+        if _is_closed(page):
+            continue
+        ok, detail = _page_authenticated(page, success_re)
+        if debug_sink is not None:
+            debug_sink.append(f"   tab: {detail}")
+        if ok and candidate is None:
+            candidate = page
+            if debug_sink is None:
+                break  # in --debug we keep listing every tab; otherwise stop early
+    return candidate
+
+
+def _confirm_authenticated(
+    page: Any, success_re: re.Pattern[str], confirm_wait_s: float = 8.0
+) -> bool:
+    """Authoritative confirmation — the SAME thing the cloud probe does: navigate
+    this page to mainMenu (the exact URL is_authenticated checks), require we're
+    not bounced to login, then wait for the supplier marker to render (searched
+    in the page AND its frames). Only then is the session genuinely logged in.
+    """
+    try:
+        page.goto(DELTA_LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
+    except Exception:  # noqa: BLE001
+        return False
     try:
         url = (page.url or "").lower()
     except Exception:  # noqa: BLE001
         return False
     if "login" in url or not success_re.search(url):
         return False
-    try:
-        return page.locator(DELTA_LOGGED_IN_MARKER).first.is_visible(timeout=500)
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _confirm_authenticated(page: Any, success_re: re.Pattern[str]) -> bool:
-    """Authoritative confirmation — the SAME thing the cloud probe does.
-
-    Navigate to the Response Manager (the exact URL `is_authenticated` checks),
-    require that Delta did NOT bounce us to login and the URL is in the supplier
-    area, then WAIT for the logged-in supplier marker to render. Only when this
-    passes is the session genuinely logged in (not a half-set/anonymous state).
-    """
-    try:
-        page.goto(DELTA_LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
-    except Exception:  # noqa: BLE001
-        return False
-    url = (page.url or "").lower()
-    if "login" in url or not success_re.search(url):
-        return False
-    try:
-        page.locator(DELTA_LOGGED_IN_MARKER).first.wait_for(
-            state="visible", timeout=8_000
-        )
-    except Exception:  # noqa: BLE001
-        return False
-    return True
+    deadline = time.monotonic() + max(0.0, confirm_wait_s)
+    while True:
+        for scope in _scopes(page):
+            visible, _ = _marker_visible(scope)
+            if visible:
+                return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
 
 
 def _delta_session_cookie_present(context: Any) -> bool:
@@ -355,10 +434,12 @@ def capture_storage_state(
     state_path: Path,
     timeout_s: int,
     keep_open: bool,
+    debug: bool = False,
 ) -> None:
     """Open a visible browser at Delta, wait for the human to log in, then
     write the Playwright storage_state to `state_path`. Raises ConnectError on
-    timeout, a closed window, or a missing Playwright install."""
+    timeout, a closed window, or a missing Playwright install. With `debug`,
+    prints per-iteration diagnostics (tabs, URLs, marker result, cookie gate)."""
     try:
         from playwright.sync_api import sync_playwright  # noqa: PLC0415
     except ModuleNotFoundError as exc:
@@ -395,22 +476,36 @@ def capture_storage_state(
         last_nudge = 0.0
         logged_in = False
         while time.monotonic() < deadline:
-            # If the operator closed the window, stop with a clear message.
-            if page.is_closed():
+            # Scan ALL open tabs (Delta's SSO can land mainMenu in a new one).
+            open_pages = [
+                pg for pg in (list(getattr(context, "pages", []) or []))
+                if not _is_closed(pg)
+            ]
+            # Only give up as "closed" when EVERY tab is gone — the human may
+            # have closed the original tab but completed login in a new one.
+            if not open_pages:
                 raise ConnectError(
                     "The browser window was closed before login finished.\n"
                     "  → Run the command again and complete the Delta login."
                 )
-            # Two gates, both required, before we trust the session:
-            #   1. cheap non-navigating signal that we're in the supplier area
-            #      (not the login page) with the supplier menu showing;
-            #   2. authoritative re-check on the Response Manager (same as the
-            #      cloud probe) PLUS a real Delta session cookie in the jar.
-            # This prevents capturing an anonymous, not-fully-authenticated state.
+            # Gates, all required, before we trust the session:
+            #   1. some open tab is in the authenticated app area (not login)
+            #      with the supplier menu visible (searched across tabs+frames);
+            #   2. a real Delta session cookie is in the jar;
+            #   3. an authoritative re-check on mainMenu (same as the cloud probe).
+            debug_sink: list[str] | None = [] if debug else None
+            candidate = _scan_for_authenticated_page(open_pages, success_re, debug_sink)
+            cookie_ok = _delta_session_cookie_present(context)
+            if debug:
+                remaining = int(deadline - time.monotonic())
+                say(f"[debug] ~{remaining}s left | tabs={len(open_pages)} | "
+                    f"cookie_gate={cookie_ok}")
+                for line in debug_sink or []:
+                    say(line)
             if (
-                _looks_authenticated(page, success_re)
-                and _confirm_authenticated(page, success_re)
-                and _delta_session_cookie_present(context)
+                candidate is not None
+                and cookie_ok
+                and _confirm_authenticated(candidate, success_re)
             ):
                 logged_in = True
                 break
@@ -491,6 +586,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Leave the browser open after capture (debugging).",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print per-iteration diagnostics (open tabs + their URLs, the "
+        "marker-visibility result and any error per tab/frame, and the cookie "
+        "gate) — use this if login is never detected.",
+    )
     return parser.parse_args(argv)
 
 
@@ -527,7 +629,9 @@ def run(args: argparse.Namespace) -> int:
 
         # 2. Open a real browser and let the human log into Delta.
         step(2, total, "Log into Delta in the browser that opens")
-        capture_storage_state(state_path, args.timeout, args.keep_open)
+        capture_storage_state(
+            state_path, args.timeout, args.keep_open, debug=args.debug
+        )
         say("   Captured!")
 
         # 3. Upload the captured session to the cloud.
