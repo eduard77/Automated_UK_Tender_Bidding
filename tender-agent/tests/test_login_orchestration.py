@@ -628,19 +628,16 @@ async def test_session_keepalive_stops_quietly_on_error():
 # --- full routing through fetch_tender_documents -----------------------
 
 
-@pytest.mark.asyncio
-async def test_routing_selects_login_adapter(db: Session, monkeypatch):
-    """A tender on a Delta-platform portal routes to the login path."""
+def _seed_delta_routed(db: Session, ref: str):
+    """Seed a tender on a Delta-platform portal with a link sighting so
+    _select_adapter picks the registered Delta adapter (requires_login)."""
     from tender_agent.models import PortalPlatform, PortalUrlSighting
 
-    t, p = _seed(db, "route-1")
-    # Give the portal the delta platform so _select_adapter picks the registered
-    # Delta adapter (which is requires_login -> login path -> bridge check).
+    t, p = _seed(db, ref)
     platform = db.execute(
         select(PortalPlatform).where(PortalPlatform.slug == "delta_esourcing")
     ).scalar_one()
     p.platform_id = platform.id
-    # A link sighting so _select_portal picks this portal for the tender.
     db.add(
         PortalUrlSighting(
             portal_id=p.id,
@@ -652,7 +649,36 @@ async def test_routing_selects_login_adapter(db: Session, monkeypatch):
         )
     )
     db.flush()
+    return t, p
+
+
+@pytest.mark.asyncio
+async def test_routing_selects_login_adapter(db: Session, monkeypatch):
+    """A tender on a Delta-platform portal routes to the login path — proven by
+    bridge_unavailable. The local-fetch guard is bypassed here (local_fetch_runner
+    True) since this test is about routing, not the cloud-refusal pivot."""
+    from tender_agent.config import settings
+
+    monkeypatch.setattr(settings, "local_fetch_runner", True)
+    t, _ = _seed_delta_routed(db, "route-1")
     # Bridge down -> login path returns bridge_unavailable (proves we entered it).
     orch = PortalOrchestrator(bridge=FakeBridge(available=False))
     res = await orch.fetch_tender_documents(t.id, "eduard", db=db)
     assert res.status == OrchestrationStatus.bridge_unavailable
+
+
+@pytest.mark.asyncio
+async def test_cloud_refuses_delta_without_local_runner(db: Session, monkeypatch):
+    """Local-fetch pivot: by default the cloud must NOT drive Delta — routing to
+    a Delta tender returns needs_local_fetch WITHOUT touching the bridge (so it
+    can't contend with the operator's local login)."""
+    from tender_agent.config import settings
+
+    monkeypatch.setattr(settings, "local_fetch_runner", False)
+    t, _ = _seed_delta_routed(db, "route-block")
+    # A live bridge would proceed if the guard were absent; it must not be used.
+    orch = PortalOrchestrator(bridge=FakeBridge(available=True))
+    res = await orch.fetch_tender_documents(t.id, "eduard", db=db)
+    assert res.status == OrchestrationStatus.needs_local_fetch
+    assert res.platform_slug == "delta_esourcing"
+    assert "scripts/fetch_delta.py" in (res.detail or "")

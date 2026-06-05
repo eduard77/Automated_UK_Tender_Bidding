@@ -77,6 +77,9 @@ class OrchestrationStatus(StrEnum):
     waiting_for_login = "waiting_for_login"
     needs_user_confirmation = "needs_user_confirmation"
     bridge_unavailable = "bridge_unavailable"
+    # Local-fetch pivot: the cloud must not drive this platform (e.g. Delta,
+    # which 403s datacenter IPs) — the operator runs scripts/fetch_delta.py.
+    needs_local_fetch = "needs_local_fetch"
     failed = "failed"
     error = "error"
 
@@ -294,6 +297,17 @@ class PortalOrchestrator:
 
         # Login adapters (Delta, …) take a separate bridge-driven path.
         if adapter.requires_login:
+            block = self._local_fetch_block(platform_slug)
+            if block is not None:
+                self._set_task(db, task_id, status="needs_local_fetch", detail=block)
+                return OrchestrationResult(
+                    status=OrchestrationStatus.needs_local_fetch,
+                    tender_id=tender_id,
+                    portal_id=(portal.id if portal else None),
+                    platform_slug=platform_slug,
+                    adapter=adapter_name,
+                    detail=block,
+                )
             return await self._run_login_adapter(
                 db, adapter, tender, portal, platform_slug, adapter_name,
                 user_id, candidate_urls, task_id, resume_from_confirm,
@@ -360,6 +374,25 @@ class PortalOrchestrator:
                 await launched.close()
 
     # --- login-via-human path (chunk 4) --------------------------------
+
+    def _local_fetch_block(self, platform_slug: str | None) -> str | None:
+        """Local-fetch pivot guard: the cloud must NOT initiate fetches for
+        platforms that require a local human login (Delta — its login is bound to
+        the operator's residential IP; the cloud IP is 403'd). Returns a
+        human-readable reason to block with, or None to proceed.
+
+        The local runner (scripts/fetch_delta.py) sets `local_fetch_runner=true`
+        in its own process to bypass this and drive the browser locally."""
+        if settings.local_fetch_runner:
+            return None
+        if platform_slug and platform_slug in settings.local_fetch_platforms:
+            return (
+                f"'{platform_slug}' must be fetched from the operator's machine — "
+                "its login is bound to a residential IP and the cloud IP is "
+                "refused (403). Run scripts/fetch_delta.py locally; the cloud "
+                "ingests the result."
+            )
+        return None
 
     def _set_task(self, db: Session, task_id: str | None, **fields) -> None:
         if task_id is None:
