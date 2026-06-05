@@ -215,6 +215,25 @@ async def test_session(
             bridge=bridge,
             platform_slug=slug,
         )
+        # Prefer the rich, frame-aware diagnostics (page title + which marker
+        # alternative was found and in which frame) so a false read tells us WHY.
+        # Backward-compatible: `available`/`logged_in`/`current_url` are always
+        # present; the diagnostic fields are added, never removed. Adapters
+        # without `login_diagnostics` (test doubles) fall back to the old probe.
+        diagnose = getattr(adapter, "login_diagnostics", None)
+        if diagnose is not None:
+            diag = await diagnose(ctx)
+            return {
+                "available": True,
+                "logged_in": bool(diag.get("logged_in")),
+                "current_url": diag.get("current_url"),
+                "page_title": diag.get("page_title"),
+                "redirected_to_login": diag.get("redirected_to_login"),
+                "detection": diag.get("detection"),
+                "markers": diag.get("markers"),
+                "frames_searched": diag.get("frames_searched"),
+                "marker_error": diag.get("marker_error"),
+            }
         logged_in = await adapter.is_authenticated(ctx)
         current_url: str | None = None
         with contextlib.suppress(Exception):

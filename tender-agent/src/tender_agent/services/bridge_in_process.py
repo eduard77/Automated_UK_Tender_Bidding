@@ -66,6 +66,8 @@ from tender_agent.services.bridge_client import (
     BridgeError,
     BridgeFile,
     BridgeRowDownload,
+    MarkerAlternative,
+    MarkerProbeResult,
     RenderedPage,
 )
 
@@ -524,6 +526,51 @@ class InProcessBridgeClient:
             html=html, wait_satisfied=wait_satisfied, current_url=page.url
         )
 
+    async def probe_login_markers(
+        self,
+        slug: str,
+        markers: list[dict[str, str]],
+        *,
+        timeout_ms: int = 8000,
+        poll_ms: int = 250,
+    ) -> MarkerProbeResult:
+        """Frame-aware, every-match login-marker probe — the in-process port of
+        the capture helper's detection (PR #92), so the headless cloud probe and
+        the operator's local capture agree on what "logged in" means.
+
+        `markers` is a list of {"label", "selector"} alternatives. Unlike a plain
+        `rendered_html(wait_for_selector=…)` (which only inspects the TOP frame
+        and trips on a hidden first match), this:
+          - searches the page AND all its frames for each alternative;
+          - checks EVERY match (count()/nth().is_visible()), so a hidden first
+            match can't mask a visible later one;
+          - surfaces locator/timeout errors instead of swallowing them.
+        Polls up to `timeout_ms` for a marker to render (Delta's supplier menu is
+        client-side chrome). Returns rich per-alternative + per-frame diagnostics;
+        never reads or returns cookie values."""
+        session = self._require(slug)
+        page = session.page
+        deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
+        alternatives, any_visible, err = await _scan_login_markers(page, markers)
+        while not any_visible and time.monotonic() < deadline:
+            await asyncio.sleep(max(0, poll_ms) / 1000.0)
+            alternatives, any_visible, err = await _scan_login_markers(page, markers)
+        page_title: str | None = None
+        with contextlib.suppress(Exception):
+            page_title = await page.title()
+        current_url: str | None = None
+        with contextlib.suppress(Exception):
+            current_url = page.url
+        frames_searched = [name for name, _ in _marker_scopes(page)]
+        return MarkerProbeResult(
+            visible=any_visible,
+            page_title=page_title,
+            current_url=current_url,
+            frames_searched=frames_searched,
+            alternatives=alternatives,
+            error=err,
+        )
+
     async def find_links(self, slug: str, pattern: str) -> list[str]:
         session = self._require(slug)
         try:
@@ -695,6 +742,98 @@ def _authenticated_guess(current_url: str, html: str) -> bool:
         re.IGNORECASE,
     )
     return not markers.search(html or "")
+
+
+# --- frame-aware login-marker detection (port of capture helper #92) -------
+# How many matches of a single OR-alternative we inspect per scope before giving
+# up — mirrors the helper's bound so a pathological page can't stall the probe.
+_MARKER_MAX_MATCHES = 20
+
+
+def _marker_scopes(page: Any) -> list[tuple[str, Any]]:
+    """The page (top document) plus each child frame, as (name, scope) pairs —
+    so a marker living inside an iframe is found, not only one in the top
+    document. The main frame is included once (as the page); child frames are
+    labelled by name, else URL, else index."""
+    scopes: list[tuple[str, Any]] = [("main", page)]
+    main_frame = None
+    with contextlib.suppress(Exception):
+        main_frame = page.main_frame
+    frames: list[Any] = []
+    with contextlib.suppress(Exception):
+        frames = list(page.frames or [])
+    for i, fr in enumerate(frames):
+        if main_frame is not None and fr is main_frame:
+            continue  # already covered by the page scope
+        name: str | None = None
+        with contextlib.suppress(Exception):
+            name = fr.name or None
+        if not name:
+            with contextlib.suppress(Exception):
+                name = fr.url or None
+        scopes.append((name or f"frame{i}", fr))
+    return scopes
+
+
+async def _marker_visible_in_scope(
+    scope: Any, selector: str
+) -> tuple[int, bool, str | None]:
+    """(match_count, any_visible, error_repr) for one selector in one scope.
+
+    Checks EVERY match (count()/nth().is_visible()), not just `.first` — Delta's
+    mainMenu has several elements matching the OR-selector and a hidden first
+    match must not mask a visible later one. Locator errors are returned, not
+    swallowed."""
+    try:
+        loc = scope.locator(selector)
+        count = await loc.count()
+    except Exception as exc:  # noqa: BLE001
+        return 0, False, repr(exc)
+    err: str | None = None
+    for i in range(min(count, _MARKER_MAX_MATCHES)):
+        try:
+            if await loc.nth(i).is_visible():
+                return count, True, None
+        except Exception as exc:  # noqa: BLE001
+            err = repr(exc)
+    return count, False, err
+
+
+async def _scan_login_markers(
+    page: Any, markers: list[dict[str, str]]
+) -> tuple[list[MarkerAlternative], bool, str | None]:
+    """One pass over the page + all frames for each marker alternative.
+
+    Returns (alternatives, any_visible, first_error). Per alternative we record
+    whether it was found (present) and/or visible, and in which frame; the first
+    locator error encountered is surfaced both per-alternative and as the overall
+    error so a future false read can be explained."""
+    scopes = _marker_scopes(page)
+    alternatives: list[MarkerAlternative] = []
+    any_visible = False
+    first_error: str | None = None
+    for m in markers:
+        selector = str(m.get("selector") or "")
+        alt = MarkerAlternative(
+            label=str(m.get("label") or selector), selector=selector
+        )
+        for scope_name, scope in scopes:
+            count, vis, err = await _marker_visible_in_scope(scope, selector)
+            if err and alt.error is None:
+                alt.error = err
+            if count > 0 and not alt.found:
+                alt.found = True
+                alt.frame = scope_name
+            if vis:
+                alt.visible = True
+                alt.frame = scope_name
+                break
+        if alt.visible:
+            any_visible = True
+        if alt.error and first_error is None:
+            first_error = alt.error
+        alternatives.append(alt)
+    return alternatives, any_visible, first_error
 
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]")

@@ -12,7 +12,7 @@ adapter import them from here exactly as before.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import httpx
@@ -55,6 +55,44 @@ class RenderedPage:
     html: str
     wait_satisfied: bool
     current_url: str | None = None
+
+
+@dataclass
+class MarkerAlternative:
+    """One alternative of an OR'd login marker and where the probe found it.
+
+    `found` = the selector matched something in some frame's DOM; `visible` =
+    at least one match is actually visible; `frame` names where it was found
+    ('main' for the top document, otherwise a child frame's name or URL).
+    `error` carries a locator/timeout error repr when one occurred — surfaced
+    rather than swallowed so a false read can be explained (no cookie values).
+    """
+
+    label: str
+    selector: str
+    found: bool = False
+    visible: bool = False
+    frame: str | None = None
+    error: str | None = None
+
+
+@dataclass
+class MarkerProbeResult:
+    """Result of a frame-aware login-marker probe.
+
+    `visible` is the headline boolean — any alternative visible in any frame.
+    The per-alternative + per-frame detail (`alternatives`, `frames_searched`)
+    plus `page_title` let `/session/test` report WHY a probe read false. This
+    is the in-process port of the capture helper's detection (PR #92) so the
+    headless cloud probe and the operator's capture agree on "logged in".
+    """
+
+    visible: bool
+    page_title: str | None = None
+    current_url: str | None = None
+    frames_searched: list[str] = field(default_factory=list)
+    alternatives: list[MarkerAlternative] = field(default_factory=list)
+    error: str | None = None
 
 
 class BridgeClient(Protocol):
