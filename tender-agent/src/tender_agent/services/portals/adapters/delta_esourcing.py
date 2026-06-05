@@ -34,7 +34,7 @@ import contextlib
 import hashlib
 import re
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -107,6 +107,20 @@ DELTA_URLS = {
     "logout": "https://www.delta-esourcing.com/delta/logout.html",
 }
 
+# CONFIRMED (live, logged-in supplier on /delta/mainMenu.html) — left-nav items
+# + header role that only render for an authenticated supplier. Held as labelled
+# ALTERNATIVES (not just an OR string) so the probe can report which one matched
+# and in which frame; the combined OR string below is derived from them so the
+# two can never drift. "Resources" is intentionally omitted — it can appear in
+# public chrome too. (label, selector) — the label is what /session/test reports.
+DELTA_LOGGED_IN_MARKERS: tuple[tuple[str, str], ...] = (
+    ("Response Manager", "a:has-text('Response Manager')"),
+    ("Profile Manager", "a:has-text('Profile Manager')"),
+    ("Select Accredit", "a:has-text('Select Accredit')"),
+    ("Settings", "a:has-text('Settings')"),
+    ("Supplier Administrator", "header:has-text('Supplier Administrator')"),
+)
+
 DELTA_SELECTORS = {
     # CONFIRMED — the notice page button label is exactly "REGISTER INTEREST".
     # Playwright :has-text is case-insensitive substring, so this matches it.
@@ -118,16 +132,12 @@ DELTA_SELECTORS = {
     # CONFIRMED — open/closed banner text on the notice page.
     "open_marker_text": "currently OPEN",
     "closed_marker_text": "not currently open",
-    # CONFIRMED (live, logged-in supplier on /delta/mainMenu.html) — left-nav
-    # items + header role that only render for an authenticated supplier. We OR
-    # several together (and the caller also checks the URL is the authenticated
-    # area, not a login page) so one selector drifting doesn't break detection.
-    # "Resources" is intentionally omitted — it can appear in public chrome too.
-    "logged_in_marker": (
-        "a:has-text('Response Manager'), a:has-text('Profile Manager'), "
-        "a:has-text('Select Accredit'), a:has-text('Settings'), "
-        "header:has-text('Supplier Administrator')"
-    ),
+    # CONFIRMED (live, logged-in supplier on /delta/mainMenu.html) — the OR of
+    # DELTA_LOGGED_IN_MARKERS (derived so the two never drift). The caller also
+    # checks the URL is the authenticated area, not a login page, so one selector
+    # drifting doesn't break detection. Kept as a single string for callers that
+    # want one selector (the capture helper, the rendered_html fallback path).
+    "logged_in_marker": ", ".join(sel for _, sel in DELTA_LOGGED_IN_MARKERS),
     # CONFIRMED (live DOM, tender 3169) — the Stage One documents table is
     # <table id="document" class="dataTable ..." role="grid"> inside
     # <div id="documentList">. Columns: Document Title / Size / File Type /
@@ -490,6 +500,25 @@ def _parse_items_count(html: str) -> int | None:
     return max(nums) if nums else None
 
 
+@dataclass
+class _LoginProbe:
+    """Structured result of the Delta authenticated-session probe. `logged_in`
+    is the headline boolean is_authenticated returns; the rest is diagnostics
+    surfaced by /session/test (page title, per-marker found/visible/frame, the
+    frames searched, any locator error) so a future false read tells us WHY.
+    `detection` is "frames" when the frame-aware bridge probe ran, "single" for
+    the top-frame rendered_html fallback (HTTP bridge / older bridges)."""
+
+    logged_in: bool
+    current_url: str | None = None
+    page_title: str | None = None
+    redirected_to_login: bool = False
+    detection: str = "single"
+    markers: list[dict[str, Any]] = field(default_factory=list)
+    frames_searched: list[str] = field(default_factory=list)
+    error: str | None = None
+
+
 class DeltaEsourcingAdapter(PortalAdapter):
     platform_slug = "delta_esourcing"
     requires_browser = False  # uses the Windows bridge, not an in-process page
@@ -526,94 +555,6 @@ class DeltaEsourcingAdapter(PortalAdapter):
         """Frame-aware authenticated-session probe shared by `is_authenticated`
         and the /admin/portals/delta/session/test endpoint.
 
-        Navigate to the authenticated landing (mainMenu / "Activity Centre");
-        authenticated if we're not bounced to login and the logged-in supplier
-        menu is visible. mainMenu.html is the CONFIRMED post-login page (an
-        unauthenticated hit redirects to login); the local capture helper checks
-        the very same page and markers, so capture and this probe agree.
-
-        The supplier menu is JS-rendered chrome, so we WAIT for it. Crucially the
-        marker check searches the page AND every frame and tests EVERY match of
-        each alternative (not just `.first`) — a hidden first match or an
-        iframe-hosted menu otherwise reads as "not logged in" even when the menu
-        is plainly visible (the cloud false-negative this fixes). Returns rich
-        diagnostics (title, per-marker found/where) and never touches cookies.
-        """
-        diag: dict[str, Any] = {
-            "logged_in": False,
-            "current_url": None,
-            "title": None,
-            "redirected_to_login": False,
-            "frames_checked": 0,
-            "markers": [],
-        }
-        bridge, slug = ctx.bridge, ctx.platform_slug
-        if bridge is None or slug is None:
-            return diag
-        try:
-            await bridge.navigate(slug, DELTA_URLS["main_menu"])
-            status = await bridge.session_status(slug)
-        except Exception as exc:  # noqa: BLE001
-            logger.info("delta.fresh_login_required", reason="navigate_failed",
-                        error=str(exc))
-            diag["error"] = str(exc)
-            return diag
-        current = status.get("current_url") or ""
-        diag["current_url"] = current
-        if "login" in current.lower():
-            logger.info("delta.fresh_login_required", reason="redirected_to_login")
-            diag["redirected_to_login"] = True
-            return diag
-
-        # Preferred: the bridge's frame-aware, every-match marker report.
-        report_fn = getattr(bridge, "logged_in_marker_report", None)
-        if report_fn is not None:
-            try:
-                rep = await report_fn(
-                    slug, DELTA_LOGGED_IN_MARKERS, DELTA_AUTH_MARKER_WAIT_MS
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.info("delta.marker_report_failed", error=str(exc))
-                rep = None
-            if rep is not None:
-                diag["logged_in"] = bool(rep.get("any_visible"))
-                diag["current_url"] = rep.get("current_url") or current
-                diag["title"] = rep.get("title")
-                diag["frames_checked"] = rep.get("frames_checked", 0)
-                diag["markers"] = rep.get("markers", [])
-                if not diag["logged_in"] and "login" in (
-                    diag["current_url"] or ""
-                ).lower():
-                    diag["redirected_to_login"] = True
-                logger.info(
-                    "delta.session_probe",
-                    slug=slug,
-                    logged_in=diag["logged_in"],
-                    markers_found=sum(
-                        1 for m in diag["markers"] if m.get("found")
-                    ),
-                    frames_checked=diag["frames_checked"],
-                )
-                return diag
-
-        # Fallback (HTTP bridge / fakes without the rich method): the original
-        # single-frame rendered_html wait. Keeps non-cloud paths working.
-        try:
-            res = await bridge.rendered_html(
-                slug,
-                wait_for_selector=DELTA_SELECTORS["logged_in_marker"],
-                timeout_ms=DELTA_AUTH_MARKER_WAIT_MS,
-            )
-            marker = res.wait_satisfied
-            diag["current_url"] = res.current_url or current
-            if not marker and "login" in (res.current_url or "").lower():
-                diag["redirected_to_login"] = True
-        except Exception:  # noqa: BLE001
-            marker = False
-        diag["logged_in"] = bool(marker)
-        logger.info("delta.session_probe", slug=slug, logged_in=diag["logged_in"],
-                    path="fallback")
-        return diag
 
     async def authenticate(
         self, ctx: PortalContext, creds: Credentials | None

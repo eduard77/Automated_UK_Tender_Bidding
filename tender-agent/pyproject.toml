@@ -36,6 +36,11 @@ dependencies = [
     "bcrypt>=4.2.0",
     "stripe>=11.0.0",
     "email-validator>=2.2.0",
+    # Azure Blob for ingested document bytes (local-fetch pivot). Auth is
+    # managed identity via DefaultAzureCredential (azure-identity) — NO
+    # connection string. Imported lazily; absent Azure → local-disk fallback.
+    "azure-storage-blob>=12.19.0",
+    "azure-identity>=1.17.0",
 ]
 
 [project.optional-dependencies]

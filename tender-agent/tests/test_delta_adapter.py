@@ -14,7 +14,13 @@ from pathlib import Path
 
 import pytest
 
-from tender_agent.services.bridge_client import BridgeError, BridgeRowDownload, RenderedPage
+from tender_agent.services.bridge_client import (
+    BridgeError,
+    BridgeRowDownload,
+    MarkerAlternative,
+    MarkerProbeResult,
+    RenderedPage,
+)
 from tender_agent.services.portals.adapters.delta_esourcing import (
     ALREADY_REGISTERED_DETAIL,
     CONCURRENT_LOGIN_DETAIL,
@@ -418,6 +424,156 @@ async def test_is_authenticated_probes_main_menu():
     assert await DeltaEsourcingAdapter().is_authenticated(_ctx(bridge)) is True
     assert any("mainMenu.html" in u for u in bridge.navigated)
     assert DELTA_URLS["main_menu"].endswith("/delta/mainMenu.html")
+
+
+# --- frame-aware marker probe (PR #92 ported into the backend) ---------------
+
+
+class MarkerBridge(FakeBridge):
+    """A bridge that supports the frame-aware `probe_login_markers` (like the
+    in-process cloud bridge). Returns a canned MarkerProbeResult so the adapter's
+    rich detection path + diagnostics are exercised without Playwright."""
+
+    def __init__(self, *, probe_result=None, probe_error=None, **kw):
+        super().__init__(**kw)
+        self._probe_result = probe_result
+        self._probe_error = probe_error
+        self.probe_calls: list = []
+
+    async def probe_login_markers(self, slug, markers, *, timeout_ms=8000,
+                                  poll_ms=250):
+        self.probe_calls.append({"markers": markers, "timeout_ms": timeout_ms})
+        if self._probe_error is not None:
+            raise self._probe_error
+        return self._probe_result
+
+
+def _visible_result(label="Response Manager", frame="menuFrame",
+                    url="https://www.delta-esourcing.com/delta/mainMenu.html"):
+    alts = [
+        MarkerAlternative(label=lbl, selector=sel,
+                          found=(lbl == label), visible=(lbl == label),
+                          frame=frame if lbl == label else None)
+        for lbl, sel in DELTA_LOGGED_IN_MARKERS
+    ]
+    return MarkerProbeResult(
+        visible=True, page_title="Activity Centre | Delta", current_url=url,
+        frames_searched=["main", frame], alternatives=alts, error=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_is_authenticated_uses_frame_probe_when_available():
+    # The marker is visible only inside a frame — the rich probe finds it where
+    # the old top-frame rendered_html wait would have missed it.
+    bridge = MarkerBridge(
+        current_url="https://www.delta-esourcing.com/delta/mainMenu.html",
+        probe_result=_visible_result(),
+    )
+    assert await DeltaEsourcingAdapter().is_authenticated(_ctx(bridge)) is True
+    # Used the frame-aware path, passing all five labelled alternatives.
+    assert bridge.probe_calls
+    sent = {m["label"] for m in bridge.probe_calls[0]["markers"]}
+    assert sent == {lbl for lbl, _ in DELTA_LOGGED_IN_MARKERS}
+    # rendered_html (the top-frame fallback) was NOT used for the marker wait.
+    assert all(
+        c["selector"] != DELTA_SELECTORS["logged_in_marker"]
+        for c in bridge.rendered_calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_login_diagnostics_surface_marker_detail():
+    bridge = MarkerBridge(
+        current_url="https://www.delta-esourcing.com/delta/mainMenu.html",
+        probe_result=_visible_result(),
+    )
+    diag = await DeltaEsourcingAdapter().login_diagnostics(_ctx(bridge))
+    assert diag["logged_in"] is True
+    assert diag["detection"] == "frames"
+    assert diag["page_title"] == "Activity Centre | Delta"
+    assert diag["frames_searched"] == ["main", "menuFrame"]
+    rm = next(m for m in diag["markers"] if m["label"] == "Response Manager")
+    assert rm["found"] is True and rm["visible"] is True and rm["frame"] == "menuFrame"
+    assert diag["marker_error"] is None
+
+
+@pytest.mark.asyncio
+async def test_login_diagnostics_report_why_false():
+    # No marker visible anywhere → logged_in False, and the diagnostics say WHY
+    # (no alternative visible) plus carry any locator error — without cookies.
+    alts = [MarkerAlternative(label=lbl, selector=sel, found=False, visible=False)
+            for lbl, sel in DELTA_LOGGED_IN_MARKERS]
+    result = MarkerProbeResult(
+        visible=False, page_title="Delta eSourcing", frames_searched=["main"],
+        current_url="https://www.delta-esourcing.com/delta/mainMenu.html",
+        alternatives=alts, error="TimeoutError('locator')",
+    )
+    bridge = MarkerBridge(
+        current_url="https://www.delta-esourcing.com/delta/mainMenu.html",
+        probe_result=result,
+    )
+    diag = await DeltaEsourcingAdapter().login_diagnostics(_ctx(bridge))
+    assert diag["logged_in"] is False
+    assert diag["redirected_to_login"] is False
+    assert diag["marker_error"] == "TimeoutError('locator')"
+    assert all(m["visible"] is False for m in diag["markers"])
+
+
+@pytest.mark.asyncio
+async def test_frame_probe_late_login_bounce_is_not_authenticated():
+    # mainMenu loaded clean, but the client-side app bounced to login and no
+    # marker is visible → not authenticated, flagged as redirected.
+    alts = [MarkerAlternative(label=lbl, selector=sel) for lbl, sel in
+            DELTA_LOGGED_IN_MARKERS]
+    result = MarkerProbeResult(
+        visible=False, current_url="https://www.delta-esourcing.com/delta/login.html",
+        frames_searched=["main"], alternatives=alts,
+    )
+    bridge = MarkerBridge(
+        current_url="https://www.delta-esourcing.com/delta/mainMenu.html",
+        probe_result=result,
+    )
+    diag = await DeltaEsourcingAdapter().login_diagnostics(_ctx(bridge))
+    assert diag["logged_in"] is False
+    assert diag["redirected_to_login"] is True
+
+
+@pytest.mark.asyncio
+async def test_frame_probe_error_surfaces_not_swallowed():
+    # The probe itself raising must NOT read as logged-in; the error is recorded.
+    bridge = MarkerBridge(
+        current_url="https://www.delta-esourcing.com/delta/mainMenu.html",
+        probe_error=BridgeError("boom"),
+    )
+    diag = await DeltaEsourcingAdapter().login_diagnostics(_ctx(bridge))
+    assert diag["logged_in"] is False
+    assert diag["detection"] == "frames"
+    assert diag["marker_error"] and "boom" in diag["marker_error"]
+
+
+@pytest.mark.asyncio
+async def test_frame_probe_login_redirect_short_circuits_before_probe():
+    # Redirected to login on navigation → never even runs the marker probe.
+    bridge = MarkerBridge(
+        current_url="https://www.delta-esourcing.com/delta/login.html",
+        probe_result=_visible_result(),
+    )
+    diag = await DeltaEsourcingAdapter().login_diagnostics(_ctx(bridge))
+    assert diag["logged_in"] is False
+    assert diag["redirected_to_login"] is True
+    assert bridge.probe_calls == []
+
+
+def test_combined_marker_is_derived_from_alternatives():
+    # The combined OR string (used by the capture helper + the fallback path) is
+    # exactly the alternatives joined, so the two can never drift.
+    assert DELTA_SELECTORS["logged_in_marker"] == ", ".join(
+        sel for _, sel in DELTA_LOGGED_IN_MARKERS
+    )
+    # And it still matches the live-confirmed supplier-menu items.
+    assert "Response Manager" in DELTA_SELECTORS["logged_in_marker"]
+    assert "Supplier Administrator" in DELTA_SELECTORS["logged_in_marker"]
 
 
 def test_login_success_pattern_matches_mainmenu_not_login():

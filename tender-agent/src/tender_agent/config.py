@@ -44,6 +44,34 @@ class Settings(BaseSettings):
     document_storage_dir: str = "/app/data/documents"
     document_max_bytes: int = 50 * 1024 * 1024  # 50 MB
 
+    # --- Local-fetch pivot: cloud ingest (DB + Blob) -------------------------
+    # Delta refuses cloud/datacenter IPs (confirmed 403), so Delta is fetched on
+    # the operator's own machine and the results are pushed UP to this backend's
+    # ingest endpoint, which stores the bytes in Azure Blob.
+    #
+    # Azure Blob via MANAGED IDENTITY (no connection string): when
+    # `azure_storage_account` is set, ingested document bytes go to
+    # https://<account>.blob.core.windows.net/<container>/<tender_id>/<sha256>.<ext>.
+    # DefaultAzureCredential resolves the App Service's system-assigned identity
+    # in Azure (granted "Storage Blob Data Contributor" on the account) and dev
+    # creds locally. Empty account → falls back to the local-disk backend so a
+    # plain checkout / CI needs no Azure.
+    azure_storage_account: str = ""  # e.g. "generasystemsfiles"
+    azure_blob_container: str = "tender-documents"
+    # Per-document size ceiling for ingest (mirrors the Delta adapter's 100 MB
+    # MAX_FILE_BYTES — Delta docs can exceed the 50 MB HTTP-download cap).
+    ingest_max_bytes: int = 100 * 1024 * 1024  # 100 MB
+
+    # The cloud backend must NOT initiate fetches for these platforms — they
+    # require a local human login from a residential IP (the cloud IP is 403'd),
+    # so a cloud attempt would only contend with the operator's local session.
+    # The local fetch runner (scripts/fetch_delta.py) sets `local_fetch_runner`
+    # true in its OWN process to bypass this and drive the browser locally.
+    local_fetch_platforms: list[str] = Field(
+        default_factory=lambda: ["delta_esourcing"],
+    )
+    local_fetch_runner: bool = False
+
     http_timeout_seconds: int = 30
     http_user_agent: str = "tender-agent/0.1 (compliance-research)"
 

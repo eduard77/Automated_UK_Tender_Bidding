@@ -299,3 +299,61 @@ async def test_test_session_handles_unavailable_bridge():
     res = await delta_session.test_session(bridge=_Down(logged_in=False))
     assert res["available"] is False
     assert res["logged_in"] is False
+
+
+class _FrameBridge(_FakeBridge):
+    """A bridge that supports the frame-aware probe (like the in-process cloud
+    bridge), so /session/test surfaces the richer diagnostics. Returns a marker
+    visible inside a frame."""
+
+    async def probe_login_markers(self, slug, markers, *, timeout_ms=8000,
+                                  poll_ms=250):
+        from tender_agent.services.bridge_client import (
+            MarkerAlternative,
+            MarkerProbeResult,
+        )
+
+        self.calls.append(("probe_login_markers", len(markers)))
+        alts = [
+            MarkerAlternative(
+                label=m["label"], selector=m["selector"],
+                found=(i == 0), visible=(i == 0 and self._logged_in),
+                frame="menuFrame" if i == 0 else None,
+            )
+            for i, m in enumerate(markers)
+        ]
+        return MarkerProbeResult(
+            visible=self._logged_in,
+            page_title="Activity Centre | Delta",
+            current_url=self._rm,
+            frames_searched=["main", "menuFrame"],
+            alternatives=alts,
+        )
+
+
+async def test_test_session_surfaces_rich_diagnostics():
+    fake = _FrameBridge(logged_in=True)
+    res = await delta_session.test_session(bridge=fake)
+    assert res["available"] is True
+    assert res["logged_in"] is True
+    # Backward-compatible additions: title + per-marker detail + frames searched.
+    assert res["page_title"] == "Activity Centre | Delta"
+    assert res["detection"] == "frames"
+    assert res["frames_searched"] == ["main", "menuFrame"]
+    first = res["markers"][0]
+    assert first["found"] is True and first["visible"] is True
+    assert first["frame"] == "menuFrame"
+    assert res["marker_error"] is None
+    # Still non-destructive: opened + closed, never clicked.
+    assert ("close_session", delta_session.DELTA_SLUG) in fake.calls
+    assert ("probe_login_markers", len(res["markers"])) in fake.calls
+    # No cookie values anywhere in the payload.
+    assert "fake-session-token" not in json.dumps(res)
+
+
+async def test_test_session_diagnostics_explain_false():
+    fake = _FrameBridge(logged_in=False)
+    res = await delta_session.test_session(bridge=fake)
+    assert res["logged_in"] is False
+    assert res["detection"] == "frames"
+    assert all(m["visible"] is False for m in res["markers"])
