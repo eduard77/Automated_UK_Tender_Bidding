@@ -34,8 +34,9 @@ import contextlib
 import hashlib
 import re
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import structlog
@@ -106,6 +107,20 @@ DELTA_URLS = {
     "logout": "https://www.delta-esourcing.com/delta/logout.html",
 }
 
+# CONFIRMED (live, logged-in supplier on /delta/mainMenu.html) — left-nav items
+# + header role that only render for an authenticated supplier. Held as labelled
+# ALTERNATIVES (not just an OR string) so the probe can report which one matched
+# and in which frame; the combined OR string below is derived from them so the
+# two can never drift. "Resources" is intentionally omitted — it can appear in
+# public chrome too. (label, selector) — the label is what /session/test reports.
+DELTA_LOGGED_IN_MARKERS: tuple[tuple[str, str], ...] = (
+    ("Response Manager", "a:has-text('Response Manager')"),
+    ("Profile Manager", "a:has-text('Profile Manager')"),
+    ("Select Accredit", "a:has-text('Select Accredit')"),
+    ("Settings", "a:has-text('Settings')"),
+    ("Supplier Administrator", "header:has-text('Supplier Administrator')"),
+)
+
 DELTA_SELECTORS = {
     # CONFIRMED — the notice page button label is exactly "REGISTER INTEREST".
     # Playwright :has-text is case-insensitive substring, so this matches it.
@@ -117,16 +132,12 @@ DELTA_SELECTORS = {
     # CONFIRMED — open/closed banner text on the notice page.
     "open_marker_text": "currently OPEN",
     "closed_marker_text": "not currently open",
-    # CONFIRMED (live, logged-in supplier on /delta/mainMenu.html) — left-nav
-    # items + header role that only render for an authenticated supplier. We OR
-    # several together (and the caller also checks the URL is the authenticated
-    # area, not a login page) so one selector drifting doesn't break detection.
-    # "Resources" is intentionally omitted — it can appear in public chrome too.
-    "logged_in_marker": (
-        "a:has-text('Response Manager'), a:has-text('Profile Manager'), "
-        "a:has-text('Select Accredit'), a:has-text('Settings'), "
-        "header:has-text('Supplier Administrator')"
-    ),
+    # CONFIRMED (live, logged-in supplier on /delta/mainMenu.html) — the OR of
+    # DELTA_LOGGED_IN_MARKERS (derived so the two never drift). The caller also
+    # checks the URL is the authenticated area, not a login page, so one selector
+    # drifting doesn't break detection. Kept as a single string for callers that
+    # want one selector (the capture helper, the rendered_html fallback path).
+    "logged_in_marker": ", ".join(sel for _, sel in DELTA_LOGGED_IN_MARKERS),
     # CONFIRMED (live DOM, tender 3169) — the Stage One documents table is
     # <table id="document" class="dataTable ..." role="grid"> inside
     # <div id="documentList">. Columns: Document Title / Size / File Type /
@@ -450,6 +461,25 @@ def _parse_items_count(html: str) -> int | None:
     return max(nums) if nums else None
 
 
+@dataclass
+class _LoginProbe:
+    """Structured result of the Delta authenticated-session probe. `logged_in`
+    is the headline boolean is_authenticated returns; the rest is diagnostics
+    surfaced by /session/test (page title, per-marker found/visible/frame, the
+    frames searched, any locator error) so a future false read tells us WHY.
+    `detection` is "frames" when the frame-aware bridge probe ran, "single" for
+    the top-frame rendered_html fallback (HTTP bridge / older bridges)."""
+
+    logged_in: bool
+    current_url: str | None = None
+    page_title: str | None = None
+    redirected_to_login: bool = False
+    detection: str = "single"
+    markers: list[dict[str, Any]] = field(default_factory=list)
+    frames_searched: list[str] = field(default_factory=list)
+    error: str | None = None
+
+
 class DeltaEsourcingAdapter(PortalAdapter):
     platform_slug = "delta_esourcing"
     requires_browser = False  # uses the Windows bridge, not an in-process page
@@ -485,44 +515,160 @@ class DeltaEsourcingAdapter(PortalAdapter):
         redirects to login); the local capture helper checks the very same page
         and markers, so capture and this probe agree on what "logged in" means.
 
-        The supplier menu is part of the JS-rendered chrome, so we WAIT for the
-        marker in the rendered DOM (a real element wait) rather than probing the
-        current DOM once — an already-authenticated session that renders the menu
-        a beat late used to read as "fresh login required" and either re-prompt
-        or hang waiting_for_login (chunk 4h). Logs reuse vs fresh-login."""
+        Detection mirrors the capture helper (PR #92): the supplier menu is
+        JS-rendered chrome that can live inside a frame and has several elements
+        matching the OR-selector, so we search the page AND all frames and check
+        EVERY match (not just `.first`), surfacing locator errors. See
+        `_probe_login` for the shared probe; `login_diagnostics` exposes the
+        per-marker detail to /session/test."""
+        return (await self._probe_login(ctx)).logged_in
+
+    async def login_diagnostics(self, ctx: PortalContext) -> dict[str, Any]:
+        """Run the authenticated-session probe and return rich, JSON-safe
+        diagnostics for /session/test: logged-in, current URL, page title, which
+        marker alternative was found/visible and in which frame, the frames
+        searched, and any locator error. NEVER includes cookie values. Does not
+        click or register — it only navigates and reads the DOM."""
+        probe = await self._probe_login(ctx)
+        return {
+            "logged_in": probe.logged_in,
+            "current_url": probe.current_url,
+            "page_title": probe.page_title,
+            "redirected_to_login": probe.redirected_to_login,
+            "detection": probe.detection,
+            "markers": probe.markers,
+            "frames_searched": probe.frames_searched,
+            "marker_error": probe.error,
+        }
+
+    async def _probe_login(self, ctx: PortalContext) -> _LoginProbe:
+        """Shared authenticated-session probe behind is_authenticated and
+        login_diagnostics. Navigates to mainMenu (the #91 URL criteria — in the
+        authenticated /delta/ area and NOT a login page), then detects the
+        supplier menu. When the bridge supports the frame-aware `probe_login_markers`
+        (the in-process cloud bridge), we use it — searching the page AND all
+        frames, checking every match, surfacing errors. Otherwise we fall back to
+        the original top-frame `rendered_html` marker wait (HTTP/older bridges),
+        which keeps existing behaviour unchanged. Logs reuse vs fresh-login."""
         bridge, slug = ctx.bridge, ctx.platform_slug
         if bridge is None or slug is None:
-            return False
+            return _LoginProbe(logged_in=False, error="no bridge session")
         try:
             await bridge.navigate(slug, DELTA_URLS["main_menu"])
             status = await bridge.session_status(slug)
         except Exception as exc:  # noqa: BLE001
             logger.info("delta.fresh_login_required", reason="navigate_failed",
                         error=str(exc))
-            return False
-        current = (status.get("current_url") or "").lower()
-        if "login" in current:
+            return _LoginProbe(logged_in=False, error=f"navigate_failed: {exc}")
+        current = status.get("current_url") or ""
+        if "login" in current.lower():
             logger.info("delta.fresh_login_required", reason="redirected_to_login")
-            return False
-        # Wait for the logged-in marker to render (robust to a slow menu render).
+            return _LoginProbe(
+                logged_in=False, current_url=current, redirected_to_login=True
+            )
+
+        probe_markers = getattr(bridge, "probe_login_markers", None)
+        if probe_markers is not None:
+            return await self._probe_login_frames(
+                probe_markers, slug, fallback_url=current
+            )
+        return await self._probe_login_single(bridge, slug, fallback_url=current)
+
+    async def _probe_login_frames(
+        self, probe_markers: Any, slug: str, *, fallback_url: str
+    ) -> _LoginProbe:
+        """Frame-aware probe (port of #92): ask the bridge to search the page and
+        every frame for any logged-in marker, checking every match. Returns rich
+        per-marker diagnostics."""
+        try:
+            result = await probe_markers(
+                slug,
+                [{"label": label, "selector": sel}
+                 for label, sel in DELTA_LOGGED_IN_MARKERS],
+                timeout_ms=DELTA_AUTH_MARKER_WAIT_MS,
+            )
+        except Exception as exc:  # noqa: BLE001 — surface, don't swallow.
+            logger.info("delta.marker_probe_failed", slug=slug, error=str(exc))
+            return _LoginProbe(
+                logged_in=False, current_url=fallback_url, detection="frames",
+                error=f"probe_failed: {exc}",
+            )
+        markers = [
+            {"label": a.label, "selector": a.selector, "found": a.found,
+             "visible": a.visible, "frame": a.frame, "error": a.error}
+            for a in result.alternatives
+        ]
+        url = result.current_url or fallback_url
+        # A late client-side bounce to login still means not authenticated.
+        redirected = (not result.visible) and "login" in (url or "").lower()
+        logged_in = bool(result.visible) and not redirected
+        self._log_probe_outcome(
+            slug, logged_in, redirected,
+            found=[m["label"] for m in markers if m["found"]],
+            error=result.error,
+        )
+        return _LoginProbe(
+            logged_in=logged_in,
+            current_url=url,
+            page_title=result.page_title,
+            redirected_to_login=redirected,
+            detection="frames",
+            markers=markers,
+            frames_searched=list(result.frames_searched),
+            error=result.error,
+        )
+
+    async def _probe_login_single(
+        self, bridge: Any, slug: str, *, fallback_url: str
+    ) -> _LoginProbe:
+        """Top-frame fallback for bridges without `probe_login_markers` (the HTTP
+        bridge / older builds): the original `rendered_html` marker wait. Keeps
+        the legacy behaviour exactly so local-dev users see no change."""
         try:
             res = await bridge.rendered_html(
                 slug,
                 wait_for_selector=DELTA_SELECTORS["logged_in_marker"],
                 timeout_ms=DELTA_AUTH_MARKER_WAIT_MS,
             )
-            marker = res.wait_satisfied
-            # A late client-side bounce to login still means not authenticated.
-            if not marker and "login" in (res.current_url or "").lower():
-                logger.info("delta.fresh_login_required", reason="redirected_to_login")
-                return False
-        except Exception:  # noqa: BLE001
-            marker = False
-        if marker:
+            visible = bool(res.wait_satisfied)
+            url = res.current_url or fallback_url
+        except Exception as exc:  # noqa: BLE001 — surface, don't swallow.
+            logger.info("delta.marker_probe_failed", slug=slug, error=str(exc))
+            return _LoginProbe(
+                logged_in=False, current_url=fallback_url, detection="single",
+                frames_searched=["main"], error=f"probe_failed: {exc}",
+            )
+        redirected = (not visible) and "login" in (url or "").lower()
+        logged_in = visible and not redirected
+        self._log_probe_outcome(slug, logged_in, redirected, found=[], error=None)
+        return _LoginProbe(
+            logged_in=logged_in,
+            current_url=url,
+            redirected_to_login=redirected,
+            detection="single",
+            markers=[{
+                "label": "logged_in_marker",
+                "selector": DELTA_SELECTORS["logged_in_marker"],
+                "found": visible, "visible": visible,
+                "frame": "main" if visible else None, "error": None,
+            }],
+            frames_searched=["main"],
+        )
+
+    @staticmethod
+    def _log_probe_outcome(
+        slug: str, logged_in: bool, redirected: bool,
+        *, found: list[str], error: str | None,
+    ) -> None:
+        if redirected:
+            logger.info("delta.fresh_login_required", reason="redirected_to_login")
+        elif logged_in:
             logger.info("delta.session_reused", slug=slug)
-            return True
-        logger.info("delta.fresh_login_required", reason="no_logged_in_marker")
-        return False
+        else:
+            logger.info(
+                "delta.fresh_login_required", reason="no_logged_in_marker",
+                markers_found=found, marker_error=error,
+            )
 
     async def authenticate(
         self, ctx: PortalContext, creds: Credentials | None
