@@ -141,18 +141,32 @@ class _GlobalManager:
             # image and to avoid the small default /dev/shm killing the
             # renderer.
             launch_args.extend(["--no-sandbox", "--disable-dev-shm-usage"])
-        context = await pw.chromium.launch_persistent_context(
-            str(user_data_dir),
-            headless=headless,
-            accept_downloads=True,
-            downloads_path=str(downloads_root),
-            args=launch_args,
-        )
-        # Login model B (stage 3): if the operator uploaded a storage_state for
-        # this slug, apply it to the freshly launched context so the headless
-        # fetch is authenticated. No-op when no upload exists.
-        await _apply_storage_state(context, user_data_dir, slug)
-        page = context.pages[0] if context.pages else await context.new_page()
+        try:
+            context = await pw.chromium.launch_persistent_context(
+                str(user_data_dir),
+                headless=headless,
+                accept_downloads=True,
+                downloads_path=str(downloads_root),
+                args=launch_args,
+                # Present as an ordinary desktop Chrome so Delta's WAF stops
+                # 403'ing the headless browser (see cloud_browser_context_kwargs).
+                # Applied to THIS context — the one that carries the uploaded
+                # session cookies.
+                **cloud_browser_context_kwargs(),
+            )
+            # Hide navigator.webdriver on the same (cookie-bearing) context.
+            await apply_cloud_browser_stealth(context)
+            # Login model B (stage 3): if the operator uploaded a storage_state
+            # for this slug, apply it to the freshly launched context so the
+            # headless fetch is authenticated. No-op when no upload exists.
+            await _apply_storage_state(context, user_data_dir, slug)
+            page = context.pages[0] if context.pages else await context.new_page()
+        except Exception:
+            # A failed launch must not orphan the Playwright we just started
+            # (it leaks a subprocess that breaks the asyncio loop on teardown).
+            with contextlib.suppress(Exception):
+                await pw.stop()
+            raise
         logger.info("bridge.in_process.session_opened", slug=slug, headless=headless)
         return _Session(slug=slug, playwright=pw, context=context, page=page)
 
@@ -307,6 +321,54 @@ def _headless() -> bool:
     if raw is None:
         return True
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+# ---------------------------------------------------------------------------
+# Desktop-Chrome disguise for the cloud (headless) browser
+# ---------------------------------------------------------------------------
+# Delta's web firewall 403s a browser that identifies itself as automated — the
+# default Playwright headless UA contains "HeadlessChrome" and `navigator.webdriver`
+# is set. The operator's LOCAL capture browser (scripts/connect_delta.py) is a
+# normal visible Chrome, so Delta accepts it; the cloud headless browser was
+# getting "403 Forbidden" at mainMenu.html before any session check. We make the
+# cloud browser present as an ordinary desktop Windows Chrome so the firewall
+# stops blocking it. Mirrors services/browser.py's disguise; applied to the SAME
+# persistent context that carries the uploaded Delta session cookies.
+#
+# A current, realistic desktop Windows Chrome UA — NO "Headless". Matches the
+# pattern used by services.browser.BrowserContextManager.
+CLOUD_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+CLOUD_BROWSER_LOCALE = "en-GB"
+CLOUD_BROWSER_VIEWPORT = {"width": 1366, "height": 768}
+CLOUD_BROWSER_HEADERS = {"Accept-Language": "en-GB,en;q=0.9"}
+# Hide the `navigator.webdriver` automation giveaway. Belt-and-braces with the
+# --disable-blink-features=AutomationControlled launch flag.
+_HIDE_WEBDRIVER_SCRIPT = (
+    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+)
+
+
+def cloud_browser_context_kwargs() -> dict[str, Any]:
+    """The launch_persistent_context kwargs that disguise the headless cloud
+    browser as an ordinary desktop Chrome (UA without "Headless", a real
+    viewport, en-GB locale, and a normal Accept-Language). Pair with
+    `apply_cloud_browser_stealth()` on the SAME context for the webdriver hide."""
+    return {
+        "user_agent": CLOUD_BROWSER_USER_AGENT,
+        "locale": CLOUD_BROWSER_LOCALE,
+        "viewport": dict(CLOUD_BROWSER_VIEWPORT),
+        "extra_http_headers": dict(CLOUD_BROWSER_HEADERS),
+    }
+
+
+async def apply_cloud_browser_stealth(context: Any) -> None:
+    """Hide `navigator.webdriver` on the cookie-bearing context (init scripts run
+    on every page before its scripts). Best-effort — never fails a launch."""
+    with contextlib.suppress(Exception):
+        await context.add_init_script(_HIDE_WEBDRIVER_SCRIPT)
 
 
 # ---------------------------------------------------------------------------
