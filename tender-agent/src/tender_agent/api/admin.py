@@ -111,14 +111,13 @@ def trigger_proactis_discovery(
 ) -> ProactisDiscoveryTriggerResponse:
     """Manually trigger a Proactis (procontract.due-north.com) discovery run.
 
-    Background-only — the run happens in a worker thread so the HTTP response
-    returns immediately (browser-driven discovery takes minutes, not seconds).
-    The bridge must be reachable AND the operator must be logged in at the
-    bridge window; the run logs `discovery.proactis.needs_login` if not and
-    finishes cleanly without raising.
+    Reads the PUBLIC "Find Opportunities" listing over plain HTTP — no login, no
+    bridge, no browser. Background-only — the run happens in a worker thread so
+    the HTTP response returns immediately. Outcome (pages walked, rows seen,
+    inserted / updated / deduped) is written to the latest `poll_runs` row for
+    source PROACTIS and to the `discovery.proactis.*` structured logs.
 
-    Filter config comes from `settings.proactis_discovery_*` (Step 1). Step 2
-    will wire the dashboard's main filter page to this same config object.
+    Filter config comes from `settings.proactis_discovery_*`.
     """
     config = ProactisFilterConfig(
         keywords=settings.proactis_discovery_keywords,

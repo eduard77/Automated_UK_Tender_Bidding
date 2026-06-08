@@ -25,9 +25,10 @@ _scheduler: AsyncIOScheduler | None = None
 
 
 async def proactis_discovery_job() -> None:
-    """Background Proactis discovery cycle. Constructs the filter config from
-    settings (Step 1) and runs once. Any uncaught exception is logged here so
-    the APScheduler job doesn't trip-line the whole job queue."""
+    """Background Proactis discovery cycle. Reads the public opportunity pages
+    over HTTP (no login). Constructs the filter config from settings and runs
+    once. Any uncaught exception is logged here so the APScheduler job doesn't
+    trip-line the whole job queue."""
     if not settings.proactis_discovery_enabled:
         return
     config = ProactisFilterConfig(
@@ -90,8 +91,8 @@ def start() -> None:
         max_instances=1,
     )
     # Proactis discovery — runs on its own interval, only when enabled.
-    # Browser-driven and slower than HTTP polling; runs in the same
-    # AsyncIOScheduler so we get the same coalesce / max_instances safety.
+    # Public-HTTP discovery (no login/bridge); runs in the same AsyncIOScheduler
+    # so we get the same coalesce / max_instances safety.
     if settings.proactis_discovery_enabled:
         _scheduler.add_job(
             proactis_discovery_job,
