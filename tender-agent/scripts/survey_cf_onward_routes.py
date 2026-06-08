@@ -35,56 +35,23 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
 import sys
-from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from sqlalchemy import select  # noqa: E402
-
 from tender_agent.db import SessionLocal  # noqa: E402
-from tender_agent.diagnostics.onward_routes import (  # noqa: E402
-    BUCKET_DIRECT,
-    BUCKETS,
-    RouteClassification,
-    classify_text,
+from tender_agent.diagnostics.cf_survey import (  # noqa: E402
+    DEFAULT_SOURCES,
+    SurveySummary,
+    iter_classified,
+    summarise,
 )
+from tender_agent.diagnostics.onward_routes import BUCKETS, RouteClassification  # noqa: E402
 from tender_agent.models import Tender  # noqa: E402
 
-DEFAULT_SOURCES = ("CF", "FTS")
 DEFAULT_OUTPUT = "cf_onward_routes_survey.csv"
 CSV_HEADER = ("tender_id", "title", "buyer", "bucket", "portal", "best_detail")
-
-
-def _tender_text(tender: Tender) -> tuple[str, tuple[str | None, ...]]:
-    """Assemble the text blob + extra URLs to classify one tender from.
-
-    The raw OCDS release is serialised wholesale so contact points, submission
-    details, and document links are all in scope without hard-coding paths.
-    """
-    parts: list[str] = []
-    if tender.description:
-        parts.append(tender.description)
-    if tender.raw is not None:
-        parts.append(json.dumps(tender.raw, default=str))
-    if tender.documents:
-        parts.append(json.dumps(tender.documents, default=str))
-    return "\n".join(parts), (tender.source_url,)
-
-
-def survey(
-    db, sources: tuple[str, ...], limit: int | None
-) -> list[tuple[Tender, RouteClassification]]:
-    stmt = select(Tender).where(Tender.source_code.in_(sources)).order_by(Tender.id)
-    if limit is not None:
-        stmt = stmt.limit(limit)
-    results: list[tuple[Tender, RouteClassification]] = []
-    for tender in db.execute(stmt).scalars():
-        text, extra_urls = _tender_text(tender)
-        results.append((tender, classify_text(text, extra_urls=extra_urls)))
-    return results
 
 
 def write_csv(path: Path, results: list[tuple[Tender, RouteClassification]]) -> None:
@@ -104,29 +71,25 @@ def write_csv(path: Path, results: list[tuple[Tender, RouteClassification]]) -> 
             )
 
 
-def print_summary(results: list[tuple[Tender, RouteClassification]], csv_path: Path) -> None:
-    total = len(results)
-    bucket_counts: Counter[str] = Counter(cls.bucket for _, cls in results)
-    portal_counts: Counter[str] = Counter(
-        cls.portal for _, cls in results if cls.bucket == BUCKET_DIRECT and cls.portal
-    )
+def print_summary(summary: SurveySummary, csv_path: Path) -> None:
+    total = summary.total_scanned
 
     print(f"\nScanned {total} CF/FTS tender(s).\n")
     print("Onward-route bucket breakdown:")
     for bucket in BUCKETS:
-        n = bucket_counts.get(bucket, 0)
+        n = summary.buckets.get(bucket, 0)
         pct = (100.0 * n / total) if total else 0.0
         print(f"  {bucket:<20} {n:>8}  ({pct:5.1f}%)")
 
     print("\ndirect_portal_link by portal (adapter-build ranking):")
-    if portal_counts:
-        for portal, n in portal_counts.most_common():
+    if summary.direct_portal_breakdown:
+        for portal, n in summary.direct_portal_breakdown:
             print(f"  {portal:<20} {n:>8}")
     else:
         print("  (none)")
 
     print(f"\nCSV written to: {csv_path}")
-    parts = " ".join(f"{b}={bucket_counts.get(b, 0)}" for b in BUCKETS)
+    parts = " ".join(f"{b}={summary.buckets.get(b, 0)}" for b in BUCKETS)
     print(f"Headline: {total} CF/FTS scanned — {parts} | CSV: {csv_path}")
 
 
@@ -156,10 +119,10 @@ def main() -> int:
     csv_path = Path(args.output).resolve()
 
     with SessionLocal() as db:
-        results = survey(db, sources, args.limit)
+        results = list(iter_classified(db, sources, args.limit))
 
     write_csv(csv_path, results)
-    print_summary(results, csv_path)
+    print_summary(summarise(results), csv_path)
     return 0
 
 
