@@ -60,6 +60,10 @@ from tender_agent.services.bridge_client import (
 from tender_agent.services.discovery.proactis_filter_config import (
     ProactisFilterConfig,
 )
+from tender_agent.services.discovery.proactis_login import (
+    LoginAttempt,
+    login_with_credentials,
+)
 from tender_agent.services.ingestion import _upsert_tender
 from tender_agent.services.portals.adapters.proactis import (
     OPPORTUNITY_DATE_RE,
@@ -145,6 +149,15 @@ class DiscoveryRunResult:
     opportunities_deduped: int = 0  # row had a CF/FTS sibling by procurement_ref
     error: str | None = None
     poll_run_id: int | None = None
+    # Filter-application telemetry (PR #102 — Dynatree popup driver). Populated
+    # only on the profile-driven path; left at defaults for the legacy
+    # public-listing `run()` so its output shape is unchanged.
+    categories_requested: int = 0
+    categories_applied: int = 0
+    categories_not_found: list[str] = field(default_factory=list)
+    regions_requested: int = 0
+    regions_applied: int = 0
+    regions_not_found: list[str] = field(default_factory=list)
 
 
 class NeedsLoginError(BridgeError):
@@ -430,6 +443,354 @@ async def _apply_filters(
         keywords=bool(config.keywords.strip()),
         regions=len(config.regions),
         categories=len(config.categories),
+        include_closed=config.include_closed,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dynatree popup driver — categories + regions (PR #102)
+# ---------------------------------------------------------------------------
+
+#: How long to wait for the Dynatree popup to render after the trigger click.
+DYNATREE_POPUP_WAIT_MS = 10_000
+#: How long to wait for the tree to settle after each Search click. The XHR
+#: is sub-second on the live site; this is a generous outer bound.
+DYNATREE_SEARCH_WAIT_MS = 8_000
+
+
+@dataclass
+class PopupApplyOutcome:
+    """The driver's report for one popup (categories OR regions). The
+    discovery run rolls these counters up onto DiscoveryRunResult so the
+    operator sees exactly which codes were and weren't matched on the first
+    real run."""
+
+    requested: int = 0
+    applied: int = 0
+    not_found: list[str] = field(default_factory=list)
+    popup_opened: bool = False
+    error: str | None = None
+
+
+async def _drive_dynatree_popup(
+    bridge: BridgeClient,
+    *,
+    open_trigger_selector: str,
+    items: list[str],
+    matcher: str,  # "code" | "region"
+    popup_kind: str,  # "category" | "region" — used for logs only
+) -> PopupApplyOutcome:
+    """Open the popup, search each item by EXACT match, tick the matching
+    node, then click Apply once after every item has been processed. Items
+    with no matching node are LOGGED and SKIPPED — never abort the run.
+
+    Defensive about ordering: search input cleared before every type, Exact
+    radio re-clicked defensively (default checked but a stale popup state
+    might have flipped it).
+    """
+    # Imported here to keep the module import-cycle clean — Dynatree depends
+    # on nothing from this module.
+    from tender_agent.services.discovery.proactis_dynatree import (
+        DYNATREE_SELECTORS,
+        match_node_for_code,
+        match_node_for_region,
+        no_results_visible,
+        node_checkbox_selector,
+        parse_dynatree_nodes,
+    )
+
+    outcome = PopupApplyOutcome(requested=len(items))
+
+    # 1. Open the popup. The trigger is portal-specific (Add CPV / Add region);
+    # the dialog itself is the SAME Dynatree component.
+    try:
+        await bridge.click(PROACTIS_BRIDGE_SLUG, open_trigger_selector)
+    except BridgeError as exc:
+        outcome.error = f"open trigger failed: {exc}"
+        logger.warning(
+            "discovery.proactis.popup_open_failed",
+            popup=popup_kind,
+            error=str(exc),
+        )
+        return outcome
+
+    # Wait for the popup to render the search box.
+    try:
+        await bridge.rendered_html(
+            PROACTIS_BRIDGE_SLUG,
+            wait_for_selector=DYNATREE_SELECTORS["search_input"],
+            timeout_ms=DYNATREE_POPUP_WAIT_MS,
+        )
+    except BridgeError as exc:
+        outcome.error = f"popup wait failed: {exc}"
+        return outcome
+
+    outcome.popup_opened = True
+
+    # 2. For each item: clear search, ensure Exact mode, type, click Search,
+    # wait for settle, parse nodes, tick the match (or record not_found).
+    for raw in items:
+        item = (raw or "").strip()
+        if not item:
+            continue
+
+        # Clear THEN fill — Proactis pre-fills the box with placeholder text
+        # as the literal value, so a plain fill on top would corrupt the query.
+        try:
+            await bridge.fill(
+                PROACTIS_BRIDGE_SLUG,
+                DYNATREE_SELECTORS["search_input"],
+                "",
+            )
+            await bridge.fill(
+                PROACTIS_BRIDGE_SLUG,
+                DYNATREE_SELECTORS["search_input"],
+                item,
+            )
+        except BridgeError as exc:
+            outcome.not_found.append(item)
+            logger.warning(
+                "discovery.proactis.popup_search_fill_failed",
+                popup=popup_kind,
+                item=item,
+                error=str(exc),
+            )
+            continue
+
+        # Belt-and-braces: ensure Exact match is selected. Default checked;
+        # a no-op click on a checked radio is harmless.
+        try:
+            await bridge.click(
+                PROACTIS_BRIDGE_SLUG, DYNATREE_SELECTORS["exact_match_radio"]
+            )
+        except BridgeError:
+            # Some Proactis variants strip the radio when only one mode is
+            # available. Don't fail the search over it.
+            logger.debug(
+                "discovery.proactis.exact_radio_missing", popup=popup_kind
+            )
+
+        # Click Search.
+        try:
+            await bridge.click(
+                PROACTIS_BRIDGE_SLUG, DYNATREE_SELECTORS["search_button"]
+            )
+        except BridgeError as exc:
+            outcome.not_found.append(item)
+            logger.warning(
+                "discovery.proactis.popup_search_click_failed",
+                popup=popup_kind,
+                item=item,
+                error=str(exc),
+            )
+            continue
+
+        # Wait for the tree to settle. The XHR returns either a populated
+        # tree OR shows the no-results marker; both selectors are in our
+        # wait expression.
+        try:
+            rendered = await bridge.rendered_html(
+                PROACTIS_BRIDGE_SLUG,
+                wait_for_selector=DYNATREE_SELECTORS["tree_settled_wait"],
+                timeout_ms=DYNATREE_SEARCH_WAIT_MS,
+            )
+        except BridgeError as exc:
+            outcome.not_found.append(item)
+            logger.warning(
+                "discovery.proactis.popup_search_wait_failed",
+                popup=popup_kind,
+                item=item,
+                error=str(exc),
+            )
+            continue
+
+        if no_results_visible(rendered.html):
+            outcome.not_found.append(item)
+            logger.info(
+                "discovery.proactis.popup_no_match",
+                popup=popup_kind,
+                item=item,
+                reason="divNoSearchResults visible",
+            )
+            continue
+
+        nodes = parse_dynatree_nodes(rendered.html)
+        node = (
+            match_node_for_code(nodes, item)
+            if matcher == "code"
+            else match_node_for_region(nodes, item)
+        )
+        if node is None:
+            outcome.not_found.append(item)
+            logger.info(
+                "discovery.proactis.popup_no_match",
+                popup=popup_kind,
+                item=item,
+                reason=f"no node matched among {len(nodes)} results",
+            )
+            continue
+
+        # Tick the checkbox span. node_checkbox_selector emits a CSS
+        # selector specific to THIS node so the click never lands on the
+        # wrong row.
+        tick_selector = node_checkbox_selector(node.node_id)
+        try:
+            await bridge.click(PROACTIS_BRIDGE_SLUG, tick_selector)
+            outcome.applied += 1
+            logger.info(
+                "discovery.proactis.popup_ticked",
+                popup=popup_kind,
+                item=item,
+                node_id=node.node_id,
+                title=node.title_text,
+            )
+        except BridgeError as exc:
+            outcome.not_found.append(item)
+            logger.warning(
+                "discovery.proactis.popup_tick_failed",
+                popup=popup_kind,
+                item=item,
+                node_id=node.node_id,
+                error=str(exc),
+            )
+            continue
+
+    # 3. Apply once. If we ticked nothing, we still click Apply to close the
+    # popup cleanly — leaving it open would block the next filter and the
+    # subsequent listing read.
+    try:
+        await bridge.click(
+            PROACTIS_BRIDGE_SLUG, DYNATREE_SELECTORS["apply_button"]
+        )
+    except BridgeError as exc:
+        # If Apply genuinely failed, fall back to Cancel so the popup
+        # doesn't stay open and block subsequent steps.
+        outcome.error = (
+            outcome.error or ""
+        ) + f"apply failed: {exc}. Attempted cancel as fallback."
+        with __import__("contextlib").suppress(Exception):
+            await bridge.click(
+                PROACTIS_BRIDGE_SLUG, DYNATREE_SELECTORS["cancel_link"]
+            )
+        logger.warning(
+            "discovery.proactis.popup_apply_failed",
+            popup=popup_kind,
+            error=str(exc),
+        )
+        return outcome
+
+    logger.info(
+        "discovery.proactis.popup_applied",
+        popup=popup_kind,
+        requested=outcome.requested,
+        applied=outcome.applied,
+        not_found_count=len(outcome.not_found),
+    )
+    return outcome
+
+
+async def _apply_filters_from_profile(
+    bridge: BridgeClient,
+    config: ProactisFilterConfig,
+    result: DiscoveryRunResult,
+) -> None:
+    """Drive the Find Opportunities filters using the SAME approach the live
+    Proactis dialogs require:
+
+      * Keywords  → text-input (the legacy `opp_keywords_input` selector).
+      * Include closed → "No" via the existing select.
+      * Categories → Dynatree popup (search-by-CODE, exact match, tick the
+        node, accumulate selections, click "Select categories").
+      * Regions → Dynatree popup (search-by-NAME, tick the node, click
+        "Select regions").
+
+    Mutates `result` with the per-popup match counters so the run summary
+    surfaces categories_applied / not_found and regions_applied / not_found
+    for the operator's first real run.
+    """
+    await bridge.navigate(PROACTIS_BRIDGE_SLUG, PROACTIS_URLS["opportunities"])
+
+    # Keywords — unchanged from the legacy text-input flow.
+    if config.keywords.strip():
+        try:
+            await bridge.fill(
+                PROACTIS_BRIDGE_SLUG,
+                PROACTIS_SELECTORS["opp_keywords_input"],
+                config.keywords.strip(),
+            )
+        except BridgeError as exc:
+            logger.warning(
+                "discovery.proactis.keywords_fill_failed", error=str(exc)
+            )
+
+    # Include closed — "No" when we want open-only (default).
+    desired = "Yes" if config.include_closed else "No"
+    try:
+        await bridge.select_option(
+            PROACTIS_BRIDGE_SLUG,
+            PROACTIS_SELECTORS["opp_include_closed_select"],
+            label=desired,
+        )
+    except BridgeError:
+        # Some variants render it as radios; on most pages "No" is already
+        # the default — skip silently.
+        logger.debug("discovery.proactis.include_closed_select_failed")
+
+    # Categories — Dynatree popup.
+    if config.categories:
+        cat_outcome = await _drive_dynatree_popup(
+            bridge,
+            open_trigger_selector=PROACTIS_SELECTORS["opp_add_category_button"],
+            items=list(config.categories),
+            matcher="code",
+            popup_kind="category",
+        )
+        result.categories_requested = cat_outcome.requested
+        result.categories_applied = cat_outcome.applied
+        result.categories_not_found = list(cat_outcome.not_found)
+
+    # Regions — same component, different trigger + matcher.
+    if config.regions:
+        reg_outcome = await _drive_dynatree_popup(
+            bridge,
+            open_trigger_selector=PROACTIS_SELECTORS["opp_add_region_button"],
+            items=list(config.regions),
+            matcher="region",
+            popup_kind="region",
+        )
+        result.regions_requested = reg_outcome.requested
+        result.regions_applied = reg_outcome.applied
+        result.regions_not_found = list(reg_outcome.not_found)
+
+    # Apply the page-level filter form.
+    try:
+        await bridge.click(
+            PROACTIS_BRIDGE_SLUG, PROACTIS_SELECTORS["opp_update_button"]
+        )
+    except BridgeError as exc:
+        logger.warning(
+            "discovery.proactis.update_click_failed", error=str(exc)
+        )
+
+    # Wait for the filtered listing to render before any pagination read.
+    try:
+        await bridge.rendered_html(
+            PROACTIS_BRIDGE_SLUG,
+            wait_for_selector=PROACTIS_SELECTORS["opp_results_table"],
+            timeout_ms=LISTING_RENDER_TIMEOUT_MS,
+        )
+    except BridgeError:
+        logger.debug("discovery.proactis.listing_wait_timeout")
+
+    logger.info(
+        "discovery.proactis.profile_filters_applied",
+        keywords=bool(config.keywords.strip()),
+        categories_requested=result.categories_requested,
+        categories_applied=result.categories_applied,
+        categories_not_found=len(result.categories_not_found),
+        regions_requested=result.regions_requested,
+        regions_applied=result.regions_applied,
+        regions_not_found=len(result.regions_not_found),
         include_closed=config.include_closed,
     )
 
@@ -795,3 +1156,194 @@ def run_blocking(config: ProactisFilterConfig) -> DiscoveryRunResult:
     """Synchronous wrapper for ``run``. Used by the admin manual-trigger
     endpoint when it executes the discovery in a background thread."""
     return asyncio.run(run(config=config))
+
+
+# ---------------------------------------------------------------------------
+# Profile-driven, logged-in path (Step 1: single account, single profile)
+# ---------------------------------------------------------------------------
+
+
+async def _login_then_get_status(
+    bridge: BridgeClient,
+    credentials,  # services.portals.base.Credentials
+) -> tuple[LoginAttempt, str | None]:
+    """Open the bridge session, drive the login form with the supplied
+    credentials, and return the LoginAttempt + the post-login current URL
+    (for diagnostics). Never raises — the caller maps the LoginAttempt onto
+    a DiscoveryRunResult shape."""
+    try:
+        await bridge.open_session(
+            PROACTIS_BRIDGE_SLUG, start_url=PROACTIS_URLS["login"]
+        )
+    except BridgeError as exc:
+        return (
+            LoginAttempt(status="error", detail=f"open_session failed: {exc}"),
+            None,
+        )
+
+    # Quick "are we ALREADY logged in?" probe — the bridge persistent context
+    # may have surviving cookies from a previous run, in which case we skip
+    # the form fill entirely.
+    try:
+        await bridge.navigate(
+            PROACTIS_BRIDGE_SLUG, PROACTIS_URLS["post_login_home"]
+        )
+        status = await bridge.session_status(PROACTIS_BRIDGE_SLUG)
+        if not _is_login_url(status.get("current_url")):
+            return (
+                LoginAttempt(
+                    status="ok",
+                    detail="session reused (cookies survived)",
+                    current_url=status.get("current_url"),
+                ),
+                status.get("current_url"),
+            )
+    except BridgeError:
+        pass
+
+    attempt = await login_with_credentials(
+        bridge, slug=PROACTIS_BRIDGE_SLUG, credentials=credentials
+    )
+    return attempt, attempt.current_url
+
+
+async def run_for_profile(
+    *,
+    credentials,  # services.portals.base.Credentials
+    profile,  # tender_agent.models.FilterProfile
+    bridge: BridgeClient | None = None,
+    db_factory=SessionLocal,
+) -> DiscoveryRunResult:
+    """Logged-in, profile-filtered Proactis discovery (Step 1).
+
+    Drives the operator's existing FilterProfile (CPV codes/prefixes +
+    regions + any keywords) through Proactis as a SEARCH user. Reuses the
+    existing parse + upsert + dedup path so nothing about the unified
+    search semantics changes — same `source_code="PROACTIS"`,
+    `source_ref=advertId`, `procurement_ref=DN`, region resolver.
+
+    The login form is filled from `credentials` (the SAME `CredentialsStore`
+    that powers Delta — secret never logged, fingerprint only). A rejected
+    credential / missing form field / persistent /Login URL all map to a
+    `needs_login` outcome with an explanatory `detail`; the run finishes
+    cleanly so the operator can act.
+
+    NOT in scope:
+      * Single-Delta-session lease style locking — Proactis behaviour TBD.
+      * Multi-user plumbing — single operator, single profile.
+
+    PR #102 update: categories and regions now go through the Dynatree
+    popup driver (`_apply_filters_from_profile` → `_drive_dynatree_popup`),
+    which searches by code/name, ticks the matching node's checkbox span,
+    and clicks the popup's apply button. Codes/regions that don't match
+    anything in the tree are logged + recorded in the run summary
+    (categories_not_found / regions_not_found) and the run continues.
+    """
+    bridge = bridge or make_bridge_client()
+    config = ProactisFilterConfig.from_filter_profile(profile)
+    result = DiscoveryRunResult(status="ok")
+
+    with db_factory() as db:
+        source = _ensure_proactis_source(db)
+        poll_run = PollRun(source_id=source.id, status="running")
+        db.add(poll_run)
+        db.commit()
+        db.refresh(poll_run)
+        result.poll_run_id = poll_run.id
+
+    logger.info(
+        "discovery.proactis.profile_start",
+        poll_run_id=result.poll_run_id,
+        profile_id=getattr(profile, "id", None),
+        constrained=config.is_constrained(),
+        cpv_count=len(config.categories),
+        region_count=len(config.regions),
+    )
+
+    try:
+        attempt, current_url = await _login_then_get_status(bridge, credentials)
+        if attempt.status != "ok":
+            result.status = "needs_login"
+            result.error = (
+                f"login {attempt.status}: {attempt.detail or 'no detail'}"
+            )
+            _finalise_poll_run(db_factory, result)
+            logger.info(
+                "discovery.proactis.login_blocked",
+                poll_run_id=result.poll_run_id,
+                outcome=attempt.status,
+                current_url=current_url,
+            )
+            return result
+
+        # PR #102: profile-driven runs use the Dynatree popup driver for
+        # categories/regions (search-by-code, exact match, tick the
+        # checkbox span, click apply). Keywords + include_closed still go
+        # through the text-input flow inside _apply_filters_from_profile.
+        await _apply_filters_from_profile(bridge, config, result)
+
+        listing_rows: list[DiscoveredOpportunity] = []
+        async for row in _walk_listing(bridge, config):
+            listing_rows.append(row)
+            result.rows_seen += 1
+        result.pages_walked = _last_walked_pages
+
+        with db_factory() as db:
+            for row in listing_rows:
+                if (
+                    config.skip_detail_for_known
+                    and _already_seen(db, row.advert_id)
+                ):
+                    continue
+                detail = await _read_detail(bridge, row)
+                if not detail.is_complete_for_dedup():
+                    logger.warning(
+                        "discovery.proactis.detail_missing_dn",
+                        advert_id=detail.advert_id,
+                    )
+                action, deduped = _upsert_from_discovered(db, detail)
+                if action == "new":
+                    result.opportunities_inserted += 1
+                elif action == "updated":
+                    result.opportunities_updated += 1
+                else:
+                    result.opportunities_unchanged += 1
+                if deduped:
+                    result.opportunities_deduped += 1
+                db.commit()
+    except NeedsLoginError:
+        result.status = "needs_login"
+    except Exception as exc:  # noqa: BLE001
+        result.status = "error"
+        result.error = f"{type(exc).__name__}: {exc}"
+        logger.exception(
+            "discovery.proactis.profile_failed", poll_run_id=result.poll_run_id
+        )
+    finally:
+        try:
+            await bridge.close_session(PROACTIS_BRIDGE_SLUG)
+        except Exception:  # noqa: BLE001
+            logger.debug("discovery.proactis.close_session_failed")
+        _finalise_poll_run(db_factory, result)
+
+    logger.info(
+        "discovery.proactis.profile_complete",
+        poll_run_id=result.poll_run_id,
+        status=result.status,
+        pages=result.pages_walked,
+        rows=result.rows_seen,
+        inserted=result.opportunities_inserted,
+        updated=result.opportunities_updated,
+        deduped=result.opportunities_deduped,
+    )
+    return result
+
+
+def run_for_profile_blocking(
+    *,
+    credentials,
+    profile,
+) -> DiscoveryRunResult:
+    """Synchronous wrapper for ``run_for_profile``. Used by the admin
+    manual-trigger endpoint when it runs discovery in a background thread."""
+    return asyncio.run(run_for_profile(credentials=credentials, profile=profile))
