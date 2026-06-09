@@ -18,6 +18,7 @@ from tender_agent.services.discovery.proactis_discovery import (
 from tender_agent.services.discovery.proactis_filter_config import (
     ProactisFilterConfig,
 )
+from tender_agent.services.email.poller import poll_all_mailboxes
 from tender_agent.services.ingestion import poll_source
 
 logger = structlog.get_logger(__name__)
@@ -43,6 +44,19 @@ async def proactis_discovery_job() -> None:
         await run_proactis_discovery(config=config)
     except Exception:  # noqa: BLE001
         logger.exception("scheduler.proactis_discovery_failed")
+
+
+async def email_poll_job() -> None:
+    """Background per-inbox email poll. Watches every connected mailbox for
+    tender emails (exact subject reference), files them, drafts a reply, and
+    notifies. Read-only and idempotent; never sends. Exceptions are logged here
+    so a bad cycle can't trip-line the job queue."""
+    if not settings.email_poll_enabled:
+        return
+    try:
+        await poll_all_mailboxes()
+    except Exception:  # noqa: BLE001
+        logger.exception("scheduler.email_poll_failed")
 
 
 def ensure_sources() -> None:
@@ -106,6 +120,24 @@ def start() -> None:
         logger.info(
             "scheduler.proactis_discovery_scheduled",
             interval_minutes=settings.proactis_discovery_interval_minutes,
+        )
+    # Email inbox poll — runs on its own interval, only when enabled. Same
+    # coalesce / max_instances=1 safety so two cycles never overlap on one
+    # mailbox (idempotency also guards this, but belt-and-braces).
+    if settings.email_poll_enabled:
+        _scheduler.add_job(
+            email_poll_job,
+            trigger=IntervalTrigger(
+                minutes=settings.email_poll_interval_minutes
+            ),
+            id="email_poll",
+            next_run_time=None,
+            coalesce=True,
+            max_instances=1,
+        )
+        logger.info(
+            "scheduler.email_poll_scheduled",
+            interval_minutes=settings.email_poll_interval_minutes,
         )
     _scheduler.start()
     logger.info("scheduler.started", interval_minutes=settings.poll_interval_minutes)

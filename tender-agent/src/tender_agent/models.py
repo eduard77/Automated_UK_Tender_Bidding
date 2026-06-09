@@ -14,6 +14,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     Numeric,
     String,
     Text,
@@ -940,4 +941,141 @@ class SubmissionQuestionDraft(Base):
     )
 
     package: Mapped[SubmissionPackage] = relationship(back_populates="drafts")
+
+
+# ---------------------------------------------------------------------------
+# Email integration (Phase 6 §5.8): connect an inbox, watch for tender emails,
+# file them, draft a reply, notify.
+#
+# This is the first genuinely MULTI-USER-shaped piece. A connected mailbox
+# belongs to ONE Account and its OAuth tokens are isolated to that account;
+# one user's email is never visible to another. The OAuth token is a SECRET:
+# it is stored encrypted (Fernet, reusing the portal credentials store's key —
+# see services/email/token_store.py) in `token_ciphertext` and is NEVER logged.
+#
+# Read-only OAuth scope by design: the system SUGGESTS a reply but has no send
+# capability. Drafts live on MailboxMessage for the user to review and send
+# themselves — see CLAUDE.md §7.3 / PROJECT.md §5.8.
+# ---------------------------------------------------------------------------
+
+
+class MailboxAccount(Base):
+    """An OAuth-connected inbox belonging to one Account.
+
+    The connect flow is two-step: a `pending` row is created with a random
+    `connect_state` when the user starts OAuth, then the provider redirect
+    fills `email_address` + `token_ciphertext` and flips status to
+    `connected`. Tokens are encrypted at rest and refreshed in place.
+    """
+
+    __tablename__ = "mailbox_accounts"
+    __table_args__ = (
+        # One connection per (account, provider, mailbox). email_address is
+        # NULL while pending — Postgres allows multiple NULLs, so concurrent
+        # pending connects don't collide.
+        UniqueConstraint(
+            "account_id",
+            "provider",
+            "email_address",
+            name="uq_mailbox_account_provider_email",
+        ),
+        Index("ix_mailbox_accounts_account_id", "account_id"),
+        Index("ix_mailbox_accounts_connect_state", "connect_state"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    account_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # 'gmail' | 'outlook' | 'yahoo'
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)
+    # The connected mailbox address, learned from the provider on callback.
+    # NULL while the connection is still pending OAuth consent.
+    email_address: Mapped[str | None] = mapped_column(String(320))
+    # 'pending' | 'connected' | 'disconnected' | 'error'
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending"
+    )
+    # Fernet-encrypted JSON of the OAuth tokens. SECRET — never logged.
+    token_ciphertext: Mapped[bytes | None] = mapped_column(LargeBinary)
+    # Random nonce that ties the provider redirect back to this row.
+    connect_state: Mapped[str | None] = mapped_column(String(64))
+    # Watermark for the incremental poll: only messages newer than this are
+    # listed (minus a small overlap). Advanced after each successful poll.
+    last_polled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    account: Mapped[Account] = relationship()
+    messages: Mapped[list[MailboxMessage]] = relationship(
+        back_populates="mailbox",
+        cascade="all, delete-orphan",
+    )
+
+
+class MailboxMessage(Base):
+    """A processed inbound email that matched a tender by exact subject ref.
+
+    One row per (mailbox, provider_message_id) — the unique constraint is the
+    idempotency guard: re-processing the same message double-files nothing and
+    double-notifies no one. We only persist messages we ACTED on (matched a
+    tender). Unmatched mail leaves no row by design.
+
+    The suggested reply lives in `draft_reply`. There is no send path: the
+    system stores the draft for the user to review and send themselves.
+    """
+
+    __tablename__ = "mailbox_messages"
+    __table_args__ = (
+        UniqueConstraint(
+            "mailbox_account_id",
+            "provider_message_id",
+            name="uq_mailbox_message_provider_id",
+        ),
+        Index("ix_mailbox_messages_mailbox_account_id", "mailbox_account_id"),
+        Index("ix_mailbox_messages_tender_id", "tender_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    mailbox_account_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("mailbox_accounts.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    provider_message_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    tender_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("tenders.id", ondelete="SET NULL"),
+    )
+    # The exact reference token from the subject that matched the tender.
+    matched_ref: Mapped[str | None] = mapped_column(String(256))
+    subject: Mapped[str | None] = mapped_column(Text)
+    sender: Mapped[str | None] = mapped_column(String(512))
+    received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # A short stored excerpt of the body (stored, not logged) for the review UI.
+    body_excerpt: Mapped[str | None] = mapped_column(Text)
+    attachment_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    # Plain-text links found in the body, surfaced to the user but NEVER
+    # fetched by the system.
+    links: Mapped[list | None] = mapped_column(JSONB)
+    draft_reply: Mapped[str | None] = mapped_column(Text)
+    # 'drafted' | 'no_reply_needed' | 'skipped' | 'error'
+    draft_status: Mapped[str | None] = mapped_column(String(16))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    mailbox: Mapped[MailboxAccount] = relationship(back_populates="messages")
+    tender: Mapped[Tender | None] = relationship()
 
