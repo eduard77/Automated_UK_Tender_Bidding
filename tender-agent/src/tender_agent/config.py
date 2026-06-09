@@ -89,6 +89,12 @@ class Settings(BaseSettings):
     # Dashboard origin — used as the base for notification `url` paths.
     dashboard_base_url: str = "http://localhost:3000"
 
+    # Operator account for SYSTEM/operational push alerts (e.g. "log in to fetch
+    # documents" from the portal orchestrator). These aren't tied to a specific
+    # end user, so they target this account's devices only. Unset → such alerts
+    # notify NOBODY (logged), never a cross-account broadcast.
+    push_operator_account_id: int | None = None
+
     # Browser bridge. There are TWO modes (Delta cloud stage 2):
     #   1. In-process Playwright (default in cloud) — `bridge_url=""`. The
     #      backend drives Chromium directly via `bridge_in_process.py`. No

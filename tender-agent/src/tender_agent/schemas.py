@@ -285,6 +285,7 @@ class PushSubscriptionRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    account_id: int | None
     endpoint: str
     filter_profile_id: int | None
     user_agent: str | None

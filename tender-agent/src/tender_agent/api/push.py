@@ -1,7 +1,8 @@
 """Push subscription endpoints — subscribe / unsubscribe / vapid-public-key.
 
-Subscriptions are anonymous: keyed by browser-issued endpoint URL. No auth yet
-(see PROJECT.md §7 for the human-gated auth story planned for a later phase).
+Subscriptions are OWNED by the authenticated account: subscribing requires auth
+and records the caller's account on the subscription, so every notification can
+be targeted to that user's devices only (no cross-account leakage).
 """
 from __future__ import annotations
 
@@ -11,9 +12,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from tender_agent.api.deps import require_account
 from tender_agent.config import settings
 from tender_agent.db import get_db
-from tender_agent.models import PushSubscription
+from tender_agent.models import Account, PushSubscription
 from tender_agent.schemas import (
     PushSubscriptionCreate,
     PushSubscriptionRead,
@@ -44,9 +46,16 @@ def get_vapid_public_key() -> VapidPublicKey:
 def subscribe(
     payload: PushSubscriptionCreate,
     request: Request,
+    account: Account = Depends(require_account),
     db: Session = Depends(get_db),
 ) -> PushSubscriptionRead:
-    """Upsert a browser PushSubscription by endpoint."""
+    """Upsert a browser PushSubscription by endpoint, OWNED by the caller.
+
+    Recording the authenticated account is what makes per-user dispatch possible
+    — a subscription with no known owner is exactly the bug this closes. If the
+    same endpoint re-subscribes under a different account (shared device), the
+    owner is reassigned to the current caller.
+    """
     if not push_configured():
         raise HTTPException(status_code=503, detail="push not configured")
 
@@ -57,6 +66,7 @@ def subscribe(
 
     if existing is None:
         sub = PushSubscription(
+            account_id=account.id,
             endpoint=payload.endpoint,
             p256dh=payload.keys.p256dh,
             auth=payload.keys.auth,
@@ -65,7 +75,9 @@ def subscribe(
         )
         db.add(sub)
     else:
-        # Browser may re-subscribe with rotated keys; treat as upsert.
+        # Browser may re-subscribe with rotated keys; treat as upsert and (re)bind
+        # ownership to the current caller.
+        existing.account_id = account.id
         existing.p256dh = payload.keys.p256dh
         existing.auth = payload.keys.auth
         existing.filter_profile_id = payload.filter_profile_id

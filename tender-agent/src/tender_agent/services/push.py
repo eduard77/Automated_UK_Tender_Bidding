@@ -1,10 +1,19 @@
-"""Web Push dispatch.
+"""Web Push dispatch — scoped per-user.
 
-Best-effort. A failure here MUST NOT break ingestion or any caller — we always
-log structured events and swallow exceptions at the dispatch boundary.
+Every notification targets a SPECIFIC account's subscriptions. There is no
+catch-all path: a notification is never sent to subscriptions across accounts,
+and a missing/unknown target account notifies NOBODY (logged), never everybody.
+This is what stops one user's notifications — especially the email-derived ones
+that carry private inbox content — reaching another user's devices.
 
-Subscriptions whose endpoint returns 404/410 ("gone") are deleted from the DB.
-Successful sends update last_used_at.
+Legacy `account_id IS NULL` subscriptions are unowned and are excluded from
+every dispatch (they are never blasted); they stop receiving until the device
+re-subscribes (now authenticated) or an operator backfills them.
+
+Best-effort: a failure here MUST NOT break ingestion, email processing, or any
+caller — we always log structured events and swallow exceptions at the dispatch
+boundary. Subscriptions whose endpoint returns 404/410 ("gone") are deleted;
+successful sends update last_used_at.
 """
 from __future__ import annotations
 
@@ -88,64 +97,77 @@ def _send_one(
     return True
 
 
-def send_to_subscribers(
-    db: Session, filter_profile_id: int, payload: dict[str, str]
+def _dispatch(
+    db: Session, subs: list[PushSubscription], payload: dict[str, str]
 ) -> tuple[int, int]:
-    """Dispatch `payload` to every subscriber of `filter_profile_id` plus every
-    subscriber with `filter_profile_id IS NULL` (catch-all subscribers).
-
-    Returns (sent, failed). Does NOT raise. Caller commits.
-    """
-    if not push_configured():
-        logger.info("push.skip_unconfigured", filter_profile_id=filter_profile_id)
-        return (0, 0)
-
-    subs = list(
-        db.execute(
-            select(PushSubscription).where(
-                or_(
-                    PushSubscription.filter_profile_id == filter_profile_id,
-                    PushSubscription.filter_profile_id.is_(None),
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-    if not subs:
-        logger.info("push.no_subscribers", filter_profile_id=filter_profile_id)
-        return (0, 0)
-
+    """Send `payload` to a pre-selected list of subscriptions. Returns
+    (sent, failed). Does NOT raise. Caller commits."""
     sent = failed = 0
     for sub in subs:
         if _send_one(db, sub, payload):
             sent += 1
         else:
             failed += 1
-
     logger.info(
-        "push.dispatch_complete",
-        filter_profile_id=filter_profile_id,
-        sent=sent,
-        failed=failed,
-        total=len(subs),
+        "push.dispatch_complete", sent=sent, failed=failed, total=len(subs)
     )
     return (sent, failed)
+
+
+def send_to_account(
+    db: Session,
+    account_id: int | None,
+    payload: dict[str, str],
+    *,
+    filter_profile_id: int | None = None,
+) -> tuple[int, int]:
+    """Dispatch `payload` to ONE account's subscriptions. Returns (sent, failed).
+    Does NOT raise. Caller commits.
+
+    Safe failure: a None/unknown `account_id` notifies NOBODY (logged), never
+    everybody. When `filter_profile_id` is given, only this account's
+    subscriptions pinned to that profile (or its "all matches" catch-all subs)
+    are targeted; otherwise ALL of the account's devices are targeted (used for
+    account-specific events like a filed email).
+    """
+    if not push_configured():
+        logger.info("push.skip_unconfigured", account_id=account_id)
+        return (0, 0)
+    if account_id is None:
+        # The whole point of this module: no target => no recipients.
+        logger.warning("push.no_target_account")
+        return (0, 0)
+
+    stmt = select(PushSubscription).where(
+        PushSubscription.account_id == account_id
+    )
+    if filter_profile_id is not None:
+        stmt = stmt.where(
+            or_(
+                PushSubscription.filter_profile_id == filter_profile_id,
+                PushSubscription.filter_profile_id.is_(None),
+            )
+        )
+    subs = list(db.execute(stmt).scalars().all())
+    if not subs:
+        logger.info("push.no_subscribers", account_id=account_id)
+        return (0, 0)
+    return _dispatch(db, subs, payload)
 
 
 def send_system_notification(
     db: Session, title: str, body: str, url: str, tag: str | None = None
 ) -> None:
-    """Dispatch a system notification (e.g. 'log in to fetch documents') to all
-    catch-all subscribers. Best-effort; never raises. Caller commits.
+    """Dispatch an operational/system alert (e.g. "log in to fetch documents").
 
-    Catch-all subscribers are those with filter_profile_id IS NULL; passing a
-    sentinel profile id that matches no real profile reaches exactly them.
+    These aren't tied to an end user, so they go to the configured OPERATOR
+    account's devices only (settings.push_operator_account_id). If that is unset,
+    they notify nobody — never a cross-account broadcast. Best-effort; never
+    raises. Caller commits.
     """
     payload = {"title": title, "body": body, "url": url, "tag": tag or "system"}
     try:
-        send_to_subscribers(db, -1, payload)
+        send_to_account(db, settings.push_operator_account_id, payload)
     except Exception:  # noqa: BLE001
         logger.exception("push.system_notification_failed", title=title)
 
@@ -153,15 +175,39 @@ def send_system_notification(
 def send_match_notifications(
     db: Session, tender: Tender, matched_profile_ids: list[int]
 ) -> None:
-    """Convenience: dispatch a "new match" notification for `tender` to subscribers
-    of each profile in `matched_profile_ids`. Wrapped in a try/except so a push
-    failure can never strand the ingestion transaction.
+    """Dispatch a "new match" notification for `tender`, per-user.
+
+    Targets only OWNED subscriptions that are pinned to one of `matched_profile_ids`
+    (plus owned "all matches" catch-all subscriptions). Legacy NULL-owner rows are
+    excluded. Each subscription is delivered to its own account — there is no
+    cross-account dispatch. Wrapped so a push failure can never strand the
+    ingestion transaction.
     """
     if not matched_profile_ids:
         return
+    if not push_configured():
+        logger.info("push.skip_unconfigured", tender_id=tender.id)
+        return
     payload = _build_tender_match_payload(tender)
     try:
-        for profile_id in matched_profile_ids:
-            send_to_subscribers(db, profile_id, payload)
+        subs = list(
+            db.execute(
+                select(PushSubscription).where(
+                    PushSubscription.account_id.isnot(None),
+                    or_(
+                        PushSubscription.filter_profile_id.in_(
+                            matched_profile_ids
+                        ),
+                        PushSubscription.filter_profile_id.is_(None),
+                    ),
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not subs:
+            logger.info("push.no_subscribers", tender_id=tender.id)
+            return
+        _dispatch(db, subs, payload)
     except Exception:  # noqa: BLE001
         logger.exception("push.dispatch_unexpected_error", tender_id=tender.id)

@@ -43,13 +43,14 @@ def db():
 
 @pytest.fixture()
 def push_recorder(monkeypatch):
-    sent: list[dict] = []
+    # Records (target_account_id, payload) so tests prove per-user targeting.
+    sent: list[tuple] = []
 
-    def _fake_send(db, filter_profile_id, payload):
-        sent.append(payload)
+    def _fake_send(db, account_id, payload, *, filter_profile_id=None):
+        sent.append((account_id, payload))
         return (1, 0)
 
-    monkeypatch.setattr(notify_mod, "send_to_subscribers", _fake_send)
+    monkeypatch.setattr(notify_mod, "send_to_account", _fake_send)
     return sent
 
 
@@ -130,9 +131,11 @@ async def test_matched_email_files_drafts_and_notifies_once(
     assert row.draft_reply
     assert row.links == ["https://portal.example/doc1"]
 
-    # Exactly one push, naming the tender + reference + attachment count.
+    # Exactly one push, to the INBOX OWNER, naming tender + ref + attachments.
     assert len(push_recorder) == 1
-    body = push_recorder[0]["body"]
+    target_account_id, payload = push_recorder[0]
+    assert target_account_id == account.id
+    body = payload["body"]
     assert "Cleaning services" in body
     assert "DN12345" in body
     assert "1 attachment" in body
