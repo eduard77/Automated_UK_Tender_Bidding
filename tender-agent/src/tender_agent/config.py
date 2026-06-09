@@ -38,6 +38,17 @@ class Settings(BaseSettings):
     sell2wales_api_base: str = "https://api.sell2wales.gov.wales/v1"
     etendersni_feed_url: str = "https://etendersni.gov.uk/epps/cft/listContractNotices.do?type=atom"
 
+    # EU-Supply / Mercell CTM public-tender listing. One adapter covers every
+    # EU-Supply tenant (yortender, bluelight, …) — each is a host whose
+    # `/ctm/Supplier/PublicTenders` page lists current OPEN public tenders as
+    # server-rendered HTML (no login). `eu_supply_api_base` is the primary host
+    # (used for the Source row); `eu_supply_portals` is the full host list the
+    # adapter sweeps. Add tenants here as the operator needs them.
+    eu_supply_api_base: str = "https://yortender.eu-supply.com"
+    eu_supply_portals: list[str] = Field(
+        default_factory=lambda: ["https://yortender.eu-supply.com"]
+    )
+
     # Document downloader. A single, writable, host-mounted location under
     # /app/data (see docker-compose.yml). Every document/staging path derives
     # from this — never a bare relative 'data' path.
