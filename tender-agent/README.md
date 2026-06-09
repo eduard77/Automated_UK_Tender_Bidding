@@ -34,6 +34,12 @@ After Phase 2:
   over real tenders, checks schema conformance + requirement grounding +
   number grounding, produces a markdown report. See
   [`docs/extractor-validation.md`](../docs/extractor-validation.md).
+- **Email integration** — connect an inbox over OAuth (read-only: Gmail /
+  Outlook; Yahoo deferred), watch for tender emails by **exact subject
+  reference**, file the email + attachments via the existing storage/dedup path,
+  draft a **suggested** reply (never sent), and push a notification. Runs as a
+  scheduled per-inbox poll, idempotent, tokens encrypted and scoped per user.
+  One-time provider setup: [`docs/email-setup.md`](../docs/email-setup.md).
 - **Scheduler** — APScheduler runs polls at the configured interval.
 - **REST API + admin endpoints** — see [Endpoints](#endpoints) below.
 - **Postgres** schema with proper indexes; audit log of every poll

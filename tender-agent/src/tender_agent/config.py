@@ -165,6 +165,49 @@ class Settings(BaseSettings):
     session_cookie_name: str = "tender_agent_session"
     session_lifetime_days: int = 30
 
+    # --- Email integration (Phase 6 §5.8) -----------------------------------
+    # Connect an inbox over OAuth (delegated READ-ONLY access — never stored
+    # passwords), watch for tender emails by exact subject reference, file
+    # attachments via the existing ingest path, draft a reply, and notify.
+    #
+    # The provider app registrations (Google Cloud OAuth client, Azure app,
+    # Yahoo app) are a ONE-TIME human setup the operator does with their own
+    # provider access — Claude Code cannot do them. The code reads the client
+    # id/secret + redirect URI from these settings; until they are set, the
+    # connect flow fails with a clear "provider not configured yet" message.
+    # See the PR description / docs/email_setup.md for the exact checklists.
+    email_poll_enabled: bool = False
+    email_poll_interval_minutes: int = 5
+    # How far back (minutes) to overlap each incremental poll so a message that
+    # arrives mid-cycle is never skipped. Idempotency (unique provider message
+    # id) makes the overlap safe.
+    email_poll_overlap_minutes: int = 10
+    # On a mailbox's first poll (no watermark), how far back to look.
+    email_initial_lookback_days: int = 1
+    # Safety cap on messages fetched per mailbox per poll.
+    email_poll_max_messages: int = 50
+
+    # The provider redirects back here after consent. Must EXACTLY match the
+    # redirect URI registered with each provider, e.g.
+    # https://api.yourdomain/email/oauth/callback
+    email_oauth_redirect_uri: str = ""
+
+    # Google / Gmail (Gmail API, scope gmail.readonly).
+    gmail_client_id: str = ""
+    gmail_client_secret: str = ""
+
+    # Microsoft / Outlook (Microsoft Graph, scopes Mail.Read offline_access
+    # User.Read). "common" lets both work + personal Microsoft accounts sign in.
+    ms_client_id: str = ""
+    ms_client_secret: str = ""
+    ms_tenant: str = "common"
+
+    # Yahoo (DEFERRED — see PR). Yahoo has no clean read-only mail REST API;
+    # it requires OAuth2 + IMAP. The provider slot exists behind the common
+    # interface and reports "not yet configured" until these are wired.
+    yahoo_client_id: str = ""
+    yahoo_client_secret: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:

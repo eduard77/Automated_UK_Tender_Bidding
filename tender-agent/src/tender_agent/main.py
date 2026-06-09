@@ -17,6 +17,7 @@ from tender_agent.api import admin_portals as admin_portals_api
 from tender_agent.api import billing as billing_api
 from tender_agent.api import credentials as credentials_api
 from tender_agent.api import document_ingest as document_ingest_api
+from tender_agent.api import email as email_api
 from tender_agent.api import filters as filters_api
 from tender_agent.api import go_no_go as go_no_go_api
 from tender_agent.api import platforms as platforms_api
@@ -119,3 +120,4 @@ app.include_router(accounts_api.me_router)
 app.include_router(billing_api.router)
 app.include_router(go_no_go_api.router)
 app.include_router(submission_api.router)
+app.include_router(email_api.router)

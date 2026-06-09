@@ -167,6 +167,25 @@ class CredentialsStore:
             extra=data.get("extra") or {},
         )
 
+    # --- generic secret crypto (reused by the email OAuth token store) ------
+    # The email integration stores OAuth tokens encrypted at rest, reusing this
+    # store's keyring-held Fernet key rather than introducing a second secret
+    # mechanism. The token ciphertext lives on the per-account mailbox_accounts
+    # row (Postgres), so these helpers expose just the crypto, not the SQLite
+    # credentials table. See services/email/token_store.py.
+
+    def encrypt_secret(self, plaintext: str) -> bytes:
+        """Fernet-encrypt an arbitrary secret string. Never logs the value."""
+        self._ensure_init()
+        assert self._fernet is not None
+        return self._fernet.encrypt(plaintext.encode("utf-8"))
+
+    def decrypt_secret(self, blob: bytes) -> str:
+        """Decrypt a value produced by `encrypt_secret`."""
+        self._ensure_init()
+        assert self._fernet is not None
+        return self._fernet.decrypt(blob).decode("utf-8")
+
     # --- operations ----------------------------------------------------
 
     def store_credentials(
