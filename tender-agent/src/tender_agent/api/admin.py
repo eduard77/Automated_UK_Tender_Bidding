@@ -12,10 +12,15 @@ from sqlalchemy.orm import Session
 
 from tender_agent.config import settings
 from tender_agent.db import get_db
-from tender_agent.models import Tender
+from tender_agent.models import FilterProfile, Tender
 from tender_agent.schemas import TenderRequirementsRead
+from tender_agent.services.credentials import (
+    CredentialsStoreError,
+    get_store,
+)
 from tender_agent.services.discovery.proactis_discovery import (
     DiscoveryRunResult,
+    run_for_profile_blocking,
 )
 from tender_agent.services.discovery.proactis_discovery import (
     run_blocking as run_proactis_discovery_blocking,
@@ -151,3 +156,142 @@ def _run_proactis_discovery_safely(config: ProactisFilterConfig) -> DiscoveryRun
         # escapes BackgroundTasks. Return a synthetic "error" result so any
         # in-process caller (tests) gets a typed object back.
         return DiscoveryRunResult(status="error", error="exception in background task")
+
+
+# ---------------------------------------------------------------------------
+# Logged-in, profile-driven Proactis discovery (Step 1)
+# ---------------------------------------------------------------------------
+
+
+class ProactisProfileRunTriggerRequest(BaseModel):
+    """Body for the logged-in profile-driven discovery trigger.
+
+    Step 1 scope: single operator, single filter profile, single portal/user
+    record in the credentials store. We accept the IDs from the body rather
+    than infer them so the operator can pick a specific profile + credential
+    pair if they have several saved.
+    """
+
+    profile_id: int
+    portal_id: int
+    user_id: str = "default"
+
+
+class ProactisProfileRunTriggerResponse(BaseModel):
+    status: str  # "scheduled"
+    detail: str
+
+
+@router.post(
+    "/discovery/proactis/run-for-profile",
+    status_code=202,
+    response_model=ProactisProfileRunTriggerResponse,
+)
+def trigger_proactis_profile_discovery(
+    body: ProactisProfileRunTriggerRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+) -> ProactisProfileRunTriggerResponse:
+    """Manually trigger a LOGGED-IN, profile-filtered Proactis discovery run
+    against the operator's existing FilterProfile.
+
+    Pulls the stored credentials from the same encrypted CredentialsStore
+    Delta uses; never logs the password or surfaces it in the response.
+    The run drives Proactis as a search user (NOT a registrant) and goes
+    through the same parse / upsert / dedup path CF and FTS use, so
+    discovered tenders land in the unified search and dedup on the DN
+    reference.
+
+    The trigger is fire-and-forget: discovery takes minutes (multiple
+    pages + per-row detail reads), so we return 202 + a hint to read the
+    structured `discovery.proactis.profile_*` logs or the latest `poll_runs`
+    row for source PROACTIS.
+    """
+    profile = db.get(FilterProfile, body.profile_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="filter_profile_not_found")
+
+    try:
+        store = get_store()
+        credentials = store.get_credentials(body.portal_id, body.user_id)
+    except CredentialsStoreError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"credentials_store_unavailable: {exc}",
+        ) from exc
+    if credentials is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "no_proactis_credentials_stored — POST credentials to "
+                "/credentials first for this portal_id + user_id"
+            ),
+        )
+
+    # Detach the profile from the session so the background thread can use
+    # it without keeping the request's DB session open. Snapshot the fields
+    # the discovery actually reads.
+    snapshot = _profile_snapshot(profile)
+    background_tasks.add_task(
+        _run_proactis_profile_discovery_safely, credentials, snapshot
+    )
+    return ProactisProfileRunTriggerResponse(
+        status="scheduled",
+        detail=(
+            "Profile-driven Proactis discovery scheduled. Check the "
+            "`discovery.proactis.profile_*` structured logs or the latest "
+            "`poll_runs` row for source PROACTIS for the outcome."
+        ),
+    )
+
+
+class _ProfileSnapshot:
+    """Tiny attribute carrier the discovery layer reads via getattr().
+
+    A FilterProfile from the request's DB session can't be safely accessed
+    inside the BackgroundTasks worker (session is closed); copy only the
+    fields the run actually uses."""
+
+    __slots__ = ("id", "cpv_codes", "cpv_prefixes", "regions", "keywords_any")
+
+    def __init__(self, profile: FilterProfile) -> None:
+        self.id = profile.id
+        self.cpv_codes = list(profile.cpv_codes or [])
+        self.cpv_prefixes = list(profile.cpv_prefixes or [])
+        self.regions = list(profile.regions or [])
+        self.keywords_any = list(profile.keywords_any or [])
+
+
+def _profile_snapshot(profile: FilterProfile) -> _ProfileSnapshot:
+    return _ProfileSnapshot(profile)
+
+
+def _run_proactis_profile_discovery_safely(
+    credentials, profile: _ProfileSnapshot
+) -> DiscoveryRunResult:
+    """Background wrapper — never lets an exception escape into the FastAPI
+    background-task runner's generic logging."""
+    try:
+        # Reuse SessionLocal as the db_factory so the run owns its own DB
+        # session for the lifetime of the cycle (mirrors `run()`).
+        from tender_agent.services.discovery.proactis_discovery import (
+            run_for_profile_blocking as _blocking,
+        )
+
+        # _blocking does `asyncio.run(run_for_profile(...))` which uses
+        # SessionLocal as db_factory by default — perfect.
+        return _blocking(credentials=credentials, profile=profile)
+    except Exception:  # noqa: BLE001
+        return DiscoveryRunResult(
+            status="error", error="exception in background task"
+        )
+
+
+# Re-exported for tests that want to drive the background work directly.
+__all__ = [
+    "_ProfileSnapshot",
+    "_run_proactis_discovery_safely",
+    "_run_proactis_profile_discovery_safely",
+    "router",
+    "run_for_profile_blocking",
+]

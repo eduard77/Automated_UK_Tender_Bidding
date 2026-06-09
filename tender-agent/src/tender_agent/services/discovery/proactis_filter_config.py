@@ -70,3 +70,46 @@ class ProactisFilterConfig(BaseModel):
             or self.organisations
             or not self.include_closed
         )
+
+    @classmethod
+    def from_filter_profile(cls, profile: object) -> ProactisFilterConfig:
+        """Translate the operator's existing FilterProfile (cpv_codes +
+        cpv_prefixes + regions + keywords_any) into the Proactis filter
+        shape. We do NOT touch the FilterProfile model — this is a one-way
+        read.
+
+        Field mapping (Step 1):
+          - keywords ← " ".join(profile.keywords_any) — Proactis's filter is
+            a single text box; the operator's local AND-of-words semantics
+            don't survive into the Proactis backend, but feeding the words
+            is still narrower than nothing.
+          - categories ← profile.cpv_codes + cpv_prefixes (deduped). The
+            discovery service drives the Categories control with these; an
+            unrecognised code is logged + skipped, never blocking.
+          - regions ← profile.regions (as-is).
+          - include_closed stays False (open-only) — operator intent.
+
+        The caller (`run_for_profile`) is the only consumer; tests assert
+        the mapping is faithful for representative profile rows.
+        """
+        keywords_any = list(getattr(profile, "keywords_any", []) or [])
+        keywords = " ".join(w for w in keywords_any if w and w.strip()).strip()
+        cpv_codes = list(getattr(profile, "cpv_codes", []) or [])
+        cpv_prefixes = list(getattr(profile, "cpv_prefixes", []) or [])
+        # De-dup while preserving order. Codes come before prefixes because
+        # the more specific entry should be tried first if Proactis offers
+        # both as suggestions.
+        categories: list[str] = []
+        seen: set[str] = set()
+        for entry in [*cpv_codes, *cpv_prefixes]:
+            value = (entry or "").strip()
+            if value and value not in seen:
+                categories.append(value)
+                seen.add(value)
+        regions = [r for r in (getattr(profile, "regions", []) or []) if r and r.strip()]
+        return cls(
+            keywords=keywords,
+            regions=regions,
+            categories=categories,
+            include_closed=False,
+        )
