@@ -60,6 +60,10 @@ from tender_agent.services.bridge_client import (
 from tender_agent.services.discovery.proactis_filter_config import (
     ProactisFilterConfig,
 )
+from tender_agent.services.discovery.proactis_login import (
+    LoginAttempt,
+    login_with_credentials,
+)
 from tender_agent.services.ingestion import _upsert_tender
 from tender_agent.services.portals.adapters.proactis import (
     OPPORTUNITY_DATE_RE,
@@ -795,3 +799,188 @@ def run_blocking(config: ProactisFilterConfig) -> DiscoveryRunResult:
     """Synchronous wrapper for ``run``. Used by the admin manual-trigger
     endpoint when it executes the discovery in a background thread."""
     return asyncio.run(run(config=config))
+
+
+# ---------------------------------------------------------------------------
+# Profile-driven, logged-in path (Step 1: single account, single profile)
+# ---------------------------------------------------------------------------
+
+
+async def _login_then_get_status(
+    bridge: BridgeClient,
+    credentials,  # services.portals.base.Credentials
+) -> tuple[LoginAttempt, str | None]:
+    """Open the bridge session, drive the login form with the supplied
+    credentials, and return the LoginAttempt + the post-login current URL
+    (for diagnostics). Never raises — the caller maps the LoginAttempt onto
+    a DiscoveryRunResult shape."""
+    try:
+        await bridge.open_session(
+            PROACTIS_BRIDGE_SLUG, start_url=PROACTIS_URLS["login"]
+        )
+    except BridgeError as exc:
+        return (
+            LoginAttempt(status="error", detail=f"open_session failed: {exc}"),
+            None,
+        )
+
+    # Quick "are we ALREADY logged in?" probe — the bridge persistent context
+    # may have surviving cookies from a previous run, in which case we skip
+    # the form fill entirely.
+    try:
+        await bridge.navigate(
+            PROACTIS_BRIDGE_SLUG, PROACTIS_URLS["post_login_home"]
+        )
+        status = await bridge.session_status(PROACTIS_BRIDGE_SLUG)
+        if not _is_login_url(status.get("current_url")):
+            return (
+                LoginAttempt(
+                    status="ok",
+                    detail="session reused (cookies survived)",
+                    current_url=status.get("current_url"),
+                ),
+                status.get("current_url"),
+            )
+    except BridgeError:
+        pass
+
+    attempt = await login_with_credentials(
+        bridge, slug=PROACTIS_BRIDGE_SLUG, credentials=credentials
+    )
+    return attempt, attempt.current_url
+
+
+async def run_for_profile(
+    *,
+    credentials,  # services.portals.base.Credentials
+    profile,  # tender_agent.models.FilterProfile
+    bridge: BridgeClient | None = None,
+    db_factory=SessionLocal,
+) -> DiscoveryRunResult:
+    """Logged-in, profile-filtered Proactis discovery (Step 1).
+
+    Drives the operator's existing FilterProfile (CPV codes/prefixes +
+    regions + any keywords) through Proactis as a SEARCH user. Reuses the
+    existing parse + upsert + dedup path so nothing about the unified
+    search semantics changes — same `source_code="PROACTIS"`,
+    `source_ref=advertId`, `procurement_ref=DN`, region resolver.
+
+    The login form is filled from `credentials` (the SAME `CredentialsStore`
+    that powers Delta — secret never logged, fingerprint only). A rejected
+    credential / missing form field / persistent /Login URL all map to a
+    `needs_login` outcome with an explanatory `detail`; the run finishes
+    cleanly so the operator can act.
+
+    NOT in scope for Step 1:
+      * Popup-tree CPV / region pickers — the existing `_apply_filters`
+        drives the text-input controls (`fill` + `Add new region/category`
+        clicks). On Proactis variants that use the searchable-tree popup,
+        we EXPECT the filters not to apply; we still record what we got and
+        log clearly. The first real run is the diagnostic.
+      * Single-Delta-session lease style locking — Proactis behaviour TBD.
+      * Multi-user plumbing — single operator, single profile.
+    """
+    bridge = bridge or make_bridge_client()
+    config = ProactisFilterConfig.from_filter_profile(profile)
+    result = DiscoveryRunResult(status="ok")
+
+    with db_factory() as db:
+        source = _ensure_proactis_source(db)
+        poll_run = PollRun(source_id=source.id, status="running")
+        db.add(poll_run)
+        db.commit()
+        db.refresh(poll_run)
+        result.poll_run_id = poll_run.id
+
+    logger.info(
+        "discovery.proactis.profile_start",
+        poll_run_id=result.poll_run_id,
+        profile_id=getattr(profile, "id", None),
+        constrained=config.is_constrained(),
+        cpv_count=len(config.categories),
+        region_count=len(config.regions),
+    )
+
+    try:
+        attempt, current_url = await _login_then_get_status(bridge, credentials)
+        if attempt.status != "ok":
+            result.status = "needs_login"
+            result.error = (
+                f"login {attempt.status}: {attempt.detail or 'no detail'}"
+            )
+            _finalise_poll_run(db_factory, result)
+            logger.info(
+                "discovery.proactis.login_blocked",
+                poll_run_id=result.poll_run_id,
+                outcome=attempt.status,
+                current_url=current_url,
+            )
+            return result
+
+        await _apply_filters(bridge, config)
+
+        listing_rows: list[DiscoveredOpportunity] = []
+        async for row in _walk_listing(bridge, config):
+            listing_rows.append(row)
+            result.rows_seen += 1
+        result.pages_walked = _last_walked_pages
+
+        with db_factory() as db:
+            for row in listing_rows:
+                if (
+                    config.skip_detail_for_known
+                    and _already_seen(db, row.advert_id)
+                ):
+                    continue
+                detail = await _read_detail(bridge, row)
+                if not detail.is_complete_for_dedup():
+                    logger.warning(
+                        "discovery.proactis.detail_missing_dn",
+                        advert_id=detail.advert_id,
+                    )
+                action, deduped = _upsert_from_discovered(db, detail)
+                if action == "new":
+                    result.opportunities_inserted += 1
+                elif action == "updated":
+                    result.opportunities_updated += 1
+                else:
+                    result.opportunities_unchanged += 1
+                if deduped:
+                    result.opportunities_deduped += 1
+                db.commit()
+    except NeedsLoginError:
+        result.status = "needs_login"
+    except Exception as exc:  # noqa: BLE001
+        result.status = "error"
+        result.error = f"{type(exc).__name__}: {exc}"
+        logger.exception(
+            "discovery.proactis.profile_failed", poll_run_id=result.poll_run_id
+        )
+    finally:
+        try:
+            await bridge.close_session(PROACTIS_BRIDGE_SLUG)
+        except Exception:  # noqa: BLE001
+            logger.debug("discovery.proactis.close_session_failed")
+        _finalise_poll_run(db_factory, result)
+
+    logger.info(
+        "discovery.proactis.profile_complete",
+        poll_run_id=result.poll_run_id,
+        status=result.status,
+        pages=result.pages_walked,
+        rows=result.rows_seen,
+        inserted=result.opportunities_inserted,
+        updated=result.opportunities_updated,
+        deduped=result.opportunities_deduped,
+    )
+    return result
+
+
+def run_for_profile_blocking(
+    *,
+    credentials,
+    profile,
+) -> DiscoveryRunResult:
+    """Synchronous wrapper for ``run_for_profile``. Used by the admin
+    manual-trigger endpoint when it runs discovery in a background thread."""
+    return asyncio.run(run_for_profile(credentials=credentials, profile=profile))
