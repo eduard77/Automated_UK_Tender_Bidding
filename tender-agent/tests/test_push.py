@@ -1,11 +1,8 @@
-"""Unit tests for the push dispatch service.
+"""Unit tests for the push dispatch service (payload + guards).
 
-We don't exercise the actual pywebpush HTTP call here — that needs a live
-endpoint and is covered by the live smoke test. These tests cover:
-
-- payload shape (the contract with the service worker)
-- the "not configured" guard
-- the SQL filter (subscribers of profile X plus catch-all subscribers with NULL)
+The DB-backed per-user scoping is covered in test_push_scoping.py. Here we test
+the pure bits: payload shape, the "not configured" guard, and the safe-failure
+contract that a None target account notifies nobody (never everybody).
 """
 from __future__ import annotations
 
@@ -57,17 +54,29 @@ def test_push_configured_reflects_settings() -> None:
         assert push.push_configured() is True
 
 
-def test_send_to_subscribers_noop_when_unconfigured() -> None:
+def test_send_to_account_noop_when_unconfigured() -> None:
     with patch.object(settings, "vapid_public_key", ""), patch.object(
         settings, "vapid_private_key", ""
     ):
         # No DB touch — push_configured() short-circuits before any query.
-        result = push.send_to_subscribers(db=None, filter_profile_id=1, payload={})
-        assert result == (0, 0)
+        assert push.send_to_account(db=None, account_id=1, payload={}) == (0, 0)
+
+
+def test_send_to_account_none_target_notifies_nobody() -> None:
+    # Configured, but no target account => nobody (and no DB query).
+    with patch.object(settings, "vapid_public_key", "pub"), patch.object(
+        settings, "vapid_private_key", "priv"
+    ):
+        assert push.send_to_account(db=None, account_id=None, payload={}) == (0, 0)
 
 
 def test_send_match_notifications_empty_profiles_is_noop() -> None:
-    # Should return without touching DB or invoking webpush.
-    with patch("tender_agent.services.push.send_to_subscribers") as send:
+    # Returns without touching DB or dispatching.
+    with patch("tender_agent.services.push._dispatch") as dispatch:
         push.send_match_notifications(db=None, tender=_tender(), matched_profile_ids=[])
-        send.assert_not_called()
+        dispatch.assert_not_called()
+
+
+def test_no_catch_all_dispatch_function_remains() -> None:
+    # The old catch-all entry point is gone; nothing can blast all subscribers.
+    assert not hasattr(push, "send_to_subscribers")

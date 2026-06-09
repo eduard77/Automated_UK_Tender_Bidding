@@ -388,16 +388,31 @@ class PollRun(Base):
 
 
 class PushSubscription(Base):
-    """Browser Web Push subscription. Anonymous by endpoint — no user accounts yet.
+    """Browser Web Push subscription, OWNED by an Account.
 
-    A subscription with `filter_profile_id IS NULL` receives every new match,
-    regardless of which filter triggered it. A subscription bound to a specific
-    profile receives only matches against that profile.
+    `account_id` ties a subscription (and its device) to one user. Every
+    notification path dispatches only to a specific account's subscriptions, so
+    one user's notifications — especially the email-derived ones that carry
+    private inbox content — never reach another user's devices.
+
+    `account_id IS NULL` marks a LEGACY row created before ownership existed.
+    Such rows are unowned and are EXCLUDED from every per-user dispatch (they
+    are never blasted as a catch-all). They simply stop receiving until the
+    device re-subscribes (now authenticated), or an operator backfills them.
+
+    `filter_profile_id IS NULL` means "every match for my account"; a specific
+    profile means "only matches against that profile" — now always AND-ed with
+    the owning account.
     """
 
     __tablename__ = "push_subscriptions"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    account_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("accounts.id", ondelete="CASCADE"),
+        index=True,
+    )
     filter_profile_id: Mapped[int | None] = mapped_column(
         Integer,
         ForeignKey("filter_profiles.id", ondelete="CASCADE"),

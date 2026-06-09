@@ -161,6 +161,7 @@ async def _process_message(
     notified = notify_email_match(
         db,
         tender,
+        account_id=mailbox.account_id,
         attachment_count=attachment_count,
         draft_ready=(draft.status == "drafted"),
     )
