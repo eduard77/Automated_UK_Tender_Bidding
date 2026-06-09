@@ -1,0 +1,167 @@
+name: Deploy backend to Azure App Service
+
+# Auto-deploys the backend container image to the existing Azure App Service
+# `GeneraTender` on every merge to main, and can be re-run by the operator
+# from the Actions tab whenever they need to redeploy without a new commit.
+#
+# Process this reproduces verbatim from the operator's manual ritual:
+#   1. az acr build -- server-side build of tender-agent/Dockerfile, pushed to
+#      `generasystemsacr` as `genera-tenders-api:latest`.
+#   2. Stop, wait, Start the App Service (NOT `restart` — `restart` keeps the
+#      cached old image; the operator's experience is the agent stays on the
+#      previous build until Stop + Start is run).
+#   3. Poll /health until the app responds so the workflow's success genuinely
+#      means "the new image is live", not "we kicked the App Service and ran".
+#
+# Auth is via an Azure service principal stored in the AZURE_CREDENTIALS
+# repository secret. Until the operator adds that secret (one-off setup
+# documented in the PR description), this workflow will deploy_guard-fail with
+# a clear, instructive message — it WILL NOT touch Azure with broken auth.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Cancel an in-flight deploy if a newer one queues so we don't try to deploy
+# two builds on top of each other. Group is workflow + ref so the main-push
+# and a manual workflow_dispatch on main share the same lane.
+concurrency:
+  group: deploy-backend-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only checkout is all we need; the deploy step uses an Azure secret.
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Build + deploy backend
+    runs-on: ubuntu-latest
+
+    # Pin the same names the operator already uses. These are infrastructure
+    # facts (registry / image / app name); only the resource group changes per
+    # environment, and that comes from a secret so the workflow never carries
+    # an Azure subscription identifier in the repo.
+    env:
+      ACR_NAME: generasystemsacr
+      IMAGE_NAME: genera-tenders-api
+      IMAGE_TAG: latest
+      WEBAPP_NAME: GeneraTender
+      DOCKERFILE: tender-agent/Dockerfile
+      BUILD_CONTEXT: tender-agent
+      WEBAPP_HEALTH_URL: https://generatender-gqbgaye9fmdfc4c6.ukwest-01.azurewebsites.net/health
+      # Hop the secret through env so the guard step can string-check it. You
+      # can't reference `secrets.X` inside an `if:` expression directly.
+      HAS_AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS != '' && 'yes' || 'no' }}
+      HAS_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP != '' && 'yes' || 'no' }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # Guard step — if the operator hasn't done the one-off secret setup
+      # yet, FAIL HERE with a clear setup checklist rather than letting the
+      # Azure CLI 401 cryptically a step later. The PR description has the
+      # full commands; the workflow log gets the short version.
+      - name: Verify Azure secrets are configured
+        run: |
+          missing=()
+          if [ "${HAS_AZURE_CREDENTIALS}" != "yes" ]; then
+            missing+=("AZURE_CREDENTIALS")
+          fi
+          if [ "${HAS_RESOURCE_GROUP}" != "yes" ]; then
+            missing+=("AZURE_RESOURCE_GROUP")
+          fi
+          if [ ${#missing[@]} -ne 0 ]; then
+            cat <<'EOF'
+          ============================================================
+          Auto-deploy is blocked: one-off Azure setup is missing.
+          ============================================================
+          The following repository secrets must be added before this
+          workflow can deploy. See the PR description for the exact
+          `az` commands and where to paste them in GitHub.
+
+          Settings -> Secrets and variables -> Actions -> New repository secret
+          EOF
+            for s in "${missing[@]}"; do echo "  - $s"; done
+            echo
+            echo "Once those are set, re-run this workflow from the Actions"
+            echo "tab (Re-run all jobs). The next merge to main will also"
+            echo "auto-deploy."
+            exit 1
+          fi
+          echo "Secrets present — proceeding with deploy."
+
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # `az acr build` runs the docker build on ACR's build agents (the same
+      # thing `az acr build` does from the operator's laptop). We pass the
+      # tender-agent/ directory as the build context and the existing
+      # Dockerfile — nothing about the image or its name changes vs the
+      # current manual process.
+      - name: Build image on ACR (server-side)
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            set -euo pipefail
+            az acr build \
+              --registry "${ACR_NAME}" \
+              --image "${IMAGE_NAME}:${IMAGE_TAG}" \
+              --file "${DOCKERFILE}" \
+              "${BUILD_CONTEXT}"
+
+      # The Stop-then-Start ritual. App Service keeps the previously-pulled
+      # container hot in memory after a plain `restart`, so the operator has
+      # consistently used Stop + Start to force a fresh image pull. The short
+      # sleep between Stop and Start gives the runtime a beat to drain.
+      - name: Stop App Service (force a clean image pull)
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            set -euo pipefail
+            az webapp stop \
+              --name "${WEBAPP_NAME}" \
+              --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}"
+            echo "Stopped. Pausing 10s before Start."
+            sleep 10
+
+      - name: Start App Service
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            set -euo pipefail
+            az webapp start \
+              --name "${WEBAPP_NAME}" \
+              --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}"
+
+      # Don't claim success until /health responds. The Playwright base image
+      # is large, so cold pulls can take a couple of minutes; the poll budget
+      # is generous (~5 minutes) but bounded so a wedged deploy still fails
+      # this workflow loudly.
+      - name: Wait for /health to come back up
+        run: |
+          set -euo pipefail
+          url="${WEBAPP_HEALTH_URL}"
+          deadline=$(( SECONDS + 300 ))   # 5 minutes
+          attempt=0
+          while [ ${SECONDS} -lt ${deadline} ]; do
+            attempt=$(( attempt + 1 ))
+            status=$(curl -s -o /tmp/health.out -w "%{http_code}" --max-time 10 "${url}" || echo "000")
+            if [ "${status}" = "200" ]; then
+              echo "Health OK (attempt ${attempt})."
+              cat /tmp/health.out
+              echo
+              exit 0
+            fi
+            echo "Attempt ${attempt}: status=${status}; retrying in 10s..."
+            sleep 10
+          done
+          echo "Deploy completed but /health did not return 200 within 5 minutes."
+          echo "Last status: ${status:-unknown}"
+          echo "Last body:"
+          cat /tmp/health.out 2>/dev/null || true
+          exit 1
