@@ -1,48 +1,84 @@
-"""Encrypted credentials store for portal logins.
+"""Encrypted credentials store for portal logins — cloud-safe.
 
-Design (per design doc): a standalone SQLite database, separate from the main
-Postgres app DB, with the encryption key held in the OS keyring (Windows
-Credential Manager on the deployment target, Secret Service on Linux, Keychain
-on macOS). The credential payload (username / password / email / extra) is
-serialised to JSON and encrypted with Fernet before being written; only
-non-secret metadata (portal_id, user_id, platform_slug, valid, timestamps) is
-stored in the clear so listing never needs to decrypt.
+Storage: the `portal_credentials` table in the MAIN Postgres DB. The
+credential payload (username / password / email / extra) is serialised to
+JSON and encrypted with Fernet (authenticated symmetric encryption) before it
+is written; only non-secret metadata (portal_id, user_id, platform_slug,
+valid, timestamps) is stored in the clear so listing never needs to decrypt.
 
-Migrates to AWS Secrets Manager on deployment; this interface stays the same.
+Encryption key — resolved in this order:
+  1. The `CREDENTIALS_ENCRYPTION_KEY` setting (env var locally, App Service
+     application setting on Azure). The cloud path: ONE secret, set ONCE in
+     the Azure portal UI, no terminal needed.
+  2. The OS keyring (local-dev convenience only — generated and stored on
+     first use, exactly as before). The cloud container has no keyring.
+If neither source yields a key the store refuses to operate with an error
+that names the app setting and how to generate it. It NEVER falls back to
+plaintext, and decryption with a wrong/rotated key fails safe with a clear
+error rather than crashing or leaking.
 
-Lazy init: the first call generates a fresh key (if none in keyring), stores
-it, and creates the schema. If no usable keyring backend is configured the
-store refuses to operate with a clear error.
+This replaced the original standalone-SQLite-plus-keyring design: the Azure
+container has neither an OS keyring nor a persistent local disk, so that
+store could not hold anything on the cloud. A local dev who had logins in
+`~/.tender-agent/credentials.db` re-adds them via POST /credentials.
+
+The email OAuth token store (services/email/token_store.py) reuses
+`encrypt_secret` / `decrypt_secret` below, so the same single key covers
+email tokens — no second secret mechanism.
 """
 from __future__ import annotations
 
 import json
-import os
-import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
 
 import structlog
+from cryptography.fernet import Fernet, InvalidToken
+from sqlalchemy import select
 
+from tender_agent.config import settings
+from tender_agent.models import PortalCredential
 from tender_agent.services.portals.base import Credentials
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
 
 logger = structlog.get_logger(__name__)
 
 KEYRING_SERVICE = "tender-agent"
 KEYRING_KEY_NAME = "credentials-db-key"
 
-KEYRING_ERROR_MESSAGE = (
-    "Credentials store requires OS keyring. Configure keyring backend "
-    "before proceeding."
+_GENERATE_KEY_HINT = (
+    'python -c "from cryptography.fernet import Fernet; '
+    'print(Fernet.generate_key().decode())"'
+)
+
+NO_KEY_ERROR_MESSAGE = (
+    "Credentials store has no encryption key. One-time setup: generate a key "
+    f"with {_GENERATE_KEY_HINT} and add it as an application setting named "
+    "CREDENTIALS_ENCRYPTION_KEY (Azure portal -> the App Service -> Settings "
+    "-> Environment variables -> Add), then restart the app. Locally, set "
+    "CREDENTIALS_ENCRYPTION_KEY in .env instead (or configure an OS keyring)."
+)
+
+INVALID_KEY_ERROR_MESSAGE = (
+    "CREDENTIALS_ENCRYPTION_KEY is set but is not a valid Fernet key. "
+    f"Generate a valid one with {_GENERATE_KEY_HINT} and update the "
+    "CREDENTIALS_ENCRYPTION_KEY application setting."
+)
+
+DECRYPT_FAILED_ERROR_MESSAGE = (
+    "Stored secret could not be decrypted with the current encryption key — "
+    "CREDENTIALS_ENCRYPTION_KEY has most likely changed since the secret was "
+    "stored. Restore the original key, or delete and re-add the credential."
 )
 
 
 class CredentialsStoreError(RuntimeError):
-    """Raised when the store cannot operate (e.g. no keyring backend)."""
+    """Raised when the store cannot operate (no key, bad key, wrong key)."""
 
 
 @dataclass
@@ -54,111 +90,112 @@ class CredentialMetadata:
     last_validated_at: str | None
 
 
-def default_db_path() -> str:
-    env = os.environ.get("TENDER_AGENT_CREDENTIALS_DB")
-    if env:
-        return env
-    return str(Path.home() / ".tender-agent" / "credentials.db")
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
 
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
+def _iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
 
 
 class CredentialsStore:
-    def __init__(self, db_path: str | None = None) -> None:
-        self.db_path = db_path or default_db_path()
-        self._fernet: Any | None = None
-        self._initialised = False
+    """Public interface is unchanged from the legacy store: callers keep
+    using store/get/mark_*/list/delete and encrypt_secret/decrypt_secret.
+    Only the backend moved (SQLite file -> Postgres column) and the key
+    source gained the env-var path."""
 
-    # --- lazy init -----------------------------------------------------
+    def __init__(
+        self,
+        session_factory: Callable[[], Session] | None = None,
+        encryption_key: str | None = None,
+    ) -> None:
+        # Both lazily resolved so importing this module never touches the DB
+        # or the key material. Tests inject an in-memory session factory and
+        # an explicit key.
+        self._session_factory = session_factory
+        self._explicit_key = encryption_key
+        self._fernet: Fernet | None = None
 
-    def _get_or_create_key(self) -> bytes:
-        import keyring
+    # --- key resolution --------------------------------------------------
 
-        # Detect a non-functional backend up front for a clear error.
+    def _key_from_keyring(self) -> bytes | None:
+        """Local-dev fallback: read (or generate-and-store) a key in the OS
+        keyring. Returns None when no usable keyring backend exists — the
+        caller raises the instructive no-key error instead."""
+        try:
+            import keyring
+        except Exception:  # noqa: BLE001 - keyring optional
+            return None
+
         try:
             from keyring.backends.fail import Keyring as FailKeyring
 
             if isinstance(keyring.get_keyring(), FailKeyring):
-                raise CredentialsStoreError(KEYRING_ERROR_MESSAGE)
-        except CredentialsStoreError:
-            raise
+                return None
         except Exception:  # noqa: BLE001 - probing the backend; ignore
             pass
 
         try:
             existing = keyring.get_password(KEYRING_SERVICE, KEYRING_KEY_NAME)
-        except Exception as exc:  # noqa: BLE001
-            raise CredentialsStoreError(KEYRING_ERROR_MESSAGE) from exc
-
-        if existing:
-            return existing.encode("utf-8")
-
-        from cryptography.fernet import Fernet
-
-        key = Fernet.generate_key()
-        try:
+            if existing:
+                return existing.encode("utf-8")
+            key = Fernet.generate_key()
             keyring.set_password(
                 KEYRING_SERVICE, KEYRING_KEY_NAME, key.decode("utf-8")
             )
-        except Exception as exc:  # noqa: BLE001
-            raise CredentialsStoreError(KEYRING_ERROR_MESSAGE) from exc
-        return key
+            return key
+        except Exception:  # noqa: BLE001 - any keyring failure => no key
+            return None
 
-    def _ensure_init(self) -> None:
-        if self._initialised:
-            return
-        from cryptography.fernet import Fernet
+    def _resolve_key(self) -> bytes:
+        if self._explicit_key:
+            return self._explicit_key.strip().encode("utf-8")
+        configured = settings.credentials_encryption_key.strip()
+        if configured:
+            return configured.encode("utf-8")
+        from_keyring = self._key_from_keyring()
+        if from_keyring:
+            return from_keyring
+        raise CredentialsStoreError(NO_KEY_ERROR_MESSAGE)
 
-        key = self._get_or_create_key()
-        self._fernet = Fernet(key)
+    def _ensure_fernet(self) -> Fernet:
+        if self._fernet is None:
+            key = self._resolve_key()
+            try:
+                self._fernet = Fernet(key)
+            except (ValueError, TypeError) as exc:
+                raise CredentialsStoreError(INVALID_KEY_ERROR_MESSAGE) from exc
+        return self._fernet
 
-        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS credentials (
-                    portal_id INTEGER NOT NULL,
-                    user_id TEXT NOT NULL,
-                    platform_slug TEXT,
-                    secret BLOB NOT NULL,
-                    valid INTEGER NOT NULL DEFAULT 1,
-                    last_used_at TEXT,
-                    last_validated_at TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    deleted_at TEXT,
-                    PRIMARY KEY (portal_id, user_id)
-                )
-                """
-            )
-            conn.commit()
-        self._initialised = True
+    # --- DB session ------------------------------------------------------
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
-        # sqlite3's own context manager only manages the transaction, not the
-        # connection lifetime — leaking connections holds a file lock on
-        # Windows. Close explicitly here.
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-            conn.commit()
-        finally:
-            conn.close()
+    def _session(self) -> Iterator[Session]:
+        if self._session_factory is None:
+            from tender_agent.db import SessionLocal
 
-    # --- crypto --------------------------------------------------------
+            self._session_factory = SessionLocal
+        db = self._session_factory()
+        try:
+            yield db
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    # --- crypto ----------------------------------------------------------
 
     def _encrypt(self, creds: Credentials) -> bytes:
-        assert self._fernet is not None
         payload = json.dumps(asdict(creds)).encode("utf-8")
-        return self._fernet.encrypt(payload)
+        return self._ensure_fernet().encrypt(payload)
 
     def _decrypt(self, blob: bytes) -> Credentials:
-        assert self._fernet is not None
-        raw = self._fernet.decrypt(blob)
+        try:
+            raw = self._ensure_fernet().decrypt(bytes(blob))
+        except InvalidToken as exc:
+            raise CredentialsStoreError(DECRYPT_FAILED_ERROR_MESSAGE) from exc
         data = json.loads(raw.decode("utf-8"))
         return Credentials(
             username=data.get("username"),
@@ -167,26 +204,25 @@ class CredentialsStore:
             extra=data.get("extra") or {},
         )
 
-    # --- generic secret crypto (reused by the email OAuth token store) ------
-    # The email integration stores OAuth tokens encrypted at rest, reusing this
-    # store's keyring-held Fernet key rather than introducing a second secret
-    # mechanism. The token ciphertext lives on the per-account mailbox_accounts
-    # row (Postgres), so these helpers expose just the crypto, not the SQLite
-    # credentials table. See services/email/token_store.py.
+    # --- generic secret crypto (reused by the email OAuth token store) ----
+    # The email integration stores OAuth tokens encrypted at rest with this
+    # store's key rather than introducing a second secret mechanism. The
+    # token ciphertext lives on the per-account mailbox_accounts row; these
+    # helpers expose just the crypto. See services/email/token_store.py.
 
     def encrypt_secret(self, plaintext: str) -> bytes:
         """Fernet-encrypt an arbitrary secret string. Never logs the value."""
-        self._ensure_init()
-        assert self._fernet is not None
-        return self._fernet.encrypt(plaintext.encode("utf-8"))
+        return self._ensure_fernet().encrypt(plaintext.encode("utf-8"))
 
     def decrypt_secret(self, blob: bytes) -> str:
-        """Decrypt a value produced by `encrypt_secret`."""
-        self._ensure_init()
-        assert self._fernet is not None
-        return self._fernet.decrypt(blob).decode("utf-8")
+        """Decrypt a value produced by `encrypt_secret`. A wrong/rotated key
+        fails safe with CredentialsStoreError, never a stack-trace crash."""
+        try:
+            return self._ensure_fernet().decrypt(bytes(blob)).decode("utf-8")
+        except InvalidToken as exc:
+            raise CredentialsStoreError(DECRYPT_FAILED_ERROR_MESSAGE) from exc
 
-    # --- operations ----------------------------------------------------
+    # --- operations --------------------------------------------------------
 
     def store_credentials(
         self,
@@ -197,115 +233,105 @@ class CredentialsStore:
     ) -> None:
         """Upsert credentials for (portal_id, user_id). Resets valid=true and
         clears any prior soft-delete."""
-        self._ensure_init()
-        secret = self._encrypt(creds)
-        now = _now()
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO credentials (
-                    portal_id, user_id, platform_slug, secret, valid,
-                    created_at, updated_at, deleted_at
-                ) VALUES (?, ?, ?, ?, 1, ?, ?, NULL)
-                ON CONFLICT(portal_id, user_id) DO UPDATE SET
-                    platform_slug = excluded.platform_slug,
-                    secret = excluded.secret,
-                    valid = 1,
-                    updated_at = excluded.updated_at,
-                    deleted_at = NULL
-                """,
-                (portal_id, user_id, platform_slug, secret, now, now),
-            )
-            conn.commit()
+        secret = self._encrypt(creds)  # resolve the key before any DB write
+        now = _utcnow()
+        with self._session() as db:
+            row = db.get(PortalCredential, (portal_id, user_id))
+            if row is None:
+                row = PortalCredential(
+                    portal_id=portal_id, user_id=user_id, created_at=now
+                )
+                db.add(row)
+            row.platform_slug = platform_slug
+            row.secret_ciphertext = secret
+            row.valid = True
+            row.deleted_at = None
+            row.updated_at = now
+        # Audit: metadata only — NEVER the credential values.
+        logger.info(
+            "credentials.stored", portal_id=portal_id, user_id=user_id
+        )
 
     def get_credentials(
         self, portal_id: int, user_id: str
     ) -> Credentials | None:
-        self._ensure_init()
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT secret FROM credentials
-                WHERE portal_id = ? AND user_id = ? AND deleted_at IS NULL
-                """,
-                (portal_id, user_id),
-            ).fetchone()
-        if row is None:
-            return None
-        return self._decrypt(row["secret"])
+        with self._session() as db:
+            row = db.get(PortalCredential, (portal_id, user_id))
+            if row is None or row.deleted_at is not None:
+                return None
+            blob = row.secret_ciphertext
+        return self._decrypt(blob)
 
     def mark_invalid(self, portal_id: int, user_id: str) -> None:
-        self._ensure_init()
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE credentials SET valid = 0, updated_at = ? "
-                "WHERE portal_id = ? AND user_id = ?",
-                (_now(), portal_id, user_id),
-            )
-            conn.commit()
+        with self._session() as db:
+            row = db.get(PortalCredential, (portal_id, user_id))
+            if row is None:
+                return
+            row.valid = False
+            row.updated_at = _utcnow()
 
     def mark_validated(self, portal_id: int, user_id: str) -> None:
-        self._ensure_init()
-        now = _now()
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE credentials SET valid = 1, last_validated_at = ?, "
-                "updated_at = ? WHERE portal_id = ? AND user_id = ?",
-                (now, now, portal_id, user_id),
-            )
-            conn.commit()
+        now = _utcnow()
+        with self._session() as db:
+            row = db.get(PortalCredential, (portal_id, user_id))
+            if row is None:
+                return
+            row.valid = True
+            row.last_validated_at = now
+            row.updated_at = now
 
     def mark_used(self, portal_id: int, user_id: str) -> None:
-        self._ensure_init()
-        now = _now()
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE credentials SET last_used_at = ?, updated_at = ? "
-                "WHERE portal_id = ? AND user_id = ?",
-                (now, now, portal_id, user_id),
-            )
-            conn.commit()
+        now = _utcnow()
+        with self._session() as db:
+            row = db.get(PortalCredential, (portal_id, user_id))
+            if row is None:
+                return
+            row.last_used_at = now
+            row.updated_at = now
 
     def list_credentials(self, user_id: str) -> list[CredentialMetadata]:
-        self._ensure_init()
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT portal_id, platform_slug, valid, last_used_at,
-                       last_validated_at
-                FROM credentials
-                WHERE user_id = ? AND deleted_at IS NULL
-                ORDER BY portal_id
-                """,
-                (user_id,),
-            ).fetchall()
-        return [
-            CredentialMetadata(
-                portal_id=row["portal_id"],
-                platform_slug=row["platform_slug"],
-                valid=bool(row["valid"]),
-                last_used_at=row["last_used_at"],
-                last_validated_at=row["last_validated_at"],
+        with self._session() as db:
+            rows = (
+                db.execute(
+                    select(PortalCredential)
+                    .where(
+                        PortalCredential.user_id == user_id,
+                        PortalCredential.deleted_at.is_(None),
+                    )
+                    .order_by(PortalCredential.portal_id)
+                )
+                .scalars()
+                .all()
             )
-            for row in rows
-        ]
+            return [
+                CredentialMetadata(
+                    portal_id=row.portal_id,
+                    platform_slug=row.platform_slug,
+                    valid=bool(row.valid),
+                    last_used_at=_iso(row.last_used_at),
+                    last_validated_at=_iso(row.last_validated_at),
+                )
+                for row in rows
+            ]
 
     def delete_credentials(self, portal_id: int, user_id: str) -> None:
         """Soft delete: mark invalid + set deleted_at. The row is retained for
         the audit trail; it disappears from list/get."""
-        self._ensure_init()
-        now = _now()
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE credentials SET valid = 0, deleted_at = ?, "
-                "updated_at = ? WHERE portal_id = ? AND user_id = ?",
-                (now, now, portal_id, user_id),
-            )
-            conn.commit()
+        now = _utcnow()
+        with self._session() as db:
+            row = db.get(PortalCredential, (portal_id, user_id))
+            if row is None:
+                return
+            row.valid = False
+            row.deleted_at = now
+            row.updated_at = now
+        logger.info(
+            "credentials.deleted", portal_id=portal_id, user_id=user_id
+        )
 
 
-# Module-level singleton used by the API. Tests instantiate their own with a
-# tmp db_path + mocked keyring.
+# Module-level singleton used by the API. Tests instantiate their own with an
+# in-memory session factory + explicit key.
 _store: CredentialsStore | None = None
 
 

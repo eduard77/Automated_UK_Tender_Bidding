@@ -1,7 +1,8 @@
 """Encrypt/decrypt OAuth tokens at rest.
 
-Tokens are SECRETS. We reuse the portal credentials store's keyring-held Fernet
-key (services/credentials.py) rather than introduce a second secret mechanism —
+Tokens are SECRETS. We reuse the portal credentials store's Fernet key
+(services/credentials.py — CREDENTIALS_ENCRYPTION_KEY on the cloud, OS keyring
+fallback for local dev) rather than introduce a second secret mechanism —
 "reuse that mechanism" per the spec. The ciphertext lives on the per-account
 mailbox_accounts row (Postgres), so this module only does the
 serialise + encrypt / decrypt + deserialise; it never logs token values.
