@@ -72,7 +72,9 @@ class ProactisFilterConfig(BaseModel):
         )
 
     @classmethod
-    def from_filter_profile(cls, profile: object) -> ProactisFilterConfig:
+    def from_filter_profile(
+        cls, profile: object, *, portals: list[str] | None = None
+    ) -> ProactisFilterConfig:
         """Translate the operator's existing FilterProfile (cpv_codes +
         cpv_prefixes + regions + keywords_any) into the Proactis filter
         shape. We do NOT touch the FilterProfile model — this is a one-way
@@ -87,6 +89,9 @@ class ProactisFilterConfig(BaseModel):
             discovery service drives the Categories control with these; an
             unrecognised code is logged + skipped, never blocking.
           - regions ← profile.regions (as-is).
+          - portals ← the `portals` argument (deployment-level scope from
+            PROACTIS_DISCOVERY_PORTALS — the FilterProfile has no portals
+            dimension). None/empty = the control is left alone.
           - include_closed stays False (open-only) — operator intent.
 
         The caller (`run_for_profile`) is the only consumer; tests assert
@@ -107,9 +112,13 @@ class ProactisFilterConfig(BaseModel):
                 categories.append(value)
                 seen.add(value)
         regions = [r for r in (getattr(profile, "regions", []) or []) if r and r.strip()]
+        portal_names = [
+            p.strip() for p in (portals or []) if p and p.strip()
+        ]
         return cls(
             keywords=keywords,
             regions=regions,
             categories=categories,
+            portals=portal_names,
             include_closed=False,
         )
