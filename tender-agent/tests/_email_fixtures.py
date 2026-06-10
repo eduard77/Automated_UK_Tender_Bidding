@@ -1,15 +1,13 @@
 """Shared fixtures + fakes for the email-integration tests.
 
-Everything here is offline: an in-memory SQLite DB (via _billing_fixtures), an
-in-memory fake keyring so the token store's Fernet key has somewhere to live,
+Everything here is offline: an in-memory SQLite DB (via _billing_fixtures), a
+credentials store with a throwaway Fernet key so the token store can encrypt,
 and fake EmailProvider / LLM implementations so no real mailbox or model is
 ever contacted.
 """
 from __future__ import annotations
 
-import sys
 from datetime import UTC, datetime
-from types import ModuleType
 
 from tender_agent.models import Tender
 from tender_agent.services.brief.llm_client import LLMResponse
@@ -21,35 +19,18 @@ from tender_agent.services.email.providers.base import (
 )
 
 
-def install_fake_keyring(monkeypatch) -> dict:
-    """Install an in-memory keyring module (mirrors test_credentials_store)."""
-    store: dict[tuple[str, str], str] = {}
-    mod = ModuleType("keyring")
+def use_fake_store(monkeypatch, tmp_path=None) -> None:
+    """Point the credentials singleton at a store with a throwaway in-memory
+    key, so encrypt_secret / decrypt_secret (and the token store) work with
+    no keyring, no env key and no DB. `tmp_path` is unused — kept so existing
+    call sites don't change."""
+    from cryptography.fernet import Fernet
 
-    def get_password(service, name):
-        return store.get((service, name))
-
-    def set_password(service, name, value):
-        store[(service, name)] = value
-
-    def get_keyring():
-        return object()
-
-    mod.get_password = get_password  # type: ignore[attr-defined]
-    mod.set_password = set_password  # type: ignore[attr-defined]
-    mod.get_keyring = get_keyring  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "keyring", mod)
-    monkeypatch.setitem(sys.modules, "keyring.backends", None)
-    return store
-
-
-def use_fake_store(monkeypatch, tmp_path) -> None:
-    """Point the credentials singleton at a fresh store backed by the fake
-    keyring, so encrypt_secret / decrypt_secret (and the token store) work."""
-    install_fake_keyring(monkeypatch)
     from tender_agent.services import credentials as creds_mod
 
-    store = creds_mod.CredentialsStore(db_path=str(tmp_path / "creds.db"))
+    store = creds_mod.CredentialsStore(
+        encryption_key=Fernet.generate_key().decode()
+    )
     monkeypatch.setattr(creds_mod, "_store", store)
 
 

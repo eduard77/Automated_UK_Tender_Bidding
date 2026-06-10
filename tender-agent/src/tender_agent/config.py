@@ -9,6 +9,12 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql+psycopg://tender:tender@localhost:5432/tender_agent"
 
+    # Apply pending Alembic migrations at app startup. Required for the
+    # browser-only cloud deploy flow (no terminal step where the operator
+    # could run `alembic upgrade head`). No-op when the DB is already at
+    # head; failures are logged but never stop the boot.
+    migrate_on_startup: bool = True
+
     app_env: str = "development"
     log_level: str = "INFO"
     api_host: str = "0.0.0.0"
@@ -85,6 +91,18 @@ class Settings(BaseSettings):
 
     http_timeout_seconds: int = 30
     http_user_agent: str = "tender-agent/0.1 (compliance-research)"
+
+    # --- Credentials store (cloud-safe) --------------------------------------
+    # Master key for encrypting portal logins (and the email OAuth tokens) at
+    # rest in the main Postgres DB. Fernet — authenticated symmetric
+    # encryption. ONE secret, set ONCE:
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # On Azure, add it as an App Service application setting named
+    # CREDENTIALS_ENCRYPTION_KEY (portal UI -> the App Service -> Settings ->
+    # Environment variables -> Add) and restart the app. Locally, set it in
+    # .env — or leave it unset to fall back to the OS keyring (dev machines
+    # only; the cloud container has no keyring). SECRET — never log it.
+    credentials_encryption_key: str = ""
 
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-sonnet-4-5"

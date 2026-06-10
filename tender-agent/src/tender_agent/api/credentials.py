@@ -1,7 +1,9 @@
 """Credentials API — admin-only management of portal logins.
 
 Passwords are write-only: they go in via POST and are never returned. The
-store encrypts them at rest with a key in the OS keyring.
+store encrypts them at rest in the main Postgres DB with the app master key
+(CREDENTIALS_ENCRYPTION_KEY application setting; OS keyring fallback exists
+for local dev only).
 """
 from __future__ import annotations
 

@@ -10,6 +10,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from tender_agent.api.credentials import DEFAULT_USER as CREDENTIALS_DEFAULT_USER
 from tender_agent.config import settings
 from tender_agent.db import get_db
 from tender_agent.models import FilterProfile, Tender
@@ -174,7 +175,10 @@ class ProactisProfileRunTriggerRequest(BaseModel):
 
     profile_id: int
     portal_id: int
-    user_id: str = "default"
+    # Default matches the user POST /credentials stores under
+    # (api.credentials.DEFAULT_USER) — so "store the login, then trigger the
+    # run" works without the caller having to know about user ids at all.
+    user_id: str = CREDENTIALS_DEFAULT_USER
 
 
 class ProactisProfileRunTriggerResponse(BaseModel):

@@ -1094,3 +1094,51 @@ class MailboxMessage(Base):
     mailbox: Mapped[MailboxAccount] = relationship(back_populates="messages")
     tender: Mapped[Tender | None] = relationship()
 
+
+
+# ---------------------------------------------------------------------------
+# Cloud-safe credentials store: portal logins encrypted at rest in the MAIN
+# Postgres DB. Replaces the old standalone SQLite file whose key lived in the
+# OS keyring — the Azure App Service container has neither a keyring nor a
+# persistent local disk, so that design could not store anything on the cloud.
+# ---------------------------------------------------------------------------
+
+
+class PortalCredential(Base):
+    """One portal login owned by one user, encrypted at rest.
+
+    The credential payload (username / password / email / extra) is serialised
+    to JSON and Fernet-encrypted with the app master key
+    (CREDENTIALS_ENCRYPTION_KEY) BEFORE it reaches this row; only non-secret
+    metadata is stored in the clear so listing never needs to decrypt.
+    `secret_ciphertext` is a SECRET — never logged, never returned by the API.
+
+    Per-account-ready: `user_id` scopes a row to its owner, so multi-user
+    portal logins later reuse this table unchanged. No FK on `portal_id` —
+    portals are soft-deleted in the registry and a stored login must survive
+    registry churn for the audit trail (mirrors the legacy store).
+    """
+
+    __tablename__ = "portal_credentials"
+    __table_args__ = (
+        Index("ix_portal_credentials_user_id", "user_id"),
+    )
+
+    portal_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    platform_slug: Mapped[str | None] = mapped_column(String(64))
+    # Fernet ciphertext of the JSON credential payload. SECRET.
+    secret_ciphertext: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    valid: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_validated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    # Soft delete: row retained for the audit trail, hidden from list/get.
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

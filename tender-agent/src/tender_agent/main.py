@@ -47,9 +47,40 @@ def _configure_logging() -> None:
     )
 
 
+def _run_startup_migrations() -> None:
+    """Apply pending Alembic migrations against the configured DB.
+
+    The cloud deploy path is browser-only (merge to main -> GitHub Action ->
+    new container) — there is no terminal step where the operator could run
+    `alembic upgrade head`, so the app brings its own schema up to date on
+    boot. Idempotent: when the DB is already at head this is a no-op, and the
+    docker-compose dev flow (which migrates before uvicorn) is unaffected.
+    Disable with MIGRATE_ON_STARTUP=false. Failures are logged loudly but
+    never stop the app from booting (mirrors the preflight philosophy)."""
+    from pathlib import Path
+
+    from alembic.config import Config
+
+    from alembic import command
+
+    logger = structlog.get_logger(__name__)
+    # main.py lives at <root>/src/tender_agent/main.py; alembic.ini sits at
+    # <root>/ both locally and in the runtime image (/app).
+    root = Path(__file__).resolve().parents[2]
+    cfg = Config(str(root / "alembic.ini"))
+    cfg.set_main_option("script_location", str(root / "alembic"))
+    try:
+        command.upgrade(cfg, "head")
+        logger.info("startup.migrations_applied")
+    except Exception as exc:  # noqa: BLE001 - never fatal at boot
+        logger.error("startup.migrations_failed", error=str(exc))
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     _configure_logging()
+    if settings.migrate_on_startup:
+        _run_startup_migrations()
     # Self-diagnosing startup check: log whether the documents dir is writable,
     # the bridge token is set, and the bridge is reachable. Best-effort and
     # never fatal — it just makes a first-run misconfiguration explain itself.
