@@ -1,0 +1,51 @@
+<!--
+  ProContract V3 supplier login page — https://procontract.due-north.com/Login/Index
+
+  RECONSTRUCTED from the live login-diagnostic capture of 2026-06-10 (PR #108):
+  page_title "Log In", HTTP 200, page text "Welcome to ProContract … User Name …
+  Password … Continue", cookie banner with an "Accept all" action; the
+  diagnostic's selectors_found confirmed an input[type=password] exists in the
+  main frame. The raw DOM was not persisted by the diagnostic (text slice +
+  screenshot only), so attribute names follow ProContract's ASP.NET MVC
+  conventions (model-bound "UserName"/"Password" controls). This fixture pins
+  the contract between the page and PROACTIS_LOGIN_SELECTORS — if a live run
+  shows different markup, update BOTH from the new diagnostic capture.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Log In</title>
+</head>
+<body>
+  <div id="cookieConsent" class="cookie-banner" role="dialog">
+    <p>We use cookies to give you the best experience on our website.</p>
+    <button type="button" class="cookie-accept">Accept all</button>
+    <button type="button" class="cookie-reject">Reject non-essential</button>
+  </div>
+
+  <header>
+    <h1>Welcome to ProContract</h1>
+    <p>Log in with your user name and password.</p>
+  </header>
+
+  <form action="/Login/Index" id="loginForm" method="post" novalidate="novalidate">
+    <div class="form-group">
+      <label for="UserName">User Name</label>
+      <input id="UserName" name="UserName" type="text" autocomplete="username"
+             class="form-control" value="" />
+    </div>
+    <div class="form-group">
+      <label for="Password">Password</label>
+      <input id="Password" name="Password" type="password"
+             autocomplete="current-password" class="form-control" />
+    </div>
+    <button type="submit" id="continueButton" class="btn btn-primary">Continue</button>
+    <a href="/Account/ForgottenPassword">Forgotten your password?</a>
+  </form>
+
+  <footer>
+    <a href="/Registration">Register free</a>
+  </footer>
+</body>
+</html>

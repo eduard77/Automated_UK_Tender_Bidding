@@ -50,16 +50,12 @@ logger = structlog.get_logger(__name__)
 #: login form; small enough to keep one log event readable.
 TEXT_EXCERPT_CHARS = 2000
 
-#: Selector inventory the snapshot reports on: every control the login flow
-#: tries to drive, plus the post-login success marker. Labels are stable keys
-#: the operator can grep for.
+#: Selector inventory the snapshot reports on: EVERY control the login flow
+#: drives (derived from the flow's own selector dict, so the diagnostic can
+#: never drift from what the flow actually looks for), plus the post-login
+#: success marker.
 _DIAGNOSTIC_SELECTORS: dict[str, str] = {
-    "email_input": PROACTIS_LOGIN_SELECTORS["email_input"],
-    "password_input": PROACTIS_LOGIN_SELECTORS["password_input"],
-    "submit_button": PROACTIS_LOGIN_SELECTORS["submit_button"],
-    "invalid_credentials_banner": PROACTIS_LOGIN_SELECTORS[
-        "invalid_credentials_banner"
-    ],
+    **PROACTIS_LOGIN_SELECTORS,
     "logged_in_marker": PROACTIS_SELECTORS["logged_in_marker"],
 }
 
