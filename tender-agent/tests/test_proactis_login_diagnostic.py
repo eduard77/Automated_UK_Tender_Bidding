@@ -137,7 +137,7 @@ async def test_login_then_get_status_logs_diagnostic_on_failure():
     assert diag["current_url"] == "https://procontract.due-north.com/Login/Index"
     assert diag["last_status_code"] == 403
     assert "Access denied" in diag["page_text_excerpt"]
-    assert diag["selectors_found"]["email_input"]["found"] is False
+    assert diag["selectors_found"]["username_input"]["found"] is False
     assert diag["screenshot_path"].endswith(".png")
 
 
@@ -161,7 +161,7 @@ async def test_run_login_diagnostic_returns_block_page_snapshot():
     # The text slice is what lets the operator recognise the failure mode.
     assert "Access denied" in snapshot["page_text_excerpt"]
     # Every login-flow control is reported, and none was found on a block page.
-    for key in ("email_input", "password_input", "submit_button", "logged_in_marker"):
+    for key in ("username_input", "password_input", "submit_button", "logged_in_marker"):
         assert snapshot["selectors_found"][key]["found"] is False
     assert snapshot["screenshot_path"] == "procontract-login-diagnostic.png"
     # Read-only contract: the probe closed its session.
@@ -242,8 +242,10 @@ async def test_no_secrets_in_snapshot_or_logs():
     dumped_logs = json.dumps(logs, default=str)
     assert _PASSWORD not in dumped_snapshot
     assert _PASSWORD not in dumped_logs
-    # No cookie-shaped fields either — the snapshot never touches cookies.
-    assert "cookie" not in dumped_snapshot.lower()
+    # No cookie VALUES either — the snapshot may name the cookie-banner
+    # selector (cookie_accept), but never reads or carries cookie contents.
+    assert "set-cookie" not in dumped_snapshot.lower()
+    assert "JSESSIONID" not in dumped_snapshot
 
 
 # --- admin endpoint ----------------------------------------------------------
@@ -294,7 +296,7 @@ def test_endpoint_returns_snapshot_json(auth_client, monkeypatch) -> None:
     assert body["logged_in"] is False
     assert body["last_status_code"] == 403
     assert "Access denied" in body["page_text_excerpt"]
-    assert body["selectors_found"]["email_input"]["found"] is False
+    assert body["selectors_found"]["username_input"]["found"] is False
     assert _PASSWORD not in resp.text
 
 

@@ -35,35 +35,55 @@ from tender_agent.services.portals.base import Credentials
 logger = structlog.get_logger(__name__)
 
 
-# Selectors used to drive the login form. Labelled CONFIRM SELECTOR — they
-# will need tuning on the first real run; the discovery surface keeps the
-# operator's first response observable via the structured log fingerprint.
+# Selectors used to drive the login form. Grounded in the LIVE login-diagnostic
+# capture of /Login/Index (2026-06-10, ProContract V3): page_title "Log In",
+# HTTP 200, page text "Welcome to ProContract … User Name … Password …
+# Continue", plus a cookie banner ("Accept all"). The original email-shaped
+# username selector never matched (Proactis has NO email field) — the fill
+# timed out and every run ended needs_login. The password selector matched
+# (found, visible, main frame) and is unchanged.
+#
+# This dict is the SINGLE source for both the login flow and the
+# login-diagnostic's `selectors_found` report — keep them from drifting apart.
 PROACTIS_LOGIN_SELECTORS = {
-    # CONFIRM SELECTOR — email field on /Login/Index. Proactis's form is
-    # ASP.NET, so we prefer name/id attribute substrings over auto-generated IDs.
-    "email_input": (
-        "input[name*='Email' i], input[id*='Email' i], "
-        "input[type='email'], input[autocomplete='username']"
+    # The "User Name" field. ASP.NET MVC convention is name/id "UserName";
+    # attribute-contains + case-insensitive keeps a minor markup difference
+    # matching. Email-shaped fallbacks stay at the END for tenant variants
+    # that do use an email login — they match nothing on ProContract V3.
+    "username_input": (
+        "input[name*='UserName' i], input[id*='UserName' i], "
+        "input[name*='User' i][type='text'], input[id*='User' i][type='text'], "
+        "input[aria-label*='User' i], input[autocomplete='username'], "
+        "input[type='email'], input[name*='Email' i]"
     ),
-    # CONFIRM SELECTOR — password field.
+    # Password field — VERIFIED matching by the live diagnostic; unchanged.
     "password_input": (
         "input[type='password'], input[name*='Password' i], "
         "input[id*='Password' i]"
     ),
-    # CONFIRM SELECTOR — submit / "Login" button.
+    # The login button is labelled "Continue" on ProContract V3 (per the
+    # captured page text); keep Log In variants + a bare submit fallback.
     "submit_button": (
-        "button[type='submit']:has-text('Login'), "
+        "button[type='submit']:has-text('Continue'), "
+        "input[type='submit'][value*='Continue' i], "
+        "button:has-text('Continue'), "
         "button[type='submit']:has-text('Log in'), "
-        "input[type='submit'][value*='Login' i], "
-        "input[type='submit'][value*='Log in' i]"
+        "input[type='submit'][value*='Log' i], "
+        "button[type='submit']"
     ),
-    # CONFIRM SELECTOR — an in-page error banner Proactis shows on bad creds.
-    # If we find this AFTER submit, we know the credentials were rejected; the
-    # generic "still on /Login" check would otherwise miss this case if
-    # Proactis returns 200 with the same URL.
+    # An in-page error banner Proactis shows on bad creds. If we find this
+    # AFTER submit, we know the credentials were rejected; the generic
+    # "still on /Login" check would otherwise miss this case if Proactis
+    # returns 200 with the same URL.
     "invalid_credentials_banner": (
         ".validation-summary-errors, .alert-danger, "
         ":has-text('Invalid username or password')"
+    ),
+    # Cookie/consent banner accept ("Accept all" per the captured page text).
+    # Dismissed defensively BEFORE the form fill in case it overlays the
+    # controls; its absence is never an error.
+    "cookie_accept": (
+        "button:has-text('Accept all'), a:has-text('Accept all')"
     ),
 }
 
@@ -124,9 +144,12 @@ async def login_with_credentials(
     if not credentials.password:
         return LoginAttempt(status="error", detail="no password on credentials record")
 
-    email = credentials.email or credentials.username or ""
+    # ProContract V3's field is "User Name", so the stored username comes
+    # first; the email is the fallback (and for this operator they're the
+    # same address anyway).
+    username = credentials.username or credentials.email or ""
     fp = _password_fingerprint(credentials.password)
-    email_domain = email.split("@")[-1] if "@" in email else None
+    email_domain = username.split("@")[-1] if "@" in username else None
     logger.info(
         "discovery.proactis.login_attempt",
         slug=slug,
@@ -140,17 +163,32 @@ async def login_with_credentials(
     except BridgeError as exc:
         return LoginAttempt(status="error", detail=f"navigate /Login failed: {exc}")
 
-    # 2. Fill credentials. We fill THEN check element_exists because some
-    # Proactis variants render the form behind a "Continue with email"
-    # disclosure; in that case the email field isn't immediately present.
+    # 1b. Dismiss the cookie/consent banner if one is up, in case it overlays
+    # the form controls. The live diagnostic showed the password field was
+    # already visible WITH the banner present, so this is belt-and-braces:
+    # accept when present, silently move on when absent or unclickable.
     try:
-        await bridge.fill(slug, PROACTIS_LOGIN_SELECTORS["email_input"], email)
+        if await bridge.element_exists(
+            slug, PROACTIS_LOGIN_SELECTORS["cookie_accept"]
+        ):
+            await bridge.click(slug, PROACTIS_LOGIN_SELECTORS["cookie_accept"])
+            logger.info("discovery.proactis.cookie_banner_accepted", slug=slug)
+    except BridgeError:
+        logger.debug("discovery.proactis.cookie_banner_skip", slug=slug)
+
+    # 2. Fill credentials. We fill THEN check element_exists because some
+    # Proactis variants render the form behind a disclosure; in that case the
+    # username field isn't immediately present.
+    try:
+        await bridge.fill(
+            slug, PROACTIS_LOGIN_SELECTORS["username_input"], username
+        )
     except BridgeError as exc:
         return LoginAttempt(
             status="needs_login",
             detail=(
-                f"email input not found on /Login/Index (selector mismatch) — "
-                f"first run after a Proactis redesign? Error: {exc}"
+                f"username input not found on /Login/Index (selector mismatch) "
+                f"— first run after a Proactis redesign? Error: {exc}"
             ),
         )
     try:

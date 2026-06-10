@@ -132,13 +132,13 @@ async def test_needs_login_when_marker_missing_and_no_banner():
 
 
 @pytest.mark.asyncio
-async def test_needs_login_when_email_field_missing():
-    bridge = _FakeBridge(fill_errors_on=("Email", "email"))
+async def test_needs_login_when_username_field_missing():
+    bridge = _FakeBridge(fill_errors_on=("UserName", "username"))
     attempt = await login_with_credentials(
         bridge, slug="proactis", credentials=_CREDS
     )
     assert attempt.status == "needs_login"
-    assert "email" in (attempt.detail or "").lower()
+    assert "username" in (attempt.detail or "").lower()
 
 
 @pytest.mark.asyncio
