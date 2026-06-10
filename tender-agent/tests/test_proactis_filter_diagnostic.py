@@ -1,14 +1,16 @@
 """Proactis filter-diagnostic — capture WHAT the filter panel + category
 popup actually contain, all offline.
 
-A fake bridge models the two confirmed live failures so the snapshot is
-proven to surface what the operator needs to see for a real fix:
+A fake bridge models the LIVE popup shapes (2026-06-10 follow-up capture)
+so the snapshot is proven to read them the way the discovery run does:
 
-  - Category popup: prefix '45' lands on `divNoSearchResults`; the word
-    'construction' returns nodes (the working state Proactis indexes).
-  - Portal control: the current "Add new portal" / "Add portal" trigger
-    selector misses; the panel's JS-enumerated controls include the REAL
-    Portals trigger so the operator can read its actual label.
+  - Category popup: the code probe's tree holds `45000000-7 - Construction
+    work` while `#divNoSearchResults` is present-but-HIDDEN — the probe must
+    report matched=True (the old presence-based check misread exactly this
+    as a miss). A genuinely empty search (displayed marker, zero nodes)
+    still reports the miss.
+  - Portal control: the panel's single-value Portals <select>; the snapshot
+    reports its presence + REAL option labels.
 
 No Playwright, no network. Secrets (password, cookie values) never appear
 in the snapshot or the logs.
@@ -32,6 +34,7 @@ from tender_agent.services.discovery.proactis_filter_diagnostic import (
     run_filter_diagnostic,
 )
 from tender_agent.services.portals.base import Credentials
+from tests.conftest import load_text_fixture
 
 _PASSWORD = "SuperSecret123!"
 _CREDS = Credentials(
@@ -40,9 +43,10 @@ _CREDS = Credentials(
     email="ops@genera-systems.com",
 )
 
-# Real-shape mock data — the strings reflect what the operator would see on
-# a live capture. The 45 probe lands on the no-results marker; the word
-# probe returns construction-family CPV nodes.
+# Real-shape mock data. The code probe returns the CAPTURED live popup:
+# ONE construction node + a hidden no-results marker (the shape the old
+# detection misread). The word probe returns a plain populated tree.
+_LIVE_CPV_POPUP_HTML = load_text_fixture("proactis_cpv_popup_live.html")
 _CONSTRUCTION_TREE_HTML = (
     '<div id="DivTree"><ul class="dynatree-container">'
     '<li id="node~CPV~45000000-7"><span class="dynatree-node">'
@@ -119,8 +123,6 @@ class _FilterBridge:
     async def element_exists(self, _slug, selector) -> bool:
         if "TxtFilterNodes" in selector:
             return self.popup_open
-        if "divNoSearchResults" in selector:
-            return self.search_term == CATEGORY_PROBE_CODE
         # The portal dropdown (single-value, "All" default).
         if "PortalWithAllOption" in selector:
             return self.portal_select_present
@@ -129,8 +131,11 @@ class _FilterBridge:
     async def rendered_html(self, _slug, *, wait_for_selector=None, **_kw):
         from tender_agent.services.bridge_client import RenderedPage
 
+        # The code probe sees the CAPTURED live shape: tree filtered to the
+        # construction node, marker present but HIDDEN. The word probe sees
+        # a plain populated tree.
         html = (
-            _EMPTY_TREE_HTML
+            _LIVE_CPV_POPUP_HTML
             if self.search_term == CATEGORY_PROBE_CODE
             else _CONSTRUCTION_TREE_HTML
         )
@@ -184,7 +189,7 @@ class _FilterBridge:
         # _POPUP_HTML_JS / _PANEL_HTML_JS — return matching outerHTML.
         if "DivTree" in script:
             if self.popup_open and self.search_term == CATEGORY_PROBE_CODE:
-                return _EMPTY_TREE_HTML
+                return _LIVE_CPV_POPUP_HTML
             if self.popup_open and self.search_term == CATEGORY_PROBE_WORD:
                 return _CONSTRUCTION_TREE_HTML
             if self.popup_open:
@@ -218,26 +223,98 @@ class _LoggedInBridge(_FilterBridge):
 
 
 @pytest.mark.asyncio
-async def test_capture_records_category_miss_for_prefix_and_hit_for_word():
+async def test_capture_reads_hidden_marker_search_as_matched():
+    """THE detection fix: the live capture showed the code probe's tree
+    holding `45000000-7 - Construction work` while the (permanently-in-DOM)
+    no-results marker sat hidden beside it — and the old presence-based
+    check reported matched=False. The probe must now report the hit."""
     bridge = _FilterBridge()
     with capture_logs() as logs:
         diag = await capture_filter_state(bridge, "procontract")
     assert diag.category_popup is not None
     probes = {p.term: p for p in diag.category_popup.probes}
-    # The prefix lands on the no-results marker — the live symptom.
-    assert probes[CATEGORY_PROBE_CODE].matched is False
-    assert probes[CATEGORY_PROBE_CODE].no_results_marker_visible is True
-    assert "divNoSearchResults" in probes[CATEGORY_PROBE_CODE].nodes_excerpt
-    # The descriptive word returns nodes — proving the gap is the format.
+    code_probe = probes[CATEGORY_PROBE_CODE]
+    assert code_probe.matched is True
+    assert code_probe.no_results_marker_visible is False
+    assert code_probe.tree_status == "results"
+    # The excerpt shows the operator the real node markup (hidden marker
+    # included — proof of the shape this fix reads correctly).
+    assert "45000000-7 - Construction work" in code_probe.nodes_excerpt
+    # The descriptive word keeps returning nodes too.
     assert probes[CATEGORY_PROBE_WORD].matched is True
-    assert probes[CATEGORY_PROBE_WORD].no_results_marker_visible is False
-    assert "45000000" in probes[CATEGORY_PROBE_WORD].nodes_excerpt
+    assert probes[CATEGORY_PROBE_WORD].tree_status == "results"
     assert "dynatree-title" in probes[CATEGORY_PROBE_WORD].nodes_excerpt
 
     # One info log with the headline counters — no secrets.
     events = [e for e in logs if e["event"] == "discovery.proactis.filter_diagnostic"]
     assert len(events) == 1
-    assert events[0]["category_probes_matched"] == 1
+    assert events[0]["category_probes_matched"] == 2
+
+
+@pytest.mark.asyncio
+async def test_capture_still_reports_a_genuine_miss():
+    """A DISPLAYED marker with an empty tree stays a miss — the fix must
+    not flip every search to matched."""
+
+    class _MissBridge(_FilterBridge):
+        async def rendered_html(self, _slug, *, wait_for_selector=None, **_kw):
+            from tender_agent.services.bridge_client import RenderedPage
+
+            html = (
+                _EMPTY_TREE_HTML
+                if self.search_term == CATEGORY_PROBE_CODE
+                else _CONSTRUCTION_TREE_HTML
+            )
+            return RenderedPage(
+                html=html, wait_satisfied=True, current_url=None
+            )
+
+    diag = await capture_filter_state(_MissBridge(), "procontract")
+    probes = {p.term: p for p in diag.category_popup.probes}
+    assert probes[CATEGORY_PROBE_CODE].matched is False
+    assert probes[CATEGORY_PROBE_CODE].no_results_marker_visible is True
+    assert probes[CATEGORY_PROBE_CODE].tree_status == "no_results"
+    assert probes[CATEGORY_PROBE_WORD].matched is True
+
+
+@pytest.mark.asyncio
+async def test_probe_waits_out_loading_then_reports_results(monkeypatch):
+    """The tree loads asynchronously — the probe's settle loop must re-read
+    past the Loading… status row instead of judging mid-flight. Pacing is
+    late-bound off proactis_dynatree, so the same monkeypatch the driver
+    tests use retunes the diagnostic too."""
+    from tender_agent.services.discovery import proactis_dynatree
+
+    monkeypatch.setattr(proactis_dynatree, "TREE_SETTLE_RETRY_DELAY_S", 0.01)
+
+    loading_html = _LIVE_CPV_POPUP_HTML.replace(
+        '<li id="node~CPV~45000000-7">',
+        '<li><span class="dynatree-node dynatree-statusnode-wait">'
+        '<a class="dynatree-title">Loading&#8230;</a></span></li>'
+        '<li id="node~CPV~45000000-7" style="display:none">',
+    )
+
+    class _SlowTreeBridge(_FilterBridge):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reads = 0
+
+        async def rendered_html(self, _slug, *, wait_for_selector=None, **_kw):
+            from tender_agent.services.bridge_client import RenderedPage
+
+            self.reads += 1
+            html = loading_html if self.reads == 1 else _LIVE_CPV_POPUP_HTML
+            return RenderedPage(
+                html=html, wait_satisfied=True, current_url=None
+            )
+
+    bridge = _SlowTreeBridge()
+    diag = await capture_filter_state(bridge, "procontract")
+    probes = {p.term: p for p in diag.category_popup.probes}
+    assert probes[CATEGORY_PROBE_CODE].matched is True
+    assert probes[CATEGORY_PROBE_CODE].tree_status == "results"
+    # The loop genuinely re-read (first read was the loading state).
+    assert bridge.reads >= 3
 
 
 @pytest.mark.asyncio
@@ -369,7 +446,9 @@ def test_endpoint_returns_snapshot_json(auth_client, monkeypatch) -> None:
     assert body["logged_in"] is True
     assert body["category_popup"]["opened"] is True
     probes = {p["term"]: p for p in body["category_popup"]["probes"]}
-    assert probes[CATEGORY_PROBE_CODE]["matched"] is False
+    # The live shape (node + hidden marker) reads as a HIT end-to-end.
+    assert probes[CATEGORY_PROBE_CODE]["matched"] is True
+    assert probes[CATEGORY_PROBE_CODE]["tree_status"] == "results"
     assert probes[CATEGORY_PROBE_WORD]["matched"] is True
     assert body["portal_control"]["portal_select_present"] is True
     assert "London Tenders" in body["portal_control"]["portal_options"]
