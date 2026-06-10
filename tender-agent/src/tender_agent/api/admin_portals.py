@@ -4,6 +4,7 @@
     GET  /admin/portals/delta/session/status     — is a session present? (no values)
     POST /admin/portals/delta/session/test       — probe whether it's actually logged in
     POST /admin/portals/proactis/login-diagnostic — read-only Proactis login probe
+    POST /admin/portals/proactis/filter-diagnostic — read-only filter-panel + category-popup capture
 
 All are gated behind `require_account` (operator/account auth) at the
 router level, so an anonymous or unauthenticated caller is rejected with 401
@@ -123,5 +124,67 @@ async def proactis_login_diagnostic(
             ),
         )
     return await run_login_diagnostic(
+        credentials=credentials, slug=PROACTIS_BRIDGE_SLUG
+    )
+
+
+# ---------------------------------------------------------------------------
+# Proactis: read-only FILTER diagnostic (the post-login follow-up)
+# ---------------------------------------------------------------------------
+
+
+class ProactisFilterDiagnosticRequest(BaseModel):
+    """Optional body — defaults cover the single-operator setup, so an empty
+    POST works. Same defaults as the login diagnostic so the operator can
+    chain both with empty bodies."""
+
+    portal_id: int = 348
+    user_id: str = CREDENTIALS_DEFAULT_USER
+
+
+@router.post("/proactis/filter-diagnostic")
+async def proactis_filter_diagnostic(
+    body: ProactisFilterDiagnosticRequest | None = None,
+) -> dict:
+    """READ-ONLY probe of the Proactis FILTER panel + category popup.
+
+    Logs in with the stored credentials, navigates to Find Opportunities,
+    captures the real markup of the filter panel (so we can see what the
+    Portals open-trigger is actually called) plus the category popup's
+    response to one numeric code and one descriptive word (so we can see
+    whether Proactis indexes 2-digit prefixes at all). Returns the
+    snapshot as JSON.
+
+    Read-only contract: the only interactions are the login submit, opening
+    + cancelling the category popup, and clicking the popup's Search button
+    to drive a search. NO filters applied to the listing, NO Update click,
+    NO documents accessed, NO portal state changed. Never returns the
+    password or cookie values; page text comes from `inner_text` so input
+    values can't leak through it."""
+    from tender_agent.services.credentials import (
+        CredentialsStoreError,
+        get_store,
+    )
+    from tender_agent.services.discovery.proactis_discovery import (
+        PROACTIS_BRIDGE_SLUG,
+    )
+    from tender_agent.services.discovery.proactis_filter_diagnostic import (
+        run_filter_diagnostic,
+    )
+
+    body = body or ProactisFilterDiagnosticRequest()
+    try:
+        credentials = get_store().get_credentials(body.portal_id, body.user_id)
+    except CredentialsStoreError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if credentials is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "no_proactis_credentials_stored — POST credentials to "
+                "/credentials first for this portal_id + user_id"
+            ),
+        )
+    return await run_filter_diagnostic(
         credentials=credentials, slug=PROACTIS_BRIDGE_SLUG
     )
