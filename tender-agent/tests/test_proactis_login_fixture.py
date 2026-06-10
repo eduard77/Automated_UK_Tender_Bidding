@@ -259,6 +259,57 @@ class _FixtureBridge:
             return {"current_url": "https://procontract.due-north.com/Home"}
         return {"current_url": "https://procontract.due-north.com/Login/Index"}
 
+    # --- robust-dismissal primitives (mirrors InProcessBridgeClient) -------
+    # Config flags let a test choose which strategy the routine lands on:
+    #   removal_works   — does the JS overlay-detach actually clear it?
+    #   force_click_works — does the forced submit click get through?
+    # Defaults model the happy path (text-accept clears it).
+
+    removal_works = True
+    force_click_works = True
+
+    async def click_by_text(self, _slug, scope_selector, text, *, timeout_ms=2000):
+        # Only the cookie dialog is in scope here; match a CLICKABLE element
+        # (button/a/input) inside the dialog subtree whose text contains the
+        # target (case-insensitive). A paragraph that merely mentions "Accept
+        # all" is never clicked.
+        if not self.cookie_dialog_present:
+            return False
+        for el in self.elements:
+            if (
+                id(el) in self._cookie_subtree_ids
+                and el["tag"] in {"button", "a", "input"}
+                and text.lower() in el["text"].lower()
+            ):
+                self.events.append(f"click_by_text:{text}")
+                self.cookie_dialog_present = False
+                return True
+        return False
+
+    async def evaluate(self, _slug, script):
+        if "requestSubmit" in script:
+            self.events.append("evaluate:submit_form")
+            self.submitted = True
+            return True
+        # Overlay-removal snippet.
+        self.events.append("evaluate:remove_overlay")
+        if self.removal_works:
+            self.cookie_dialog_present = False
+            return 1
+        return 0
+
+    async def force_click(self, _slug, selector):
+        hits = _selector_hits(self._visible_elements(), selector)
+        if not hits:
+            raise BridgeError("force click failed: no match")
+        if not self.force_click_works:
+            raise BridgeError("force click failed: still intercepted")
+        clicked = hits[0]
+        self.events.append(f"force_click:{clicked['attrs'].get('id', '?')}")
+        if clicked["attrs"].get("type") == "submit":
+            self.submitted = True
+        return {"ok": True}
+
 
 # --- selector ↔ fixture contract ---------------------------------------------
 
@@ -284,12 +335,15 @@ def test_submit_selector_matches_the_continue_button():
     assert "Continue" in hits[0]["text"]
 
 
-def test_cookie_accept_selector_matches_the_banner_button():
-    elements = _parse_elements(load_text_fixture("proactis_login_page.html"))
-    hits = _selector_hits(elements, PROACTIS_LOGIN_SELECTORS["cookie_accept"])
-    assert hits and "Accept all" in hits[0]["text"]
-    # And it is NOT the form submit — accepting cookies must not submit.
-    assert hits[0]["attrs"].get("type") != "submit"
+def test_cookie_accept_selector_is_text_based_and_dialog_scoped():
+    """The accept selector is markup-agnostic (Playwright text engine) and
+    every alternative is scoped to a cookie-dialog container — never a bare
+    page-wide text match that could hit something unrelated."""
+    sel = PROACTIS_LOGIN_SELECTORS["cookie_accept"]
+    assert "text=" in sel  # matches by visible text, not class/tag
+    for alternative in sel.split(","):
+        assert ">>" in alternative  # scoped: <container> >> text=...
+        assert "cookie" in alternative.lower()
 
 
 # --- full flow against the fixture markup -------------------------------------
@@ -358,26 +412,11 @@ def test_cookie_dialog_selector_hits_the_real_dialog_container():
     assert hits[0]["attrs"].get("role") == "dialog"
 
 
-def test_cookie_accept_selector_is_scoped_to_the_dialog():
-    elements = _parse_elements(
-        load_text_fixture("proactis_login_page_with_cookie_dialog.html")
-    )
-    hits = _selector_hits(elements, PROACTIS_LOGIN_SELECTORS["cookie_accept"])
-    assert hits, "cookie_accept matched nothing inside the dialog"
-    # The Accept button lives INSIDE js-cookie-consent-dialog — never the
-    # form submit, never an unrelated page-level button.
-    assert any(
-        "js-cookie-consent-dialog" in (a["attrs"].get("class") or "")
-        for a in hits[0]["ancestors"]
-    )
-    assert hits[0]["attrs"].get("type") != "submit"
-    assert "Accept all" in hits[0]["text"]
-
-
 @pytest.mark.asyncio
-async def test_login_dismisses_dialog_before_clicking_submit():
-    """The full chain from the second live diagnostic: dialog present →
-    dismissed → Continue actually clicks."""
+async def test_strategy1_text_accept_dismisses_before_submit():
+    """The full chain from the third live diagnostic: dialog present →
+    clicked by VISIBLE TEXT ("Accept all") → cleared → Continue clicks.
+    This is the ordering the live failure violated."""
     bridge = _FixtureBridge(
         load_text_fixture("proactis_login_page_with_cookie_dialog.html")
     )
@@ -386,17 +425,61 @@ async def test_login_dismisses_dialog_before_clicking_submit():
     )
     assert attempt.status == "ok"
     assert attempt.cookie_dialog_dismissed is True
-    # The Accept-all click landed BEFORE any form fill, and BEFORE the
-    # Continue submit. This is the ordering the live failure violated.
+    assert attempt.cookie_dismiss_method == "text-accept"
     accept_idx = next(
-        i
-        for i, e in enumerate(bridge.events)
-        if "btn btn-primary js-cookie-accept-all" in e
-        or "Accept all" in e
+        i for i, e in enumerate(bridge.events) if e.startswith("click_by_text")
     )
     fill_idx = bridge.events.index("fill:UserName")
     submit_idx = bridge.events.index("click:continueButton")
     assert accept_idx < fill_idx < submit_idx
+    assert bridge.submitted is True
+    # Strategy 1 worked → no overlay removal, no forced submit needed.
+    assert not any(e.startswith("evaluate") for e in bridge.events)
+    assert not any(e.startswith("force_click") for e in bridge.events)
+
+
+@pytest.mark.asyncio
+async def test_strategy3_removes_overlay_when_accept_text_unmatchable():
+    """Accept control text we can't match → routine falls through to
+    detaching the overlay via JS (strategy 3) and still logs in."""
+    html = load_text_fixture("proactis_login_page_with_cookie_dialog.html")
+    # Rename the button text so click_by_text can't find any accept variant;
+    # the <p> still mentions "Accept all" but a paragraph is never clicked.
+    html = html.replace(">Accept all</button>", ">Allow selected</button>")
+    bridge = _FixtureBridge(html)
+    attempt = await login_with_credentials(
+        bridge, slug="procontract", credentials=_CREDS
+    )
+    assert attempt.status == "ok"
+    assert attempt.cookie_dialog_dismissed is True
+    assert attempt.cookie_dismiss_method == "removed"
+    assert "evaluate:remove_overlay" in bridge.events
+    # Overlay gone before the Continue click landed.
+    assert bridge.events.index("evaluate:remove_overlay") < bridge.events.index(
+        "click:continueButton"
+    )
+
+
+@pytest.mark.asyncio
+async def test_strategy5_forced_submit_when_overlay_cannot_be_cleared(monkeypatch):
+    """Residual overlay at submit time: text-accept misses AND removal fails →
+    the submit click is intercepted → forced submit gets login through."""
+    import tender_agent.services.discovery.proactis_login as pl
+
+    # The overlay never clears here, so don't burn the full dismiss timeout.
+    monkeypatch.setattr(pl, "COOKIE_DIALOG_DISMISS_TIMEOUT_S", 0.05)
+    html = load_text_fixture("proactis_login_page_with_cookie_dialog.html")
+    html = html.replace(">Accept all</button>", ">Allow selected</button>")
+    bridge = _FixtureBridge(html)
+    bridge.removal_works = False  # JS detach is a no-op → dialog stays up
+    attempt = await login_with_credentials(
+        bridge, slug="procontract", credentials=_CREDS
+    )
+    assert attempt.status == "ok"
+    assert attempt.cookie_dismiss_method == "forced-submit"
+    # A normal submit click was attempted and intercepted; the forced click
+    # then carried it through.
+    assert any(e.startswith("force_click") for e in bridge.events)
     assert bridge.submitted is True
 
 
@@ -411,7 +494,11 @@ async def test_login_proceeds_when_no_dialog_present():
     )
     assert attempt.status == "ok"
     assert attempt.cookie_dialog_dismissed is None
-    assert not any("cookie-accept" in e or "Accept" in e for e in bridge.events)
+    assert attempt.cookie_dismiss_method is None
+    assert not any(
+        e.startswith("click_by_text") or e.startswith("evaluate")
+        for e in bridge.events
+    )
 
 
 @pytest.mark.asyncio
@@ -439,4 +526,7 @@ async def test_diagnostic_reports_cookie_dialog_dismissed_true():
     )
     diag = await capture_login_state(bridge, "procontract", attempt=attempt)
     assert diag.cookie_dialog_dismissed is True
+    assert diag.cookie_dismiss_method == "text-accept"
     assert diag.logged_in is True
+    # The method also rides through to the JSON the admin endpoint returns.
+    assert diag.as_dict()["cookie_dismiss_method"] == "text-accept"

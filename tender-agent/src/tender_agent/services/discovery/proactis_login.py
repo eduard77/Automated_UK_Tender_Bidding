@@ -91,22 +91,55 @@ PROACTIS_LOGIN_SELECTORS = {
         ".cookie-dialog[role='dialog'], "
         "[role='dialog'][aria-labelledby*='cookie' i]"
     ),
-    # Accept button — SCOPED to the dialog so we never click an unrelated
-    # "Accept" elsewhere on the page. Fallbacks broaden the text and lift the
-    # scope only as a last resort.
+    # Accept action — matched by VISIBLE TEXT via Playwright's text engine
+    # (`>> text=`), NOT by class/tag, because the live diagnostic found the
+    # dialog container but NOT a `button:has-text('Accept all')` — the real
+    # control's markup (anchor? input? span?) is unknown. The text engine
+    # matches whatever element carries the text. This selector is what the
+    # diagnostic reports under `cookie_accept`; the FLOW dismisses via
+    # `click_by_text` (same text), so the two stay aligned.
     "cookie_accept": (
-        ".js-cookie-consent-dialog button:has-text('Accept all'), "
-        ".js-cookie-consent-dialog a:has-text('Accept all'), "
-        ".cookie-dialog button:has-text('Accept all'), "
-        "[role='dialog'][aria-labelledby*='cookie' i] button:has-text('Accept all'), "
-        ".js-cookie-consent-dialog button:has-text('Accept'), "
-        "button:has-text('Accept all')"
+        ".js-cookie-consent-dialog >> text=/accept all/i, "
+        ".cookie-dialog >> text=/accept all/i, "
+        "[role='dialog'][aria-labelledby*='cookie' i] >> text=/accept all/i"
     ),
 }
 
+#: Text variants tried (in order) to accept the consent dialog.
+COOKIE_ACCEPT_TEXTS = ("Accept all", "Accept", "I agree", "Agree")
 
-#: How long to wait for the cookie dialog to detach after the accept click
-#: before we give up and let the form-click's own auto-wait deal with it.
+#: JS that detaches every known cookie-overlay container — strategy 3, used
+#: only when the text-accept didn't clear the dialog. Returns the count
+#: removed. CSS Level-4 case-insensitive attribute match (`i`) is supported
+#: by Chromium's querySelectorAll.
+_REMOVE_OVERLAY_JS = """
+() => {
+  const sels = [
+    '.js-cookie-consent-dialog',
+    '.cookie-dialog',
+    "[role='dialog'][aria-labelledby*='cookie' i]"
+  ];
+  let removed = 0;
+  for (const s of sels) {
+    document.querySelectorAll(s).forEach(el => { el.remove(); removed++; });
+  }
+  return removed;
+}
+"""
+
+#: JS that submits the login form programmatically — strategy 5's deepest
+#: fallback when even a forced click can't reach the button.
+_SUBMIT_FORM_JS = """
+() => {
+  const f = document.querySelector('form#loginForm, form[action*="Login" i], form');
+  if (!f) return false;
+  if (f.requestSubmit) { f.requestSubmit(); } else { f.submit(); }
+  return true;
+}
+"""
+
+#: How long to wait for the cookie dialog to detach after a dismissal action
+#: before moving to the next strategy.
 COOKIE_DIALOG_DISMISS_TIMEOUT_S = 5.0
 COOKIE_DIALOG_POLL_INTERVAL_S = 0.1
 
@@ -133,6 +166,12 @@ class LoginAttempt:
     #: clear (the form click may still succeed if the dialog stops
     #: intercepting pointer events, but the diagnostic gets to see this).
     cookie_dialog_dismissed: bool | None = None
+    #: WHICH strategy got us past the consent overlay, for at-a-glance
+    #: regression triage: "text-accept" (clicked Accept-all by text),
+    #: "removed" (detached the overlay via JS), "forced-submit" (overlay
+    #: stayed but we forced the login submit through), or "none" (no dialog,
+    #: or nothing was needed).
+    cookie_dismiss_method: str | None = None
 
 
 def _password_fingerprint(password: str) -> str:
@@ -200,6 +239,7 @@ async def login_with_credentials(
     # actually present. Telemetry goes onto the LoginAttempt so the diagnostic
     # snapshot can report `cookie_dialog_dismissed` truthfully.
     cookie_dialog_dismissed: bool | None = None
+    cookie_dismiss_method: str | None = None
     try:
         dialog_present = await bridge.element_exists(
             slug, PROACTIS_LOGIN_SELECTORS["cookie_dialog"]
@@ -207,7 +247,9 @@ async def login_with_credentials(
     except BridgeError:
         dialog_present = False
     if dialog_present:
-        cookie_dialog_dismissed = await _dismiss_cookie_dialog(bridge, slug)
+        cookie_dialog_dismissed, cookie_dismiss_method = (
+            await _dismiss_cookie_dialog(bridge, slug)
+        )
 
     # 2. Fill credentials. We fill THEN check element_exists because some
     # Proactis variants render the form behind a disclosure; in that case the
@@ -224,6 +266,7 @@ async def login_with_credentials(
                 f"— first run after a Proactis redesign? Error: {exc}"
             ),
             cookie_dialog_dismissed=cookie_dialog_dismissed,
+            cookie_dismiss_method=cookie_dismiss_method,
         )
     try:
         await bridge.fill(
@@ -236,17 +279,28 @@ async def login_with_credentials(
             status="needs_login",
             detail=f"password input not found on /Login/Index: {exc}",
             cookie_dialog_dismissed=cookie_dialog_dismissed,
+            cookie_dismiss_method=cookie_dismiss_method,
         )
 
-    # 3. Submit.
+    # 3. Submit. If a residual overlay still intercepts the click, fall back
+    # to a forced click and then a programmatic form submit (strategy 5) so a
+    # stray dialog can't block authentication.
     try:
         await bridge.click(slug, PROACTIS_LOGIN_SELECTORS["submit_button"])
     except BridgeError as exc:
-        return LoginAttempt(
-            status="needs_login",
-            detail=f"submit button not found on /Login/Index: {exc}",
-            cookie_dialog_dismissed=cookie_dialog_dismissed,
-        )
+        forced = await _force_submit(bridge, slug)
+        if not forced:
+            return LoginAttempt(
+                status="needs_login",
+                detail=(
+                    f"submit click intercepted and force-submit failed: {exc}"
+                ),
+                cookie_dialog_dismissed=cookie_dialog_dismissed,
+                cookie_dismiss_method=cookie_dismiss_method,
+            )
+        # We got the form submitted past the overlay — record that as the
+        # decisive action so a regression is obvious in the diagnostic.
+        cookie_dismiss_method = "forced-submit"
 
     # 4. Did we land on an authenticated page, OR did Proactis show an
     # invalid-credentials banner? Try the success marker first; only if it
@@ -264,6 +318,7 @@ async def login_with_credentials(
             detail=f"pwd_fp={fp}",
             current_url=status.get("current_url"),
             cookie_dialog_dismissed=cookie_dialog_dismissed,
+            cookie_dismiss_method=cookie_dismiss_method,
         )
 
     # Probe for the rejection banner. If it's visible, the credentials were
@@ -284,6 +339,7 @@ async def login_with_credentials(
                 "submit. Update the stored Proactis credentials."
             ),
             cookie_dialog_dismissed=cookie_dialog_dismissed,
+            cookie_dismiss_method=cookie_dismiss_method,
         )
 
     # Still on /Login but no banner — most likely a captcha or a multi-step
@@ -298,34 +354,22 @@ async def login_with_credentials(
             ),
             current_url=status.get("current_url"),
             cookie_dialog_dismissed=cookie_dialog_dismissed,
+            cookie_dismiss_method=cookie_dismiss_method,
         )
     return LoginAttempt(
         status="needs_login",
         detail="Form submitted but the post-login marker did not appear.",
         current_url=status.get("current_url"),
         cookie_dialog_dismissed=cookie_dialog_dismissed,
+        cookie_dismiss_method=cookie_dismiss_method,
     )
 
 
-async def _dismiss_cookie_dialog(bridge: BridgeClient, slug: str) -> bool:
-    """Click the cookie dialog's Accept-all button, then poll until the
-    dialog container detaches. Returns True only on confirmed dismissal —
-    so the diagnostic can show `cookie_dialog_dismissed: true` honestly.
-
-    Defensive: any BridgeError on the accept click yields False; the form
-    fill still goes ahead because the submit click's own auto-wait may yet
-    clear the overlay (or report it again in the next diagnostic)."""
-    try:
-        await bridge.click(slug, PROACTIS_LOGIN_SELECTORS["cookie_accept"])
-    except BridgeError as exc:
-        logger.info(
-            "discovery.proactis.cookie_dialog_accept_failed",
-            slug=slug,
-            error=str(exc),
-        )
-        return False
+async def _dialog_gone(bridge: BridgeClient, slug: str) -> bool:
+    """Poll until the cookie-dialog container is no longer in the DOM, up to
+    the dismiss timeout. True once it's gone, False if it outlasts the wait."""
     deadline = asyncio.get_event_loop().time() + COOKIE_DIALOG_DISMISS_TIMEOUT_S
-    while asyncio.get_event_loop().time() < deadline:
+    while True:
         try:
             still_visible = await bridge.element_exists(
                 slug, PROACTIS_LOGIN_SELECTORS["cookie_dialog"]
@@ -333,12 +377,96 @@ async def _dismiss_cookie_dialog(bridge: BridgeClient, slug: str) -> bool:
         except BridgeError:
             still_visible = False
         if not still_visible:
-            logger.info("discovery.proactis.cookie_dialog_dismissed", slug=slug)
             return True
+        if asyncio.get_event_loop().time() >= deadline:
+            return False
         await asyncio.sleep(COOKIE_DIALOG_POLL_INTERVAL_S)
+
+
+async def _dismiss_cookie_dialog(
+    bridge: BridgeClient, slug: str
+) -> tuple[bool, str]:
+    """Clear the consent overlay using progressively more forceful strategies,
+    stopping as soon as the dialog container is gone. Returns
+    `(dismissed, method)` where method ∈ {"text-accept", "removed", "none"}.
+
+    Strategy 1 — click "Accept all" (then "Accept", …) by VISIBLE TEXT scoped
+    to the dialog, via the bridge's `click_by_text` (Playwright text/role
+    engine). This is markup-agnostic: it doesn't matter whether the control is
+    a button, anchor, input or span. The live diagnostic found the dialog
+    container but NOT a class-based accept button, so text is the robust path.
+
+    Strategy 3 — if the text accept didn't clear it (or the bridge lacks
+    `click_by_text`), DETACH the overlay nodes with a small JS snippet via the
+    bridge's `evaluate`. The dialog only matters because it overlays the form;
+    removing it stops the interception.
+
+    Every step is best-effort: a missing optional bridge method or a
+    BridgeError just falls through to the next strategy. (Strategy 5, the
+    forced/programmatic submit, lives at the submit step in
+    `login_with_credentials` — by then we know whether a click is still
+    blocked.)"""
+    click_by_text = getattr(bridge, "click_by_text", None)
+    if click_by_text is not None:
+        for text in COOKIE_ACCEPT_TEXTS:
+            try:
+                clicked = await click_by_text(
+                    slug, PROACTIS_LOGIN_SELECTORS["cookie_dialog"], text
+                )
+            except BridgeError:
+                clicked = False
+            if clicked and await _dialog_gone(bridge, slug):
+                logger.info(
+                    "discovery.proactis.cookie_dialog_dismissed",
+                    slug=slug,
+                    method="text-accept",
+                    text=text,
+                )
+                return True, "text-accept"
+
+    evaluate = getattr(bridge, "evaluate", None)
+    if evaluate is not None:
+        try:
+            await evaluate(slug, _REMOVE_OVERLAY_JS)
+        except BridgeError:
+            pass
+        else:
+            if await _dialog_gone(bridge, slug):
+                logger.info(
+                    "discovery.proactis.cookie_dialog_dismissed",
+                    slug=slug,
+                    method="removed",
+                )
+                return True, "removed"
+
     logger.info(
         "discovery.proactis.cookie_dialog_still_visible",
         slug=slug,
         timeout_s=COOKIE_DIALOG_DISMISS_TIMEOUT_S,
     )
+    return False, "none"
+
+
+async def _force_submit(bridge: BridgeClient, slug: str) -> bool:
+    """Strategy 5: the normal submit click was intercepted. Try a FORCED click
+    on the submit button (ignores the intercepting overlay), then a
+    programmatic `form.submit()` via JS. Returns True if either fired."""
+    force_click = getattr(bridge, "force_click", None)
+    if force_click is not None:
+        try:
+            await force_click(slug, PROACTIS_LOGIN_SELECTORS["submit_button"])
+            logger.info("discovery.proactis.submit_forced_click", slug=slug)
+            return True
+        except BridgeError:
+            pass
+
+    evaluate = getattr(bridge, "evaluate", None)
+    if evaluate is not None:
+        try:
+            submitted = await evaluate(slug, _SUBMIT_FORM_JS)
+        except BridgeError:
+            submitted = False
+        if submitted:
+            logger.info("discovery.proactis.submit_form_js", slug=slug)
+            return True
     return False

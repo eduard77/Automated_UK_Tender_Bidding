@@ -508,6 +508,66 @@ class InProcessBridgeClient:
             el = None
         return el is not None
 
+    # --- robust-dismissal primitives (Proactis cookie dialog) -------------
+    # These three exist so the login flow can dismiss an overlay WITHOUT
+    # depending on the exact button markup: click by visible text (Playwright
+    # text/role engine, not a brittle class selector), run a small JS snippet
+    # to detach/neutralise the overlay, and force a click that ignores an
+    # intercepting overlay. The login flow reaches them via getattr so the
+    # HTTP bridge / test doubles that don't implement them degrade cleanly.
+
+    async def click_by_text(
+        self,
+        slug: str,
+        scope_selector: str,
+        text: str,
+        *,
+        timeout_ms: int = 2000,
+    ) -> bool:
+        """Click an element matched by VISIBLE TEXT (case-insensitive) within
+        `scope_selector`. Prefers role=button, falls back to any element with
+        the text. Returns True only if something was clicked."""
+        import re as _re
+
+        session = self._require(slug)
+        page = session.page
+        try:
+            scope = page.locator(scope_selector).first
+            pattern = _re.compile(_re.escape(text), _re.IGNORECASE)
+            target = scope.get_by_role("button", name=pattern)
+            if await target.count() == 0:
+                target = scope.get_by_text(pattern)
+            if await target.count() == 0:
+                return False
+            await target.first.click(timeout=timeout_ms)
+            with contextlib.suppress(Exception):
+                await page.wait_for_load_state("domcontentloaded")
+            return True
+        except Exception:  # noqa: BLE001 - dismissal is best-effort
+            return False
+
+    async def force_click(self, slug: str, selector: str) -> dict:
+        """Click ignoring actionability checks (force=True) so a stray overlay
+        that still intercepts pointer events can't block the click."""
+        session = self._require(slug)
+        try:
+            await session.page.click(selector, force=True)
+            with contextlib.suppress(Exception):
+                await session.page.wait_for_load_state("domcontentloaded")
+        except Exception as exc:  # noqa: BLE001
+            raise BridgeError(f"force click failed: {exc}") from exc
+        return {"ok": True, "current_url": session.page.url}
+
+    async def evaluate(self, slug: str, script: str) -> Any:
+        """Run a JS expression in the page context and return its result.
+        Used to detach the cookie overlay and, as a last resort, to submit
+        the login form programmatically."""
+        session = self._require(slug)
+        try:
+            return await session.page.evaluate(script)
+        except Exception as exc:  # noqa: BLE001
+            raise BridgeError(f"evaluate failed: {exc}") from exc
+
     async def select_option(
         self,
         slug: str,

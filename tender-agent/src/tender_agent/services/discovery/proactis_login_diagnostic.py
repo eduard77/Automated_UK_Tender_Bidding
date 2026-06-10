@@ -88,6 +88,9 @@ class LoginDiagnostic:
     #: accept click failed or the dialog stayed visible past the timeout;
     #: None = no attempt (dialog absent, or the flow exited before that step).
     cookie_dialog_dismissed: bool | None = None
+    #: WHICH dismissal strategy worked — "text-accept" / "removed" /
+    #: "forced-submit" / "none" — so a regression is obvious at a glance.
+    cookie_dismiss_method: str | None = None
     selectors_found: dict[str, SelectorPresence] = field(default_factory=dict)
     frames: list[str] = field(default_factory=list)
     page_text_excerpt: str = ""
@@ -182,6 +185,7 @@ async def capture_login_state(
         page_title=page_title,
         last_status_code=last_status_code,
         cookie_dialog_dismissed=attempt.cookie_dialog_dismissed,
+        cookie_dismiss_method=attempt.cookie_dismiss_method,
         selectors_found=selectors,
         frames=frames,
         page_text_excerpt=excerpt,
