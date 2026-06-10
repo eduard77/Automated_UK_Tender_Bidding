@@ -32,6 +32,18 @@ class Settings(BaseSettings):
             "http://127.0.0.1:3000",
         ],
     )
+    # Regex companion to the explicit list above — needed because Azure gives
+    # the dashboard App Service a RANDOM-SUFFIXED default hostname
+    # (genera-tenders-dashboard-<suffix>.<region>.azurewebsites.net) that
+    # can't be known ahead of the app's creation. The middleware echoes the
+    # matching Origin back (never "*"), so credentialed requests stay safe.
+    # Scoped tightly to OUR dashboard app's name prefix. Set empty to disable;
+    # a future custom domain (tenders.genera-systems.com) goes in
+    # CORS_ALLOW_ORIGINS instead.
+    cors_allow_origin_regex: str = (
+        r"^https://genera-tenders-dashboard[a-z0-9-]*"
+        r"(?:\.[a-z0-9-]+)?\.azurewebsites\.net$"
+    )
 
     poll_interval_minutes: int = 30
     lookback_days_initial: int = 7
@@ -239,6 +251,12 @@ class Settings(BaseSettings):
     # in account_sessions, NOT a signed JWT — so revocation is just a DELETE.
     session_cookie_name: str = "tender_agent_session"
     session_lifetime_days: int = 30
+    # SameSite for the session cookie. EMPTY = auto: "none" (+Secure) when
+    # TENDER_AGENT_ENV=production — required for the cross-origin deployed
+    # dashboard to send the cookie at all — and "lax" in local dev, where the
+    # Next.js /__api rewrite keeps calls same-origin. Only set this if you
+    # need to force a specific value.
+    session_cookie_samesite: str = ""
 
     # --- Email integration (Phase 6 §5.8) -----------------------------------
     # Connect an inbox over OAuth (delegated READ-ONLY access — never stored

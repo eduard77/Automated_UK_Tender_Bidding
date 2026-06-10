@@ -126,6 +126,9 @@ const SOURCE_LABELS: Record<string, string> = {
   PCS: "Public Contracts Scotland",
   S2W: "Sell2Wales",
   NI: "eTendersNI",
+  PROACTIS: "Proactis / ProContract",
+  EU_SUPPLY: "EU-Supply / Mercell",
+  ATAMIS: "Atamis",
 };
 
 export function sourceLabel(code: string): string {

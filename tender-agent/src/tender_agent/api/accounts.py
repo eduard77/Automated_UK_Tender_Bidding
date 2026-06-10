@@ -85,14 +85,32 @@ class DevOverrideRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _session_cookie_attrs() -> tuple[str, bool]:
+    """(samesite, secure) for the session cookie.
+
+    The deployed dashboard lives on a DIFFERENT origin than the API
+    (dashboard …azurewebsites.net → backend …azurewebsites.net), and
+    browsers only send cookies on cross-site XHR when SameSite=None — which
+    in turn REQUIRES Secure. So production defaults to none+Secure, while
+    local dev keeps lax (the Next.js /__api rewrite makes dev calls
+    same-origin, so Lax suffices there). `SESSION_COOKIE_SAMESITE` overrides
+    the auto choice when set explicitly."""
+    samesite = settings.session_cookie_samesite.strip().lower()
+    if not samesite:
+        samesite = "none" if _is_production() else "lax"
+    secure = _is_production() or samesite == "none"
+    return samesite, secure
+
+
 def _set_session_cookie(response: Response, token: str) -> None:
+    samesite, secure = _session_cookie_attrs()
     response.set_cookie(
         key=settings.session_cookie_name,
         value=token,
         max_age=settings.session_lifetime_days * 24 * 3600,
         httponly=True,
-        secure=settings.tender_agent_env == "production",
-        samesite="lax",
+        secure=secure,
+        samesite=samesite,
         path="/",
     )
 
@@ -166,8 +184,16 @@ def logout(
     token = request.cookies.get(settings.session_cookie_name)
     if token:
         revoke_session(db, token)
+    # Deletion must carry the SAME SameSite/Secure attributes the cookie was
+    # set with — browsers reject a SameSite=None deletion without Secure, and
+    # the cross-origin dashboard sets exactly that combination in production.
+    samesite, secure = _session_cookie_attrs()
     response.delete_cookie(
-        key=settings.session_cookie_name, path="/"
+        key=settings.session_cookie_name,
+        path="/",
+        samesite=samesite,
+        secure=secure,
+        httponly=True,
     )
     response.status_code = 204
     return response
