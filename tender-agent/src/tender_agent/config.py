@@ -65,6 +65,25 @@ class Settings(BaseSettings):
         ]
     )
 
+    # Atamis-on-Salesforce public Visualforce listing. One adapter sweeps
+    # every configured tenant host's `/?searchtype=Projects` page (no login;
+    # the Lightning /s/Welcome SPA is 403 to non-browsers, the Visualforce
+    # sibling is server-rendered and public — fixtures captured 2026-06-10).
+    # `atamis_api_base` is the primary tenant (the NHS "Health Family",
+    # ~4,900 opportunities) used for the Source row; `atamis_portals` is the
+    # full tenant list the adapter sweeps. `atamis_max_pages` caps the
+    # newest-first page walk per tenant per cycle (10 rows/page; the health
+    # tenant alone has ~491 pages, so the cap keeps a poll cycle bounded
+    # while `sortStr=Recently Published` guarantees new rows are up front).
+    atamis_api_base: str = "https://atamis-1928.my.salesforce-sites.com"
+    atamis_portals: list[str] = Field(
+        default_factory=lambda: [
+            "https://atamis-1928.my.salesforce-sites.com",
+            "https://atamis-ukparliament.my.salesforce-sites.com",
+        ]
+    )
+    atamis_max_pages: int = 5
+
     # Document downloader. A single, writable, host-mounted location under
     # /app/data (see docker-compose.yml). Every document/staging path derives
     # from this — never a bare relative 'data' path.
