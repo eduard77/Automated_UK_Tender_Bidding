@@ -30,6 +30,11 @@ from tender_agent.services.discovery.proactis_filter_config import (
     ProactisFilterConfig,
 )
 from tender_agent.services.requirements_extractor import extract_requirements
+from tender_agent.services.test_profile_seed import (
+    TEST_PROFILE_CPV_PREFIXES,
+    TEST_PROFILE_NAME,
+    ensure_test_filter_profile,
+)
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -291,11 +296,55 @@ def _run_proactis_profile_discovery_safely(
         )
 
 
+# ---------------------------------------------------------------------------
+# Test-profile seed (browser-only path for the end-to-end Proactis test run)
+# ---------------------------------------------------------------------------
+
+
+class SeedTestProfileResponse(BaseModel):
+    """Outcome of POST /admin/seed-test-profile.
+
+    `created` is True only on the first call — subsequent calls are idempotent
+    and return the existing row, so the operator can hit the button twice
+    without duplicating the test profile."""
+
+    profile_id: int
+    name: str
+    cpv_prefixes: list[str]
+    created: bool
+
+
+@router.post(
+    "/seed-test-profile",
+    response_model=SeedTestProfileResponse,
+    status_code=200,
+)
+def seed_test_profile(db: Session = Depends(get_db)) -> SeedTestProfileResponse:
+    """Browser-only path to create the canonical test FilterProfile.
+
+    A fresh cloud DB has no FilterProfile, so the profile-driven Proactis run
+    has nothing to filter by. This endpoint creates ONE broad construction-
+    sector profile so the operator can run the end-to-end test without
+    hand-crafting JSON. Idempotent — the second call returns the existing
+    row's id, never duplicates.
+    """
+    profile, created = ensure_test_filter_profile(db)
+    return SeedTestProfileResponse(
+        profile_id=profile.id,
+        name=profile.name,
+        cpv_prefixes=list(profile.cpv_prefixes or []),
+        created=created,
+    )
+
+
 # Re-exported for tests that want to drive the background work directly.
 __all__ = [
+    "TEST_PROFILE_CPV_PREFIXES",
+    "TEST_PROFILE_NAME",
     "_ProfileSnapshot",
     "_run_proactis_discovery_safely",
     "_run_proactis_profile_discovery_safely",
     "router",
     "run_for_profile_blocking",
+    "seed_test_profile",
 ]

@@ -8,9 +8,10 @@ features.
 """
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import BigInteger, create_engine
+from sqlalchemy import BigInteger, String, create_engine, types
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Session, sessionmaker
@@ -58,6 +59,42 @@ except Exception:  # pragma: no cover — pgvector optional in tests
     pass
 
 
+class _JsonList(types.TypeDecorator):
+    """ARRAY-of-string stand-in for SQLite. Stores the list as a JSON string
+    on write and parses it back on read so round-trips preserve Python lists.
+    The model declares the column as Postgres ARRAY(String); we swap the type
+    at metadata level before create_all so SQLite gets a JSON-backed column
+    while Postgres production stays untouched."""
+
+    impl = types.Text
+    cache_ok = True
+
+    def process_bind_param(self, value, _dialect):
+        if value is None:
+            return None
+        return json.dumps(value)
+
+    def process_result_value(self, value, _dialect):
+        if value is None or value == "":
+            return None
+        return json.loads(value)
+
+
+def _patch_array_columns_for_sqlite() -> None:
+    """Replace every ARRAY column on the shared MetaData with a JSON-encoded
+    TypeDecorator. Idempotent — re-runs see the swap and no-op. Only the
+    in-memory SQLite test schema is affected; the production Postgres ORM
+    keeps the real ARRAY type."""
+    for table in Base.metadata.tables.values():
+        for column in table.columns:
+            if isinstance(column.type, ARRAY):
+                column.type = _JsonList()
+            elif isinstance(column.type, String):
+                # Pure VARCHAR — leave alone. (Listed for completeness so the
+                # walk obviously skips non-collection types.)
+                continue
+
+
 def make_engine_and_session():
     """Build a fresh in-memory SQLite engine with our schema. StaticPool keeps
     the same connection for the whole test so the in-memory DB persists
@@ -68,6 +105,7 @@ def make_engine_and_session():
         poolclass=StaticPool,
         future=True,
     )
+    _patch_array_columns_for_sqlite()
     Base.metadata.create_all(engine)
     factory = sessionmaker(
         bind=engine, autoflush=False, autocommit=False, future=True
