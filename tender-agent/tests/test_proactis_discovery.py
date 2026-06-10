@@ -395,3 +395,142 @@ async def test_run_records_pollrun_finalisation_on_success(stub_db_factory) -> N
     )
     assert result.status == "ok"
     assert result.poll_run_id == 99
+
+
+# ---------------------------------------------------------------------------
+# Per-portal loop (2026-06-10 fix): the portal control is a SINGLE-value
+# dropdown, so configured portals mean one select -> Update -> walk cycle
+# per portal, deduped by advertId across cycles.
+# ---------------------------------------------------------------------------
+
+
+_PORTAL_LOOP_OPTIONS = [
+    {"label": "All", "value": ""},
+    {"label": "London Tenders", "value": "g-london"},
+    {"label": "EastMidsTenders", "value": "g-eastmids"},
+]
+
+
+def _portal_listing(advert_suffixes: list[str]) -> str:
+    rows = "".join(
+        f'<tr><td><a href="/Supplier/Advert/View?advertId='
+        f'aaaa1111-bbbb-cccc-dddd-eeeeffff{suffix}">Opportunity {suffix}</a>'
+        f"</td><td>Buyer</td><td>£100,000.00</td></tr>"
+        for suffix in advert_suffixes
+    )
+    return f'<table class="opportunities"><tbody>{rows}</tbody></table>'
+
+
+async def test_run_for_profile_loops_portals_and_dedupes_rows(
+    stub_db_factory, monkeypatch
+) -> None:
+    """Two resolvable portals + one unknown: the run selects each resolved
+    portal by its option VALUE, walks the listing per portal, aggregates
+    rows de-duped by advertId, and reports requested/applied/not_found."""
+    from tender_agent.config import settings
+
+    monkeypatch.setattr(
+        settings,
+        "proactis_discovery_portals",
+        ["London Tenders", "EastMidsTenders", "Atlantis"],
+    )
+
+    bridge = _fake_bridge_authenticated()
+    state = {"portal": None}
+
+    async def select_option_side_effect(_slug, selector, **kwargs):
+        if "PortalWithAllOption" in selector:
+            state["portal"] = kwargs.get("value")
+        return {"ok": True}
+
+    bridge.select_option = AsyncMock(side_effect=select_option_side_effect)
+    bridge.evaluate = AsyncMock(return_value=list(_PORTAL_LOOP_OPTIONS))
+    # One listing page per portal; row 0002 appears under BOTH portals to
+    # prove the cross-portal dedupe.
+    listings = {
+        "g-london": _portal_listing(["0001", "0002"]),
+        "g-eastmids": _portal_listing(["0002", "0003"]),
+    }
+
+    async def rendered_side_effect(*_a, **_kw):
+        html = listings.get(state["portal"], "<table class='opportunities'></table>")
+        return MagicMock(html=html, wait_satisfied=True, current_url="")
+
+    bridge.rendered_html = AsyncMock(side_effect=rendered_side_effect)
+    bridge.element_exists = AsyncMock(return_value=False)  # no Next link
+
+    async def fake_read_detail(_bridge, row):
+        row.dn_reference = f"DN{row.advert_id[-4:]}"
+        return row
+
+    with (
+        patch.object(pd, "_read_detail", side_effect=fake_read_detail),
+        patch.object(
+            pd, "_upsert_from_discovered", return_value=("new", False)
+        ) as upsert,
+    ):
+        result = await pd.run_for_profile(
+            credentials=MagicMock(),
+            profile=MagicMock(id=1, cpv_codes=[], cpv_prefixes=[], regions=[], keywords_any=[]),
+            bridge=bridge,
+            db_factory=stub_db_factory,
+        )
+
+    assert result.status == "ok"
+    assert result.portals_requested == 3
+    assert result.portals_applied == 2
+    assert result.portals_not_found == ["Atlantis"]
+    # Both portals were selected by their option VALUE on the real select.
+    portal_selects = [
+        c.kwargs.get("value")
+        for c in bridge.select_option.call_args_list
+        if "PortalWithAllOption" in c.args[1]
+    ]
+    assert portal_selects == ["g-london", "g-eastmids"]
+    # 0001 + 0002 + 0003, with 0002 de-duped across the two walks.
+    assert result.rows_seen == 3
+    assert upsert.call_count == 3
+    assert result.pages_walked == 2  # one page per portal
+
+
+async def test_run_for_profile_without_portals_walks_once(
+    stub_db_factory, monkeypatch
+) -> None:
+    """No portals configured: the select is never touched and the listing
+    is walked exactly once — the proven pre-portal behaviour."""
+    from tender_agent.config import settings
+
+    monkeypatch.setattr(settings, "proactis_discovery_portals", [])
+
+    bridge = _fake_bridge_authenticated()
+    bridge.rendered_html = AsyncMock(
+        return_value=MagicMock(
+            html=_portal_listing(["0009"]), wait_satisfied=True, current_url=""
+        )
+    )
+    bridge.element_exists = AsyncMock(return_value=False)
+
+    async def fake_read_detail(_bridge, row):
+        row.dn_reference = f"DN{row.advert_id[-4:]}"
+        return row
+
+    with (
+        patch.object(pd, "_read_detail", side_effect=fake_read_detail),
+        patch.object(pd, "_upsert_from_discovered", return_value=("new", False)),
+    ):
+        result = await pd.run_for_profile(
+            credentials=MagicMock(),
+            profile=MagicMock(id=1, cpv_codes=[], cpv_prefixes=[], regions=[], keywords_any=[]),
+            bridge=bridge,
+            db_factory=stub_db_factory,
+        )
+
+    assert result.status == "ok"
+    assert result.rows_seen == 1
+    assert result.portals_requested == 0
+    portal_selects = [
+        c
+        for c in bridge.select_option.call_args_list
+        if "PortalWithAllOption" in c.args[1]
+    ]
+    assert portal_selects == []

@@ -11,6 +11,7 @@ import pytest
 
 from tender_agent.services.discovery.proactis_dynatree import (
     DYNATREE_SELECTORS,
+    expand_cpv_prefix,
     match_node_for_code,
     match_node_for_region,
     no_results_visible,
@@ -302,3 +303,31 @@ def test_round_trip_search_by_code_finds_the_intended_node(
     match = match_node_for_code(nodes, operator_code)
     assert match is not None
     assert match.node_id == expected_node_id
+
+
+# ---------------------------------------------------------------------------
+# CPV prefix expansion (2026-06-10 fix): profile prefixes -> the 8-digit form
+# the live CPV tree displays and the popup search matches.
+# ---------------------------------------------------------------------------
+
+
+def test_expand_two_digit_prefix_pads_to_division_code():
+    assert expand_cpv_prefix("45") == "45000000"
+    assert expand_cpv_prefix("09") == "09000000"
+
+
+def test_expand_intermediate_prefixes():
+    assert expand_cpv_prefix("451") == "45100000"
+    assert expand_cpv_prefix("4511") == "45110000"
+
+
+def test_full_codes_pass_through():
+    assert expand_cpv_prefix("45000000") == "45000000"
+    # Check digit stripped (normalise_code), code otherwise untouched.
+    assert expand_cpv_prefix("45000000-7") == "45000000"
+
+
+def test_non_numeric_labels_pass_through():
+    assert expand_cpv_prefix("Construction work") == "Construction work"
+    assert expand_cpv_prefix("") == ""
+    assert expand_cpv_prefix("  45  ") == "45000000"

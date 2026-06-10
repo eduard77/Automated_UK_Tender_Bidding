@@ -72,6 +72,7 @@ from tender_agent.services.portals.adapters.proactis import (
     OPPORTUNITY_DATE_RE,
     OPPORTUNITY_ID_RE,
     OPPORTUNITY_VALUE_RE,
+    PORTAL_OPTIONS_JS,
     PROACTIS_SELECTORS,
     PROACTIS_URLS,
 )
@@ -482,6 +483,51 @@ class PopupApplyOutcome:
     error: str | None = None
 
 
+async def _popup_search(bridge: BridgeClient, term: str, popup_kind: str):
+    """Drive ONE search inside an already-open Dynatree popup: clear the
+    pre-filled placeholder, type `term`, re-assert Exact mode, click Search,
+    wait for the tree (or the no-results marker) to settle. Returns the
+    rendered page; raises BridgeError on a hard bridge failure so the caller
+    can record the item and move on."""
+    from tender_agent.services.discovery.proactis_dynatree import (
+        DYNATREE_SELECTORS,
+    )
+
+    # Clear THEN fill — Proactis pre-fills the box with placeholder text as
+    # the literal value, so a plain fill on top would corrupt the query.
+    await bridge.fill(
+        PROACTIS_BRIDGE_SLUG, DYNATREE_SELECTORS["search_input"], ""
+    )
+    await bridge.fill(
+        PROACTIS_BRIDGE_SLUG, DYNATREE_SELECTORS["search_input"], term
+    )
+
+    # Belt-and-braces: ensure Exact match is selected. Default checked; a
+    # no-op click on a checked radio is harmless.
+    try:
+        await bridge.click(
+            PROACTIS_BRIDGE_SLUG, DYNATREE_SELECTORS["exact_match_radio"]
+        )
+    except BridgeError:
+        # Some Proactis variants strip the radio when only one mode is
+        # available. Don't fail the search over it.
+        logger.debug(
+            "discovery.proactis.exact_radio_missing", popup=popup_kind
+        )
+
+    await bridge.click(
+        PROACTIS_BRIDGE_SLUG, DYNATREE_SELECTORS["search_button"]
+    )
+
+    # The XHR returns either a populated tree OR shows the no-results
+    # marker; both selectors are in our wait expression.
+    return await bridge.rendered_html(
+        PROACTIS_BRIDGE_SLUG,
+        wait_for_selector=DYNATREE_SELECTORS["tree_settled_wait"],
+        timeout_ms=DYNATREE_SEARCH_WAIT_MS,
+    )
+
+
 async def _drive_dynatree_popup(
     bridge: BridgeClient,
     *,
@@ -502,6 +548,7 @@ async def _drive_dynatree_popup(
     # on nothing from this module.
     from tender_agent.services.discovery.proactis_dynatree import (
         DYNATREE_SELECTORS,
+        expand_cpv_prefix,
         match_node_for_code,
         match_node_for_region,
         no_results_visible,
@@ -537,106 +584,71 @@ async def _drive_dynatree_popup(
 
     outcome.popup_opened = True
 
-    # 2. For each item: clear search, ensure Exact mode, type, click Search,
-    # wait for settle, parse nodes, tick the match (or record not_found).
+    # 2. For each item: search (with the expanded CPV form first), parse the
+    # settled tree, tick the match — or record not_found and continue.
     for raw in items:
         item = (raw or "").strip()
         if not item:
             continue
 
-        # Clear THEN fill — Proactis pre-fills the box with placeholder text
-        # as the literal value, so a plain fill on top would corrupt the query.
-        try:
-            await bridge.fill(
-                PROACTIS_BRIDGE_SLUG,
-                DYNATREE_SELECTORS["search_input"],
-                "",
-            )
-            await bridge.fill(
-                PROACTIS_BRIDGE_SLUG,
-                DYNATREE_SELECTORS["search_input"],
-                item,
-            )
-        except BridgeError as exc:
-            outcome.not_found.append(item)
-            logger.warning(
-                "discovery.proactis.popup_search_fill_failed",
-                popup=popup_kind,
-                item=item,
-                error=str(exc),
-            )
-            continue
+        # CPV codes: search AND match with the canonical 8-digit form. The
+        # live CPV tree (filter-diagnostic, 2026-06-10) titles its nodes
+        # "45000000-7 - Construction work" and its search matches code
+        # prefixes, so "45000000" hits where the node-token comparison for a
+        # bare "45" never could. The raw text stays as a second search in
+        # case a tenant tree indexes the short form differently.
+        if matcher == "code":
+            target = expand_cpv_prefix(item)
+            search_terms = [target] if target == item else [target, item]
+        else:
+            target = item
+            search_terms = [item]
 
-        # Belt-and-braces: ensure Exact match is selected. Default checked;
-        # a no-op click on a checked radio is harmless.
-        try:
-            await bridge.click(
-                PROACTIS_BRIDGE_SLUG, DYNATREE_SELECTORS["exact_match_radio"]
-            )
-        except BridgeError:
-            # Some Proactis variants strip the radio when only one mode is
-            # available. Don't fail the search over it.
-            logger.debug(
-                "discovery.proactis.exact_radio_missing", popup=popup_kind
-            )
+        node = None
+        no_match_reason = "no search attempted"
+        for attempt_index, term in enumerate(search_terms):
+            try:
+                rendered = await _popup_search(bridge, term, popup_kind)
+            except BridgeError as exc:
+                no_match_reason = f"search drive failed: {exc}"
+                logger.warning(
+                    "discovery.proactis.popup_search_failed",
+                    popup=popup_kind,
+                    item=item,
+                    search_term=term,
+                    error=str(exc),
+                )
+                break  # hard bridge failure — don't retry other terms
 
-        # Click Search.
-        try:
-            await bridge.click(
-                PROACTIS_BRIDGE_SLUG, DYNATREE_SELECTORS["search_button"]
-            )
-        except BridgeError as exc:
-            outcome.not_found.append(item)
-            logger.warning(
-                "discovery.proactis.popup_search_click_failed",
-                popup=popup_kind,
-                item=item,
-                error=str(exc),
-            )
-            continue
+            if no_results_visible(rendered.html):
+                no_match_reason = "divNoSearchResults visible"
+                continue
 
-        # Wait for the tree to settle. The XHR returns either a populated
-        # tree OR shows the no-results marker; both selectors are in our
-        # wait expression.
-        try:
-            rendered = await bridge.rendered_html(
-                PROACTIS_BRIDGE_SLUG,
-                wait_for_selector=DYNATREE_SELECTORS["tree_settled_wait"],
-                timeout_ms=DYNATREE_SEARCH_WAIT_MS,
+            nodes = parse_dynatree_nodes(rendered.html)
+            node = (
+                match_node_for_code(nodes, target)
+                if matcher == "code"
+                else match_node_for_region(nodes, target)
             )
-        except BridgeError as exc:
-            outcome.not_found.append(item)
-            logger.warning(
-                "discovery.proactis.popup_search_wait_failed",
-                popup=popup_kind,
-                item=item,
-                error=str(exc),
-            )
-            continue
+            if node is not None:
+                if attempt_index > 0:
+                    logger.info(
+                        "discovery.proactis.popup_search_fallback",
+                        popup=popup_kind,
+                        item=item,
+                        used=term,
+                    )
+                break
+            no_match_reason = f"no node matched among {len(nodes)} results"
 
-        if no_results_visible(rendered.html):
-            outcome.not_found.append(item)
-            logger.info(
-                "discovery.proactis.popup_no_match",
-                popup=popup_kind,
-                item=item,
-                reason="divNoSearchResults visible",
-            )
-            continue
-
-        nodes = parse_dynatree_nodes(rendered.html)
-        node = (
-            match_node_for_code(nodes, item)
-            if matcher == "code"
-            else match_node_for_region(nodes, item)
-        )
         if node is None:
             outcome.not_found.append(item)
             logger.info(
                 "discovery.proactis.popup_no_match",
                 popup=popup_kind,
                 item=item,
-                reason=f"no node matched among {len(nodes)} results",
+                search_term=target,
+                reason=no_match_reason,
             )
             continue
 
@@ -651,6 +663,7 @@ async def _drive_dynatree_popup(
                 "discovery.proactis.popup_ticked",
                 popup=popup_kind,
                 item=item,
+                search_term=target,
                 node_id=node.node_id,
                 title=node.title_text,
             )
@@ -772,22 +785,13 @@ async def _apply_filters_from_profile(
         result.regions_applied = reg_outcome.applied
         result.regions_not_found = list(reg_outcome.not_found)
 
-    # Portals — the SAME Dynatree component again. procontract.due-north.com
-    # hosts many sister portals (YPO, The Chest, London Tenders, …); entries
-    # here scope the search to those portals BY NAME (the name matcher is the
-    # same case-insensitive prefix/contains logic regions use). Empty = the
-    # control is left alone — the proven default behaviour is unchanged.
-    if config.portals:
-        portal_outcome = await _drive_dynatree_popup(
-            bridge,
-            open_trigger_selector=PROACTIS_SELECTORS["opp_add_portal_button"],
-            items=list(config.portals),
-            matcher="region",
-            popup_kind="portal",
-        )
-        result.portals_requested = portal_outcome.requested
-        result.portals_applied = portal_outcome.applied
-        result.portals_not_found = list(portal_outcome.not_found)
+    # Portals are NOT applied here. The live filter-diagnostic (2026-06-10)
+    # proved there is no "Add portal" popup — portal scope is a plain
+    # single-value <select> ("All" default). `run_for_profile` resolves the
+    # configured names against the select's real options and loops the
+    # listing walk per portal (see _resolve_portal_targets /
+    # _apply_portal_selection). Leaving the select untouched here keeps the
+    # proven all-portals default for the first Update below.
 
     # Apply the page-level filter form.
     try:
@@ -818,11 +822,148 @@ async def _apply_filters_from_profile(
         regions_requested=result.regions_requested,
         regions_applied=result.regions_applied,
         regions_not_found=len(result.regions_not_found),
-        portals_requested=result.portals_requested,
-        portals_applied=result.portals_applied,
-        portals_not_found=len(result.portals_not_found),
         include_closed=config.include_closed,
     )
+
+
+# ---------------------------------------------------------------------------
+# Portal scope — a single-value <select>, looped per configured portal
+# ---------------------------------------------------------------------------
+
+def _match_portal_option(
+    options: list[tuple[str, str]], name: str
+) -> tuple[str, str] | None:
+    """Resolve one configured portal NAME against the select's real options.
+
+    Tolerance mirrors the region matcher: case-insensitive exact first, then
+    prefix, then whole-substring — so "EastMidsTenders" matches exactly and
+    "the chest" still finds "The Chest – North West". The "All" option is
+    only reachable by EXACT match: a fuzzy hit on "All" would silently widen
+    the scope, which is the opposite of what a configured name means."""
+    target = (name or "").strip().lower()
+    if not target:
+        return None
+    pairs = [((label or "").strip(), value) for label, value in options]
+    for label, value in pairs:
+        if label.lower() == target:
+            return (label, value)
+    for label, value in pairs:
+        if label.lower() == "all":
+            continue
+        if label.lower().startswith(target):
+            return (label, value)
+    if len(target) >= 3:
+        for label, value in pairs:
+            if label.lower() == "all":
+                continue
+            if target in label.lower():
+                return (label, value)
+    return None
+
+
+async def _resolve_portal_targets(
+    bridge: BridgeClient,
+    config: ProactisFilterConfig,
+    result: DiscoveryRunResult,
+) -> list[tuple[str, str | None]]:
+    """Map the configured portal names onto the select's REAL options.
+
+    Returns [(option_label, option_value)] for the names that resolved;
+    unresolved names land in `result.portals_not_found` (logged, run
+    continues — same loud-not-silent contract the popups have). When the
+    bridge can't enumerate options (no `evaluate` — the HTTP bridge or test
+    doubles), every name is returned with value=None and selection falls
+    back to Playwright's exact-label match."""
+    result.portals_requested = len(config.portals)
+
+    options: list[tuple[str, str]] = []
+    evaluate = getattr(bridge, "evaluate", None)
+    if evaluate is not None:
+        try:
+            rows = await evaluate(PROACTIS_BRIDGE_SLUG, PORTAL_OPTIONS_JS)
+        except BridgeError as exc:
+            rows = None
+            logger.warning(
+                "discovery.proactis.portal_options_read_failed",
+                error=str(exc),
+            )
+        if isinstance(rows, list):
+            options = [
+                (str(row.get("label") or ""), str(row.get("value") or ""))
+                for row in rows
+                if isinstance(row, dict)
+            ]
+
+    targets: list[tuple[str, str | None]] = []
+    if not options:
+        # Can't enumerate — defer to exact-label selection per name. A name
+        # that doesn't exist will fail at selection time and be recorded
+        # there, so the loud-miss contract still holds.
+        logger.info(
+            "discovery.proactis.portal_options_unavailable",
+            fallback="exact-label select_option per configured name",
+        )
+        return [(name, None) for name in config.portals]
+
+    for name in config.portals:
+        matched = _match_portal_option(options, name)
+        if matched is None:
+            result.portals_not_found.append(name)
+            logger.info(
+                "discovery.proactis.portal_option_no_match",
+                name=name,
+                options_count=len(options),
+            )
+            continue
+        label, value = matched
+        if label != name:
+            logger.info(
+                "discovery.proactis.portal_option_fuzzy_match",
+                configured=name,
+                matched_label=label,
+            )
+        targets.append((label, value))
+    return targets
+
+
+async def _apply_portal_selection(
+    bridge: BridgeClient, label: str, value: str | None
+) -> bool:
+    """Select ONE portal in the dropdown, click Update, wait for the listing
+    to re-render. Returns True when the selection + update went through."""
+    try:
+        if value:
+            await bridge.select_option(
+                PROACTIS_BRIDGE_SLUG,
+                PROACTIS_SELECTORS["opp_portal_select"],
+                value=value,
+            )
+        else:
+            await bridge.select_option(
+                PROACTIS_BRIDGE_SLUG,
+                PROACTIS_SELECTORS["opp_portal_select"],
+                label=label,
+            )
+        await bridge.click(
+            PROACTIS_BRIDGE_SLUG, PROACTIS_SELECTORS["opp_update_button"]
+        )
+    except BridgeError as exc:
+        logger.warning(
+            "discovery.proactis.portal_select_failed",
+            portal=label,
+            error=str(exc),
+        )
+        return False
+    try:
+        await bridge.rendered_html(
+            PROACTIS_BRIDGE_SLUG,
+            wait_for_selector=PROACTIS_SELECTORS["opp_results_table"],
+            timeout_ms=LISTING_RENDER_TIMEOUT_MS,
+        )
+    except BridgeError:
+        logger.debug("discovery.proactis.portal_listing_wait_timeout")
+    logger.info("discovery.proactis.portal_scope_applied", portal=label)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1332,11 +1473,51 @@ async def run_for_profile(
         # through the text-input flow inside _apply_filters_from_profile.
         await _apply_filters_from_profile(bridge, config, result)
 
+        # Portal scope: the select is SINGLE-value ("…WithAllOptionFilter",
+        # default "All"), so multiple configured portals mean one
+        # select → Update → walk cycle per portal, de-duped by advertId
+        # across cycles. No portals configured = the select stays on "All"
+        # and we walk once — the proven default.
         listing_rows: list[DiscoveredOpportunity] = []
-        async for row in _walk_listing(bridge, config):
-            listing_rows.append(row)
-            result.rows_seen += 1
-        result.pages_walked = _last_walked_pages
+        seen_advert_ids: set[str] = set()
+        portal_targets: list[tuple[str, str | None]] = []
+        if config.portals:
+            portal_targets = await _resolve_portal_targets(
+                bridge, config, result
+            )
+        if portal_targets:
+            total_pages = 0
+            for portal_label, portal_value in portal_targets:
+                selected = await _apply_portal_selection(
+                    bridge, portal_label, portal_value
+                )
+                if not selected:
+                    result.portals_not_found.append(portal_label)
+                    continue
+                result.portals_applied += 1
+                async for row in _walk_listing(bridge, config):
+                    if row.advert_id in seen_advert_ids:
+                        continue
+                    seen_advert_ids.add(row.advert_id)
+                    listing_rows.append(row)
+                    result.rows_seen += 1
+                total_pages += _last_walked_pages
+            result.pages_walked = total_pages
+        else:
+            # Either no portals configured (select stays on "All") or none
+            # of the configured names resolved (loud in the summary below;
+            # the run continues un-scoped rather than yielding nothing).
+            async for row in _walk_listing(bridge, config):
+                listing_rows.append(row)
+                result.rows_seen += 1
+            result.pages_walked = _last_walked_pages
+        if config.portals:
+            logger.info(
+                "discovery.proactis.portal_scope_summary",
+                requested=result.portals_requested,
+                applied=result.portals_applied,
+                not_found=list(result.portals_not_found),
+            )
 
         with db_factory() as db:
             for row in listing_rows:

@@ -126,6 +126,23 @@ def normalise_code(raw: str) -> str:
     return re.sub(r"-\d$", "", cleaned)
 
 
+def expand_cpv_prefix(raw: str) -> str:
+    """Expand a CPV prefix to the 8-digit code form the CPV tree displays.
+
+    The operator's FilterProfile stores DIVISION-level prefixes ("45", "71",
+    "09"); the live CPV tree titles nodes with full codes ("45000000-7 -
+    Construction work") and — per the 2026-06-10 filter-diagnostic — the
+    popup search matches code PREFIXES even in Exact mode. So both the
+    search term we type and the node-match target use the canonical 8-digit
+    form: "45" -> "45000000", "451" -> "45100000". Full codes and
+    non-numeric labels pass through unchanged (minus any -checkdigit, which
+    `normalise_code` already strips)."""
+    cleaned = normalise_code(raw)
+    if cleaned.isdigit() and 2 <= len(cleaned) < 8:
+        return cleaned.ljust(8, "0")
+    return cleaned
+
+
 def match_node_for_code(
     nodes: list[DynatreeNode], code: str
 ) -> DynatreeNode | None:

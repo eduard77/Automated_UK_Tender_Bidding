@@ -2,17 +2,18 @@
 the Find Opportunities filter panel, so a real selector/format fix can be
 made from the actual markup instead of guessed.
 
-Two confirmed live failures this addresses, both AFTER a successful login:
+Built for (and proven by) the 2026-06-10 live capture, which resolved two
+post-login failures:
 
-  1. Category popup: every CPV prefix we send (45/71/50/44/09) comes back
-     `divNoSearchResults visible`, so categories_applied=0. We need to see
-     what the popup's TREE markup actually carries (full CPV codes? labels?
-     ProClass values?) and whether a descriptive word like "construction"
-     matches when a 2-digit prefix does not.
-  2. Portal popup: the "Add new portal" / "Add portal" open-trigger times
-     out. We need to see the REAL control(s) on the filter panel that open
-     a Portals scope dialog — text, tag, class — to wire the right
-     selector.
+  1. Category popup: the bare "Add" trigger opened the UNSPSC tree (where
+     45 = printing/photographic, not construction) — the panel has FIVE
+     `a.CategoryFilter` triggers and the flow now opens "Add CPV
+     categories" specifically. The diagnostic keeps probing one code + one
+     word so a future taxonomy/format drift is visible immediately.
+  2. Portals: there is NO popup — scope is a plain single-value <select>
+     (`FilterResultItems.PortalWithAllOptionFilter`, "All" default). The
+     diagnostic probes the select and lists its REAL option labels so the
+     configured portal names can be checked against them.
 
 Hard rule, same as the login diagnostic: NO secrets. Page text comes from
 `inner_text`, so credential strings (form input VALUES) physically can't
@@ -37,6 +38,7 @@ from tender_agent.services.discovery.proactis_login import (
     login_with_credentials,
 )
 from tender_agent.services.portals.adapters.proactis import (
+    PORTAL_OPTIONS_JS,
     PROACTIS_SELECTORS,
     PROACTIS_URLS,
 )
@@ -52,12 +54,11 @@ TEXT_EXCERPT_CHARS = 2000
 #: control labels. Capped to keep the JSON response reviewable.
 HTML_EXCERPT_CHARS = 4000
 
-#: Example category-popup probes. We try ONE numeric code and ONE descriptive
-#: word, because the live failure is exactly the gap between those two.
-#: Choices match the operator's profile (CPV 45 / "construction work") so the
-#: diagnostic answers "does Proactis index 45 at all, vs. does it want
-#: descriptions?" without inventing new test data.
-CATEGORY_PROBE_CODE = "45"
+#: Example category-popup probes. ONE numeric code and ONE descriptive word.
+#: The code probe uses the 8-digit form the discovery flow now searches with
+#: (expand_cpv_prefix("45") — the 2026-06-10 capture showed tree nodes title
+#: full codes), so the diagnostic exercises exactly what the run does.
+CATEGORY_PROBE_CODE = "45000000"
 CATEGORY_PROBE_WORD = "construction"
 
 
@@ -115,13 +116,16 @@ class CategoryPopupSnapshot:
 class PortalControlSnapshot:
     """What the filter panel ACTUALLY exposes for portal scoping.
 
-    The flow currently uses an "Add new portal" / "Add portal" label-based
-    selector; this snapshot records whether THAT selector matches and what
-    every clickable filter-panel control is named instead, so the real
-    trigger is named loudly in the JSON."""
+    The 2026-06-10 capture proved portal scope is a plain single-value
+    <select> (`FilterResultItems.PortalWithAllOptionFilter`), not a popup.
+    This snapshot probes that select and lists its real option labels, so
+    PROACTIS_DISCOVERY_PORTALS entries can be checked against the exact
+    names the dropdown carries. The control scan + panel HTML stay for the
+    next time a control moves."""
 
-    current_open_trigger_selector: str
-    current_trigger_matches: bool
+    portal_select_selector: str
+    portal_select_present: bool
+    portal_options: list[str] = field(default_factory=list)
     panel_html_excerpt: str = ""
     panel_text_excerpt: str = ""
     panel_controls: list[ControlMarkup] = field(default_factory=list)
@@ -302,17 +306,28 @@ async def _capture_category_popup(
 async def _capture_portal_control(
     bridge: BridgeClient, slug: str
 ) -> PortalControlSnapshot:
-    current_trigger = PROACTIS_SELECTORS["opp_add_portal_button"]
+    select_selector = PROACTIS_SELECTORS["opp_portal_select"]
     snapshot = PortalControlSnapshot(
-        current_open_trigger_selector=current_trigger,
-        current_trigger_matches=False,
+        portal_select_selector=select_selector,
+        portal_select_present=False,
     )
     try:
-        snapshot.current_trigger_matches = await bridge.element_exists(
-            slug, current_trigger
+        snapshot.portal_select_present = await bridge.element_exists(
+            slug, select_selector
         )
     except BridgeError as exc:
-        snapshot.error = f"current-trigger probe failed: {exc}"
+        snapshot.error = f"portal-select probe failed: {exc}"
+
+    # The dropdown's real option labels — the source of truth the operator
+    # checks PROACTIS_DISCOVERY_PORTALS against. Labels only; the GUID values
+    # are resolved at run time by the discovery itself.
+    option_rows = await _evaluate(bridge, slug, PORTAL_OPTIONS_JS)
+    if isinstance(option_rows, list):
+        snapshot.portal_options = [
+            str(row.get("label") or "")
+            for row in option_rows
+            if isinstance(row, dict) and (row.get("label") or "").strip()
+        ]
 
     panel_html = await _evaluate(bridge, slug, _PANEL_HTML_JS)
     if isinstance(panel_html, str) and panel_html:
@@ -412,8 +427,8 @@ async def capture_filter_state(
             for p in (category_snapshot.probes if category_snapshot else [])
             if p.matched
         ),
-        portal_trigger_matches=bool(
-            portal_snapshot and portal_snapshot.current_trigger_matches
+        portal_select_present=bool(
+            portal_snapshot and portal_snapshot.portal_select_present
         ),
     )
     return diagnostic
