@@ -64,6 +64,9 @@ from tender_agent.services.discovery.proactis_login import (
     LoginAttempt,
     login_with_credentials,
 )
+from tender_agent.services.discovery.proactis_login_diagnostic import (
+    capture_login_state,
+)
 from tender_agent.services.ingestion import _upsert_tender
 from tender_agent.services.portals.adapters.proactis import (
     OPPORTUNITY_DATE_RE,
@@ -1204,6 +1207,18 @@ async def _login_then_get_status(
     attempt = await login_with_credentials(
         bridge, slug=PROACTIS_BRIDGE_SLUG, credentials=credentials
     )
+    if attempt.status != "ok":
+        # The session is still open and the page still shows whatever blocked
+        # us (block page / cookie wall / unrecognised form / redirect target).
+        # Snapshot it NOW — `run_for_profile` closes the session right after
+        # this returns. Logs `discovery.proactis.login_diagnostic`; must never
+        # mask the original outcome, hence best-effort.
+        try:
+            await capture_login_state(
+                bridge, PROACTIS_BRIDGE_SLUG, attempt=attempt
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("discovery.proactis.login_diagnostic_failed")
     return attempt, attempt.current_url
 
 

@@ -86,13 +86,18 @@ class _Session:
     backend process. No HTTP boundary, no shared mounts.
     """
 
-    __slots__ = ("slug", "playwright", "context", "page")
+    __slots__ = ("slug", "playwright", "context", "page", "last_status_code")
 
     def __init__(self, slug: str, playwright: Any, context: Any, page: Any) -> None:
         self.slug = slug
         self.playwright = playwright
         self.context = context
         self.page = page
+        # HTTP status of the most recent page.goto() — surfaced via
+        # session_status() so the Proactis login diagnostic can report what
+        # the last navigation returned (e.g. 403 from a WAF). None until the
+        # first navigate, and unchanged by form-submit navigations.
+        self.last_status_code: int | None = None
 
 
 class _GlobalManager:
@@ -428,7 +433,12 @@ class InProcessBridgeClient:
         if session is None:
             return {"exists": False, "current_url": None, "authenticated_guess": False}
         current_url, guess = await _page_state(session)
-        return {"exists": True, "current_url": current_url, "authenticated_guess": guess}
+        return {
+            "exists": True,
+            "current_url": current_url,
+            "authenticated_guess": guess,
+            "last_status_code": session.last_status_code,
+        }
 
     async def wait_for_login(
         self,
@@ -459,6 +469,7 @@ class InProcessBridgeClient:
             resp = await session.page.goto(url, wait_until="domcontentloaded")
         except Exception as exc:  # noqa: BLE001
             raise BridgeError(f"navigation failed: {exc}") from exc
+        session.last_status_code = resp.status if resp else None
         title = ""
         with contextlib.suppress(Exception):
             title = await session.page.title()
