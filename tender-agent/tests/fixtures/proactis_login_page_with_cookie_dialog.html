@@ -1,0 +1,62 @@
+<!--
+  ProContract V3 supplier login page WITH the cookie-consent dialog visible —
+  https://procontract.due-north.com/Login/Index
+
+  RECONSTRUCTED from the second live login-diagnostic (2026-06-10):
+  - submit_button.found was true (the User Name/Continue selector fix landed)
+  - the Playwright click was intercepted 42× by:
+    <div role="dialog" class="dialog cookie-dialog js-cookie-consent-dialog
+         is-visible" aria-labelledby="cookie-consent-dialog-title">
+  - the dialog wording is "At Proactis we value your privacy … please select
+    'Accept all' … 'Manage options'", confirming an Accept-all action.
+
+  The form markup is unchanged from tests/fixtures/proactis_login_page.html;
+  this fixture differs by injecting the dialog overlay so the contract test
+  proves the dismiss-before-submit ordering against the real overlay shape.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Log In</title>
+</head>
+<body>
+  <header>
+    <h1>Welcome to ProContract</h1>
+    <p>Log in with your user name and password.</p>
+  </header>
+
+  <form action="/Login/Index" id="loginForm" method="post" novalidate="novalidate">
+    <div class="form-group">
+      <label for="UserName">User Name</label>
+      <input id="UserName" name="UserName" type="text" autocomplete="username"
+             class="form-control" value="" />
+    </div>
+    <div class="form-group">
+      <label for="Password">Password</label>
+      <input id="Password" name="Password" type="password"
+             autocomplete="current-password" class="form-control" />
+    </div>
+    <button type="submit" id="continueButton" class="btn btn-primary">Continue</button>
+    <a href="/Account/ForgottenPassword">Forgotten your password?</a>
+  </form>
+
+  <footer>
+    <a href="/Registration">Register free</a>
+  </footer>
+
+  <div role="dialog"
+       class="dialog cookie-dialog js-cookie-consent-dialog is-visible"
+       aria-labelledby="cookie-consent-dialog-title">
+    <h2 id="cookie-consent-dialog-title">Cookies on Proactis</h2>
+    <p>
+      At Proactis we value your privacy. Please select "Accept all" to
+      consent to all cookies, or "Manage options" to choose which.
+    </p>
+    <div class="dialog-actions">
+      <button type="button" class="btn btn-primary js-cookie-accept-all">Accept all</button>
+      <button type="button" class="btn btn-secondary js-cookie-manage">Manage options</button>
+    </div>
+  </div>
+</body>
+</html>

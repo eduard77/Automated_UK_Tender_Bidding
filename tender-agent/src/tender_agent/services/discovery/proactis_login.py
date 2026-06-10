@@ -19,6 +19,7 @@ Hard rules
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from dataclasses import dataclass
 from typing import Literal
@@ -79,13 +80,35 @@ PROACTIS_LOGIN_SELECTORS = {
         ".validation-summary-errors, .alert-danger, "
         ":has-text('Invalid username or password')"
     ),
-    # Cookie/consent banner accept ("Accept all" per the captured page text).
-    # Dismissed defensively BEFORE the form fill in case it overlays the
-    # controls; its absence is never an error.
+    # Cookie/consent DIALOG container. The previous live diagnostic
+    # (2026-06-10) showed Proactis renders the consent as a modal dialog with
+    # this stable class — it sits on top of the form and intercepted the
+    # submit click 42 times before timeout. We probe for the CONTAINER (not
+    # the button) to decide whether to attempt a dismiss at all.
+    "cookie_dialog": (
+        ".js-cookie-consent-dialog.is-visible, "
+        ".js-cookie-consent-dialog, "
+        ".cookie-dialog[role='dialog'], "
+        "[role='dialog'][aria-labelledby*='cookie' i]"
+    ),
+    # Accept button — SCOPED to the dialog so we never click an unrelated
+    # "Accept" elsewhere on the page. Fallbacks broaden the text and lift the
+    # scope only as a last resort.
     "cookie_accept": (
-        "button:has-text('Accept all'), a:has-text('Accept all')"
+        ".js-cookie-consent-dialog button:has-text('Accept all'), "
+        ".js-cookie-consent-dialog a:has-text('Accept all'), "
+        ".cookie-dialog button:has-text('Accept all'), "
+        "[role='dialog'][aria-labelledby*='cookie' i] button:has-text('Accept all'), "
+        ".js-cookie-consent-dialog button:has-text('Accept'), "
+        "button:has-text('Accept all')"
     ),
 }
+
+
+#: How long to wait for the cookie dialog to detach after the accept click
+#: before we give up and let the form-click's own auto-wait deal with it.
+COOKIE_DIALOG_DISMISS_TIMEOUT_S = 5.0
+COOKIE_DIALOG_POLL_INTERVAL_S = 0.1
 
 
 LoginStatus = Literal["ok", "needs_login", "credentials_rejected", "error"]
@@ -103,6 +126,13 @@ class LoginAttempt:
     status: LoginStatus
     detail: str | None = None
     current_url: str | None = None
+    #: Tri-state telemetry for the cookie-dialog dismissal that runs before
+    #: the form fill. None = no attempt made (the flow exited before reaching
+    #: that step, or the dialog wasn't present); True = dismissed and
+    #: confirmed detached within the deadline; False = found but failed to
+    #: clear (the form click may still succeed if the dialog stops
+    #: intercepting pointer events, but the diagnostic gets to see this).
+    cookie_dialog_dismissed: bool | None = None
 
 
 def _password_fingerprint(password: str) -> str:
@@ -163,18 +193,21 @@ async def login_with_credentials(
     except BridgeError as exc:
         return LoginAttempt(status="error", detail=f"navigate /Login failed: {exc}")
 
-    # 1b. Dismiss the cookie/consent banner if one is up, in case it overlays
-    # the form controls. The live diagnostic showed the password field was
-    # already visible WITH the banner present, so this is belt-and-braces:
-    # accept when present, silently move on when absent or unclickable.
+    # 1b. Dismiss the cookie/consent dialog if one is up — it's a real modal
+    # (`role=dialog .js-cookie-consent-dialog.is-visible`) that the live
+    # diagnostic showed intercepting the submit click 42× before timeout.
+    # Detect the dialog container first; only attempt the dismiss when one is
+    # actually present. Telemetry goes onto the LoginAttempt so the diagnostic
+    # snapshot can report `cookie_dialog_dismissed` truthfully.
+    cookie_dialog_dismissed: bool | None = None
     try:
-        if await bridge.element_exists(
-            slug, PROACTIS_LOGIN_SELECTORS["cookie_accept"]
-        ):
-            await bridge.click(slug, PROACTIS_LOGIN_SELECTORS["cookie_accept"])
-            logger.info("discovery.proactis.cookie_banner_accepted", slug=slug)
+        dialog_present = await bridge.element_exists(
+            slug, PROACTIS_LOGIN_SELECTORS["cookie_dialog"]
+        )
     except BridgeError:
-        logger.debug("discovery.proactis.cookie_banner_skip", slug=slug)
+        dialog_present = False
+    if dialog_present:
+        cookie_dialog_dismissed = await _dismiss_cookie_dialog(bridge, slug)
 
     # 2. Fill credentials. We fill THEN check element_exists because some
     # Proactis variants render the form behind a disclosure; in that case the
@@ -190,6 +223,7 @@ async def login_with_credentials(
                 f"username input not found on /Login/Index (selector mismatch) "
                 f"— first run after a Proactis redesign? Error: {exc}"
             ),
+            cookie_dialog_dismissed=cookie_dialog_dismissed,
         )
     try:
         await bridge.fill(
@@ -201,6 +235,7 @@ async def login_with_credentials(
         return LoginAttempt(
             status="needs_login",
             detail=f"password input not found on /Login/Index: {exc}",
+            cookie_dialog_dismissed=cookie_dialog_dismissed,
         )
 
     # 3. Submit.
@@ -210,6 +245,7 @@ async def login_with_credentials(
         return LoginAttempt(
             status="needs_login",
             detail=f"submit button not found on /Login/Index: {exc}",
+            cookie_dialog_dismissed=cookie_dialog_dismissed,
         )
 
     # 4. Did we land on an authenticated page, OR did Proactis show an
@@ -227,6 +263,7 @@ async def login_with_credentials(
             status="ok",
             detail=f"pwd_fp={fp}",
             current_url=status.get("current_url"),
+            cookie_dialog_dismissed=cookie_dialog_dismissed,
         )
 
     # Probe for the rejection banner. If it's visible, the credentials were
@@ -246,6 +283,7 @@ async def login_with_credentials(
                 "Proactis displayed an invalid-credentials banner after "
                 "submit. Update the stored Proactis credentials."
             ),
+            cookie_dialog_dismissed=cookie_dialog_dismissed,
         )
 
     # Still on /Login but no banner — most likely a captcha or a multi-step
@@ -259,9 +297,48 @@ async def login_with_credentials(
                 "Likely a captcha or a multi-step login step."
             ),
             current_url=status.get("current_url"),
+            cookie_dialog_dismissed=cookie_dialog_dismissed,
         )
     return LoginAttempt(
         status="needs_login",
         detail="Form submitted but the post-login marker did not appear.",
         current_url=status.get("current_url"),
+        cookie_dialog_dismissed=cookie_dialog_dismissed,
     )
+
+
+async def _dismiss_cookie_dialog(bridge: BridgeClient, slug: str) -> bool:
+    """Click the cookie dialog's Accept-all button, then poll until the
+    dialog container detaches. Returns True only on confirmed dismissal —
+    so the diagnostic can show `cookie_dialog_dismissed: true` honestly.
+
+    Defensive: any BridgeError on the accept click yields False; the form
+    fill still goes ahead because the submit click's own auto-wait may yet
+    clear the overlay (or report it again in the next diagnostic)."""
+    try:
+        await bridge.click(slug, PROACTIS_LOGIN_SELECTORS["cookie_accept"])
+    except BridgeError as exc:
+        logger.info(
+            "discovery.proactis.cookie_dialog_accept_failed",
+            slug=slug,
+            error=str(exc),
+        )
+        return False
+    deadline = asyncio.get_event_loop().time() + COOKIE_DIALOG_DISMISS_TIMEOUT_S
+    while asyncio.get_event_loop().time() < deadline:
+        try:
+            still_visible = await bridge.element_exists(
+                slug, PROACTIS_LOGIN_SELECTORS["cookie_dialog"]
+            )
+        except BridgeError:
+            still_visible = False
+        if not still_visible:
+            logger.info("discovery.proactis.cookie_dialog_dismissed", slug=slug)
+            return True
+        await asyncio.sleep(COOKIE_DIALOG_POLL_INTERVAL_S)
+    logger.info(
+        "discovery.proactis.cookie_dialog_still_visible",
+        slug=slug,
+        timeout_s=COOKIE_DIALOG_DISMISS_TIMEOUT_S,
+    )
+    return False

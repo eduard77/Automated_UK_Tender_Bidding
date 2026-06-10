@@ -83,6 +83,11 @@ class LoginDiagnostic:
     current_url_unreadable: bool
     page_title: str | None
     last_status_code: int | None
+    #: Tri-state from the LoginAttempt: True = cookie dialog was found AND
+    #: dismissed (container detached) before submit; False = found but the
+    #: accept click failed or the dialog stayed visible past the timeout;
+    #: None = no attempt (dialog absent, or the flow exited before that step).
+    cookie_dialog_dismissed: bool | None = None
     selectors_found: dict[str, SelectorPresence] = field(default_factory=dict)
     frames: list[str] = field(default_factory=list)
     page_text_excerpt: str = ""
@@ -176,6 +181,7 @@ async def capture_login_state(
         current_url_unreadable=not current_url,
         page_title=page_title,
         last_status_code=last_status_code,
+        cookie_dialog_dismissed=attempt.cookie_dialog_dismissed,
         selectors_found=selectors,
         frames=frames,
         page_text_excerpt=excerpt,
