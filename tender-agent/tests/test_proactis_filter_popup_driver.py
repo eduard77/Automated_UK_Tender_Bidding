@@ -302,3 +302,89 @@ async def test_apply_filters_from_profile_records_misses_without_aborting():
     assert result.categories_not_found == ["99999999"]
     assert result.regions_applied == 0
     assert result.regions_not_found == ["Atlantis"]
+
+
+# ---------------------------------------------------------------------------
+# Portals popup — sister ProContract portals on the same instance, driven by
+# the same Dynatree component with name matching.
+# ---------------------------------------------------------------------------
+
+_PORTAL_HTML = """
+<div id="DivTree"><ul class="dynatree-container">
+  <li id="node~Portal~YPO">
+    <span class="dynatree-node">
+      <span class="dynatree-checkbox">&nbsp;</span>
+      <a class="dynatree-title">YPO</a>
+    </span>
+  </li>
+  <li id="node~Portal~TheChest">
+    <span class="dynatree-node">
+      <span class="dynatree-checkbox">&nbsp;</span>
+      <a class="dynatree-title">The Chest - North West</a>
+    </span>
+  </li>
+</ul></div>
+"""
+
+
+@pytest.mark.asyncio
+async def test_apply_filters_ticks_portals_and_populates_counters():
+    bridge = _FakeBridge(
+        html_responses=[
+            "<div id='DivTree'></div>",  # portal popup open
+            _PORTAL_HTML,                # search "YPO"
+            _PORTAL_HTML,                # search "the chest" (name matcher)
+            "<table class='opportunities'></table>",
+        ]
+    )
+    config = ProactisFilterConfig(
+        keywords="",
+        categories=[],
+        regions=[],
+        portals=["YPO", "the chest"],
+        include_closed=False,
+    )
+    result = DiscoveryRunResult(status="ok")
+    await _apply_filters_from_profile(bridge, config, result)
+    assert result.portals_requested == 2
+    assert result.portals_applied == 2
+    assert result.portals_not_found == []
+    ticked = [c for c in bridge.clicks if "dynatree-checkbox" in c]
+    assert 'li[id="node~Portal~YPO"] span.dynatree-checkbox' in ticked
+    assert 'li[id="node~Portal~TheChest"] span.dynatree-checkbox' in ticked
+
+
+@pytest.mark.asyncio
+async def test_portal_name_misses_are_loud_not_silent():
+    """The whole reason a wrong portal entry is safe: it lands in
+    portals_not_found in the run summary instead of silently narrowing the
+    search to nothing."""
+    bridge = _FakeBridge(
+        html_responses=[
+            "<div id='DivTree'></div>",  # portal popup open
+            _NO_RESULTS_HTML,            # search "ypo-wrong-slug" — no match
+            "<table class='opportunities'></table>",
+        ]
+    )
+    config = ProactisFilterConfig(portals=["ypo-wrong-slug"])
+    result = DiscoveryRunResult(status="ok")
+    await _apply_filters_from_profile(bridge, config, result)
+    assert result.portals_applied == 0
+    assert result.portals_not_found == ["ypo-wrong-slug"]
+
+
+@pytest.mark.asyncio
+async def test_empty_portals_leaves_the_control_alone():
+    """No portals configured (the default) → the popup is never opened, so
+    the proven first-run behaviour is byte-for-byte unchanged."""
+    bridge = _FakeBridge(
+        html_responses=["<table class='opportunities'></table>"]
+    )
+    config = ProactisFilterConfig()
+    result = DiscoveryRunResult(status="ok")
+    await _apply_filters_from_profile(bridge, config, result)
+    assert result.portals_requested == 0
+    # Only the page-level Update click happens — no popup trigger, no node
+    # tick, no popup apply button.
+    assert all("Update" in c for c in bridge.clicks)
+    assert not any("portal" in c.lower() for c in bridge.clicks)

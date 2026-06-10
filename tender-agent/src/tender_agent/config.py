@@ -51,8 +51,18 @@ class Settings(BaseSettings):
     # (used for the Source row); `eu_supply_portals` is the full host list the
     # adapter sweeps. Add tenants here as the operator needs them.
     eu_supply_api_base: str = "https://yortender.eu-supply.com"
+    # bluelight.eu-supply.com is the police/emergency-services ("Blue Light")
+    # tenant flagged by the portal survey. Added to the default sweep — the
+    # adapter is host-parameterised so this is pure config. NOTE: could not
+    # be live-verified from CI (eu-supply.com 403s datacenter IPs); the
+    # survey also mentioned uk.eu-supply.com, NOT added here to avoid
+    # double-ingesting if it aliases the same tenants — verify in the
+    # structured logs after the first scheduled sweep.
     eu_supply_portals: list[str] = Field(
-        default_factory=lambda: ["https://yortender.eu-supply.com"]
+        default_factory=lambda: [
+            "https://yortender.eu-supply.com",
+            "https://bluelight.eu-supply.com",
+        ]
     )
 
     # Document downloader. A single, writable, host-mounted location under
@@ -166,6 +176,17 @@ class Settings(BaseSettings):
     proactis_discovery_keywords: str = ""
     proactis_discovery_regions: list[str] = Field(default_factory=list)
     proactis_discovery_categories: list[str] = Field(default_factory=list)
+    # Portal scope. procontract.due-north.com hosts MANY sister portals
+    # behind vanity domains (the survey flagged YPO, ESPO/eastmidstenders,
+    # The Chest, London Tenders, Supplying the South West, South East
+    # Business Portal, Supply Staffordshire & Stoke). Entries here are ticked
+    # BY NAME in the Find Opportunities "Portals" popup (same Dynatree driver
+    # as categories/regions); names that match nothing land in the run
+    # summary's portals_not_found — loud, never a silent zero-row run.
+    # EMPTY (the default) leaves the control alone — Proactis's own default
+    # scope, i.e. the proven first-run behaviour. The vanity domains had
+    # broken TLS in the survey; discovery always addresses the due-north.com
+    # URL, never the vanity hosts.
     proactis_discovery_portals: list[str] = Field(default_factory=list)
     proactis_discovery_organisations: list[str] = Field(default_factory=list)
     proactis_discovery_include_closed: bool = False

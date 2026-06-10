@@ -136,3 +136,18 @@ def test_representative_profiles_round_trip(
     assert cfg.regions == expected_regs
     assert cfg.keywords == expected_kw
     assert cfg.include_closed is False
+
+
+def test_portals_kwarg_passes_through_trimmed():
+    """Deployment-level portal scope (PROACTIS_DISCOVERY_PORTALS) rides in via
+    the kwarg — the FilterProfile has no portals dimension."""
+    cfg = ProactisFilterConfig.from_filter_profile(
+        _FP(cpv_codes=["72000000"]),
+        portals=["YPO", "  The Chest  ", "", None],
+    )
+    assert cfg.portals == ["YPO", "The Chest"]
+
+
+def test_portals_default_empty_leaves_control_alone():
+    cfg = ProactisFilterConfig.from_filter_profile(_FP())
+    assert cfg.portals == []
