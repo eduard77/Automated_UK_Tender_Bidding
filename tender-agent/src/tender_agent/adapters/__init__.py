@@ -1,3 +1,4 @@
+from tender_agent.adapters.atamis import AtamisAdapter
 from tender_agent.adapters.base import SourceAdapter
 from tender_agent.adapters.contracts_finder import ContractsFinderAdapter
 from tender_agent.adapters.etendersni import ETendersNIAdapter
@@ -13,10 +14,12 @@ ADAPTERS: dict[str, type[SourceAdapter]] = {
     "S2W": Sell2WalesAdapter,
     "NI": ETendersNIAdapter,
     "EU_SUPPLY": EUSupplyAdapter,
+    "ATAMIS": AtamisAdapter,
 }
 
 __all__ = [
     "ADAPTERS",
+    "AtamisAdapter",
     "ContractsFinderAdapter",
     "ETendersNIAdapter",
     "EUSupplyAdapter",
