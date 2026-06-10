@@ -121,6 +121,12 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_allow_origins,
+    # The deployed dashboard's azurewebsites.net hostname carries a random
+    # suffix Azure assigns at app creation, so the explicit list can't name
+    # it ahead of time — the regex (scoped to our app-name prefix) covers it.
+    # Starlette echoes the specific matching Origin, never "*", so this is
+    # safe WITH credentials.
+    allow_origin_regex=settings.cors_allow_origin_regex or None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

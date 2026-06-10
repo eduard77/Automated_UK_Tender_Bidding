@@ -12,7 +12,15 @@ const API_BASE =
 // Types — mirror tender_agent/schemas.py. Keep field names/casing in sync.
 // ---------------------------------------------------------------------------
 
-export type SourceCode = "FTS" | "CF" | "PCS" | "S2W" | "NI";
+export type SourceCode =
+  | "FTS"
+  | "CF"
+  | "PCS"
+  | "S2W"
+  | "NI"
+  | "PROACTIS"
+  | "EU_SUPPLY"
+  | "ATAMIS";
 
 export interface TenderDocumentRaw {
   title?: string | null;
