@@ -1,0 +1,60 @@
+<!--
+  ProContract Find Opportunities — "Narrow your results" filter panel.
+
+  RECONSTRUCTED from the 2026-06-10 live filter-diagnostic capture:
+  - FIVE separate category triggers, each an <a class="CategoryFilter">:
+    "Add UNSPSC categories", "Add NHS eClass Version 2014 categories",
+    "Add CPV categories", "Add ProClass categories", "Add Proc HE
+    categories" (the popup the old bare "Add" selector opened was headed
+    "UNSPSC category selection" — the FIRST anchor in document order).
+  - Portals is a plain SINGLE-value select named
+    "FilterResultItems.PortalWithAllOptionFilter" with an "All" default;
+    options carry GUID values + visible portal names. Labels "London
+    Tenders", "South East Business Portal" and "EastMidsTenders" are
+    verbatim from the capture; the GUID values are synthetic stand-ins
+    (the capture relayed labels, not values).
+  This fixture pins the contract between the panel and
+  PROACTIS_SELECTORS — if a live run shows different markup, update BOTH
+  from a fresh filter-diagnostic capture.
+-->
+<form id="opportunitiesForm" action="/Opportunities/Index" method="post">
+  <h2>Narrow your results</h2>
+
+  <label>Keywords
+    <input id="FilterResultItems_Keywords" name="FilterResultItems.Keywords" type="text" />
+  </label>
+
+  <div class="filter-group">
+    <h3>Categories</h3>
+    <a class="CategoryFilter" href="#">Add UNSPSC categories</a>
+    <a class="CategoryFilter" href="#">Add NHS eClass Version 2014 categories</a>
+    <a class="CategoryFilter" href="#">Add CPV categories</a>
+    <a class="CategoryFilter" href="#">Add ProClass categories</a>
+    <a class="CategoryFilter" href="#">Add Proc HE categories</a>
+  </div>
+
+  <div class="filter-group">
+    <h3>Portals</h3>
+    <select id="FilterResultItems_PortalWithAllOptionFilter"
+            name="FilterResultItems.PortalWithAllOptionFilter">
+      <option value="" selected="selected">All</option>
+      <option value="22222222-aaaa-4bbb-8ccc-000000000001">London Tenders</option>
+      <option value="22222222-aaaa-4bbb-8ccc-000000000002">South East Business Portal</option>
+      <option value="22222222-aaaa-4bbb-8ccc-000000000003">EastMidsTenders</option>
+    </select>
+  </div>
+
+  <div class="filter-group">
+    <h3>Regions</h3>
+    <a href="#">Add new region</a>
+  </div>
+
+  <label>Include closed
+    <select name="FilterResultItems.IncludeClosed">
+      <option value="false" selected="selected">No</option>
+      <option value="true">Yes</option>
+    </select>
+  </label>
+
+  <button type="submit" id="btnUpdate">Update</button>
+</form>

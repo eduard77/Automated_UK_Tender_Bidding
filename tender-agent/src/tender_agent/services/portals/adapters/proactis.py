@@ -149,18 +149,30 @@ PROACTIS_SELECTORS = {
         "input[name*='Region' i]:not([type='hidden']), "
         "select[name*='Region' i]"
     ),
+    # VERIFIED 2026-06-10 via the live filter-diagnostic: the panel carries
+    # FIVE separate `<a class="CategoryFilter">` triggers — "Add UNSPSC
+    # categories", "Add NHS eClass Version 2014 categories", "Add CPV
+    # categories", "Add ProClass categories", "Add Proc HE categories". The
+    # old bare "Add" selector clicked the FIRST one, opening the UNSPSC tree
+    # — where code 45 is "Printing and Photographic and Audio and Visual
+    # Equipment", NOT construction. Every CPV prefix therefore missed and
+    # runs were effectively un-CPV-filtered. Target the CPV anchor by its
+    # exact visible text.
     "opp_add_category_button": (
-        "button:has-text('Add'), a:has-text('Add')"
+        "a.CategoryFilter:has-text('Add CPV categories'), "
+        "a:has-text('Add CPV categories'), "
+        "button:has-text('Add CPV categories')"
     ),
-    # CONFIRM SELECTOR — the "Portals" filter control on the same panel. The
-    # procontract.due-north.com instance hosts MANY portals (YPO, The Chest,
-    # London Tenders, …); this popup scopes the search to specific ones.
-    # Label convention mirrors the verified "Add new region" control. Could
-    # not be live-verified from CI (the portal 403s datacenter IPs) — the
-    # popup driver records portals_not_found loudly if this never matches.
-    "opp_add_portal_button": (
-        "button:has-text('Add new portal'), a:has-text('Add new portal'), "
-        "button:has-text('Add portal'), a:has-text('Add portal')"
+    # VERIFIED 2026-06-10 via the live filter-diagnostic: Portals is NOT a
+    # popup. There is no "Add portal" control at all (the old trigger timed
+    # out) — it's a plain single-value <select> defaulting to "All", whose
+    # options carry GUID values + visible portal names ("London Tenders",
+    # "South East Business Portal", "EastMidsTenders", …). Discovery selects
+    # an option per configured portal name and re-runs the search per portal.
+    "opp_portal_select": (
+        "select[name='FilterResultItems.PortalWithAllOptionFilter'], "
+        "select[name*='PortalWithAllOption' i], "
+        "select[id*='PortalWithAllOption' i]"
     ),
     "opp_category_input": (
         "input[name*='Categor' i]:not([type='hidden']), "
@@ -182,6 +194,30 @@ PROACTIS_SELECTORS = {
         "a.pagination-next, li.next a"
     ),
 }
+
+#: JS that lists the portal select's options as {label, value} rows. Values
+#: are the GUIDs ProContract uses; labels are the visible portal names the
+#: operator configures against. Lives HERE next to `opp_portal_select` so
+#: the discovery flow and the filter diagnostic read the same definition.
+PORTAL_OPTIONS_JS = """
+() => {
+  const sels = [
+    "select[name='FilterResultItems.PortalWithAllOptionFilter']",
+    "select[name*='PortalWithAllOption' i]",
+    "select[id*='PortalWithAllOption' i]",
+  ];
+  for (const s of sels) {
+    const sel = document.querySelector(s);
+    if (sel) {
+      return Array.from(sel.options).map(o => ({
+        label: (o.label || o.text || "").trim(),
+        value: o.value,
+      }));
+    }
+  }
+  return null;
+}
+"""
 
 # --- chunk 9 discovery: detail-page markers + regex patterns ------------
 # CONFIRMED — the DN reference on /Supplier/Advert/View follows this shape.

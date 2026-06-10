@@ -73,9 +73,9 @@ class _FilterBridge:
         self.fills: list[tuple[str, str]] = []
         self.popup_open = False
         self.search_term: str | None = None
-        # When True, element_exists matches the OLD portal-trigger selector
-        # — flip in the "before fix" test to assert the diagnostic notices.
-        self.current_portal_trigger_matches = False
+        # The real page HAS the portal select; a test can flip this to
+        # model a tenant where the control moved.
+        self.portal_select_present = True
 
     async def bridge_available(self) -> bool:
         return True
@@ -121,9 +121,9 @@ class _FilterBridge:
             return self.popup_open
         if "divNoSearchResults" in selector:
             return self.search_term == CATEGORY_PROBE_CODE
-        # The current (broken) Portals trigger.
-        if "Add new portal" in selector or "Add portal" in selector:
-            return self.current_portal_trigger_matches
+        # The portal dropdown (single-value, "All" default).
+        if "PortalWithAllOption" in selector:
+            return self.portal_select_present
         return False
 
     async def rendered_html(self, _slug, *, wait_for_selector=None, **_kw):
@@ -146,6 +146,15 @@ class _FilterBridge:
         return {"path": f"{label}.png", "size_bytes": 1}
 
     async def evaluate(self, _slug, script):
+        if "PortalWithAllOption" in script:
+            if not self.portal_select_present:
+                return None
+            return [
+                {"label": "All", "value": ""},
+                {"label": "London Tenders", "value": "g-1"},
+                {"label": "South East Business Portal", "value": "g-2"},
+                {"label": "EastMidsTenders", "value": "g-3"},
+            ]
         if "document.title" in script:
             return "Find Opportunities | ProContract"
         if "buttons, anchor" in script or "querySelectorAll" in script:
@@ -232,19 +241,33 @@ async def test_capture_records_category_miss_for_prefix_and_hit_for_word():
 
 
 @pytest.mark.asyncio
-async def test_capture_records_portal_trigger_missing_and_lists_real_controls():
-    bridge = _FilterBridge()  # default: current trigger does NOT match
+async def test_capture_probes_portal_select_and_lists_its_options():
+    """The 2026-06-10 capture proved Portals is a single-value dropdown —
+    the snapshot now reports the select's presence + its REAL option labels
+    so PROACTIS_DISCOVERY_PORTALS can be trued up against them."""
+    bridge = _FilterBridge()
     diag = await capture_filter_state(bridge, "procontract")
     panel = diag.portal_control
     assert panel is not None
-    assert panel.current_trigger_matches is False
-    # The REAL control's label sits in the enumerated controls — the
-    # whole reason for this diagnostic. The operator reads this back and we
-    # wire its real selector.
+    assert panel.portal_select_present is True
+    assert "PortalWithAllOptionFilter" in panel.portal_select_selector
+    assert "London Tenders" in panel.portal_options
+    assert "EastMidsTenders" in panel.portal_options
+    # The coarse control scan + panel HTML stay, for the next control move.
     texts = [c.text for c in panel.panel_controls]
     assert "Select organisations / portals" in texts
-    # And the panel HTML excerpt carries it for the operator to copy/paste.
     assert "Select organisations / portals" in panel.panel_html_excerpt
+
+
+@pytest.mark.asyncio
+async def test_capture_flags_missing_portal_select():
+    """A tenant where the select moved → present=False, options empty —
+    loud in the snapshot rather than silently wrong."""
+    bridge = _FilterBridge()
+    bridge.portal_select_present = False
+    diag = await capture_filter_state(bridge, "procontract")
+    assert diag.portal_control.portal_select_present is False
+    assert diag.portal_control.portal_options == []
 
 
 @pytest.mark.asyncio
@@ -348,7 +371,8 @@ def test_endpoint_returns_snapshot_json(auth_client, monkeypatch) -> None:
     probes = {p["term"]: p for p in body["category_popup"]["probes"]}
     assert probes[CATEGORY_PROBE_CODE]["matched"] is False
     assert probes[CATEGORY_PROBE_WORD]["matched"] is True
-    assert body["portal_control"]["current_trigger_matches"] is False
+    assert body["portal_control"]["portal_select_present"] is True
+    assert "London Tenders" in body["portal_control"]["portal_options"]
     assert any(
         c["text"] == "Select organisations / portals"
         for c in body["portal_control"]["panel_controls"]
