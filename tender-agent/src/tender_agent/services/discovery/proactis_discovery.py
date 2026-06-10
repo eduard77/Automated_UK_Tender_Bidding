@@ -161,6 +161,13 @@ class DiscoveryRunResult:
     regions_requested: int = 0
     regions_applied: int = 0
     regions_not_found: list[str] = field(default_factory=list)
+    # Portal scoping (sister ProContract portals on the same instance — YPO,
+    # The Chest, London Tenders, …). A name that doesn't match any node in
+    # the Portals popup lands in portals_not_found, so a wrong entry is LOUD
+    # in the run summary, never a silent zero-row run.
+    portals_requested: int = 0
+    portals_applied: int = 0
+    portals_not_found: list[str] = field(default_factory=list)
 
 
 class NeedsLoginError(BridgeError):
@@ -765,6 +772,23 @@ async def _apply_filters_from_profile(
         result.regions_applied = reg_outcome.applied
         result.regions_not_found = list(reg_outcome.not_found)
 
+    # Portals — the SAME Dynatree component again. procontract.due-north.com
+    # hosts many sister portals (YPO, The Chest, London Tenders, …); entries
+    # here scope the search to those portals BY NAME (the name matcher is the
+    # same case-insensitive prefix/contains logic regions use). Empty = the
+    # control is left alone — the proven default behaviour is unchanged.
+    if config.portals:
+        portal_outcome = await _drive_dynatree_popup(
+            bridge,
+            open_trigger_selector=PROACTIS_SELECTORS["opp_add_portal_button"],
+            items=list(config.portals),
+            matcher="region",
+            popup_kind="portal",
+        )
+        result.portals_requested = portal_outcome.requested
+        result.portals_applied = portal_outcome.applied
+        result.portals_not_found = list(portal_outcome.not_found)
+
     # Apply the page-level filter form.
     try:
         await bridge.click(
@@ -794,6 +818,9 @@ async def _apply_filters_from_profile(
         regions_requested=result.regions_requested,
         regions_applied=result.regions_applied,
         regions_not_found=len(result.regions_not_found),
+        portals_requested=result.portals_requested,
+        portals_applied=result.portals_applied,
+        portals_not_found=len(result.portals_not_found),
         include_closed=config.include_closed,
     )
 
@@ -1255,7 +1282,15 @@ async def run_for_profile(
     (categories_not_found / regions_not_found) and the run continues.
     """
     bridge = bridge or make_bridge_client()
-    config = ProactisFilterConfig.from_filter_profile(profile)
+    # Portal scope is deployment-level config (PROACTIS_DISCOVERY_PORTALS),
+    # not a per-profile field — the FilterProfile has no portals dimension.
+    # Empty (the default) leaves the Portals control untouched, exactly the
+    # proven first-run behaviour.
+    from tender_agent.config import settings as _settings
+
+    config = ProactisFilterConfig.from_filter_profile(
+        profile, portals=list(_settings.proactis_discovery_portals)
+    )
     result = DiscoveryRunResult(status="ok")
 
     with db_factory() as db:

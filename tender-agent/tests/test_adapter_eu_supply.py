@@ -201,3 +201,15 @@ async def test_one_host_failure_does_not_stop_the_sweep() -> None:
 
     assert adapter.had_errors is True
     assert len(tenders) == 5  # the healthy host still delivered
+
+
+def test_default_portal_sweep_includes_blue_light() -> None:
+    """bluelight.eu-supply.com (the police/emergency-services "Blue Light"
+    tenant) is in the DEFAULT sweep. Pure config — the host-parameterised
+    sweep test above proves the adapter handles the host; this pins the
+    default so a config regression is caught."""
+    from tender_agent.config import Settings
+
+    default_portals = Settings.model_fields["eu_supply_portals"].default_factory()
+    assert "https://bluelight.eu-supply.com" in default_portals
+    assert "https://yortender.eu-supply.com" in default_portals

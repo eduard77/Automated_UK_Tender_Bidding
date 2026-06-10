@@ -152,6 +152,16 @@ PROACTIS_SELECTORS = {
     "opp_add_category_button": (
         "button:has-text('Add'), a:has-text('Add')"
     ),
+    # CONFIRM SELECTOR — the "Portals" filter control on the same panel. The
+    # procontract.due-north.com instance hosts MANY portals (YPO, The Chest,
+    # London Tenders, …); this popup scopes the search to specific ones.
+    # Label convention mirrors the verified "Add new region" control. Could
+    # not be live-verified from CI (the portal 403s datacenter IPs) — the
+    # popup driver records portals_not_found loudly if this never matches.
+    "opp_add_portal_button": (
+        "button:has-text('Add new portal'), a:has-text('Add new portal'), "
+        "button:has-text('Add portal'), a:has-text('Add portal')"
+    ),
     "opp_category_input": (
         "input[name*='Categor' i]:not([type='hidden']), "
         "select[name*='Categor' i]"
