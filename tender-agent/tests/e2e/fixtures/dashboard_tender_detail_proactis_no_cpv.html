@@ -1,0 +1,18 @@
+<!--
+  A Proactis tender's detail page today: per handover §3 there is NO CPV
+  stored on the tender. The detail page renders the CPV cell EMPTY (or
+  the dashboard could omit the row entirely; here we model the empty
+  cell since the SearchPage code always renders the dl entry, even
+  when the value is blank). The bot's `OpenTender.cpv_field_present`
+  check returns OBSERVED_GAP for this DOM.
+-->
+<main>
+  <h1>Construction work — Greater Manchester schools</h1>
+  <dl>
+    <dt>Source</dt><dd>Proactis / ProContract</dd>
+    <dt>Buyer</dt><dd>Trafford Council</dd>
+    <dt>Region</dt><dd>Greater Manchester</dd>
+    <dt>CPV</dt><dd></dd>
+    <dt>Value</dt><dd>£1,200,000.00</dd>
+  </dl>
+</main>

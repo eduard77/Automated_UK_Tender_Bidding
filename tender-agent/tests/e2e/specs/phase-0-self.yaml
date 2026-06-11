@@ -1,0 +1,75 @@
+# Phase 0 — self-tests for the dashboard bot itself.
+#
+# Each spec pins a "known current state" the handover names. Phase 0 is
+# DONE when these specs, run against the LIVE dashboard, return a
+# matching observed verdict for every check. When a later phase closes
+# a gap that this YAML records as OBSERVED_GAP, flipping that entry to
+# `expected_outcome: PASS` is the regression proof.
+#
+# Run:
+#   python -m tests.e2e.dashboard_bot tests/e2e/specs/phase-0-self.yaml
+#
+# From the project's CI runners (Azure datacenter range) the dashboard
+# 403s — see tests/e2e/dashboard_bot/README.md for the residential-IP
+# / disguised-bridge story. CI runs the unit tests; the operator runs
+# this YAML.
+
+- name: Phase-0/source-facet-has-the-five-known-sources
+  rationale: >-
+    Handover §2: "Sources currently in the dashboard: CF, FTS, PCS,
+    Proactis/ProContract, SAMPLE_SEED". The bot reads the Source-chip
+    labels off the filter panel.
+  expected_outcome: PASS
+  tags: [phase-0, facet]
+
+- name: Phase-0/proactis-rows-exist
+  rationale: >-
+    Handover §2: a Proactis-filtered run inserted 61 construction tenders.
+    Filtering Source=Proactis must return at least 1 result card.
+  expected_outcome: PASS
+  filter:
+    sources: [PROACTIS]
+  search:
+    min_results: 1
+    must_include_sources: [PROACTIS]
+    must_exclude_sources: []
+  tags: [phase-0, proactis]
+
+- name: Phase-0/cpv-filter-returns-nothing-for-proactis-today
+  rationale: >-
+    Handover §3 (the headline gap): "Proactis tenders arrive with no CPV
+    code stored". Filtering by CPV 45000000 AND Source=Proactis returns
+    zero rows — the dashboard correctly finds nothing. The bot reports
+    OBSERVED_GAP here; Phase 3 will flip it to PASS.
+  expected_outcome: OBSERVED_GAP
+  filter:
+    cpv: "45000000"
+    sources: [PROACTIS]
+  search:
+    max_results: 0
+  tags: [phase-0, normalisation-gap]
+
+- name: Phase-0/silent-sources-absent-from-facet
+  rationale: >-
+    Handover §7.1: Atamis, EU-Supply, Sell2Wales are deployed but not
+    pulling, so they must NOT yet appear in the Source facet. Phase 1
+    will flip this to PASS by getting them ingesting.
+  expected_outcome: OBSERVED_GAP
+  filter:
+    sources: []
+  search:
+    must_exclude_sources: [ATAMIS, EU_SUPPLY, S2W]
+  tags: [phase-0, phase-1-blocker]
+
+- name: Phase-0/cpv-filter-still-returns-cf-and-fts
+  rationale: >-
+    Handover §3: CF and FTS publish CPV directly — so a 45000000 filter
+    must still return CF/FTS construction tenders even today.
+  expected_outcome: PASS
+  filter:
+    cpv: "45000000"
+    sources: [CF, FTS]
+  search:
+    min_results: 1
+    must_exclude_sources: [PROACTIS, SAMPLE_SEED]
+  tags: [phase-0, baseline]

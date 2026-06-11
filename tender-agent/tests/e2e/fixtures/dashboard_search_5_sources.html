@@ -1,0 +1,62 @@
+<!--
+  Synthesised SearchPage DOM matching the live dashboard's component
+  output (tender-agent-dashboard/components/SearchPage.tsx) on
+  2026-06-11 — handover §2: "Sources currently in the dashboard: CF,
+  FTS, PCS, Proactis/ProContract, SAMPLE_SEED". Five source chips, five
+  result cards (one per source), each card carries the source code on
+  its <span title="..."> exactly as ResultCard renders it.
+
+  The bot's parser unit tests read this verbatim; if the dashboard's
+  ResultCard / ChipChoices shape changes the unit tests fail loudly
+  rather than the live run failing 30s in.
+-->
+<form aria-label="Tender search filters">
+  <fieldset>
+    <legend>Source (default: all)</legend>
+    <button type="button" aria-pressed="false">Contracts Finder</button>
+    <button type="button" aria-pressed="false">Find a Tender</button>
+    <button type="button" aria-pressed="false">Public Contracts Scotland</button>
+    <button type="button" aria-pressed="false">Proactis / ProContract</button>
+    <button type="button" aria-pressed="false">SAMPLE_SEED</button>
+  </fieldset>
+</form>
+
+<section>
+  <ul>
+    <li>
+      <article>
+        <span title="CF">Contracts Finder</span>
+        <h2><a href="/tenders/101">Demolition works — Bristol Old School</a></h2>
+        <p>Bristol City Council · South West</p>
+      </article>
+    </li>
+    <li>
+      <article>
+        <span title="FTS">Find a Tender</span>
+        <h2><a href="/tenders/102">Highways resurfacing — A38 corridor</a></h2>
+        <p>Department for Transport · United Kingdom</p>
+      </article>
+    </li>
+    <li>
+      <article>
+        <span title="PCS">Public Contracts Scotland</span>
+        <h2><a href="/tenders/103">Refurbishment of Inverclyde primary school</a></h2>
+        <p>Inverclyde Council · Scotland</p>
+      </article>
+    </li>
+    <li>
+      <article>
+        <span title="PROACTIS">Proactis / ProContract</span>
+        <h2><a href="/tenders/104">Construction work — Greater Manchester schools</a></h2>
+        <p>Trafford Council · Greater Manchester</p>
+      </article>
+    </li>
+    <li>
+      <article>
+        <span title="SAMPLE_SEED">SAMPLE_SEED</span>
+        <h2><a href="/tenders/105">Sample seed tender</a></h2>
+        <p>Synthetic buyer</p>
+      </article>
+    </li>
+  </ul>
+</section>
