@@ -240,13 +240,28 @@ async def run(
         result.pages_walked = _last_walked_pages
 
         # --- read detail + upsert ------------------------------------------
+        # Phase-1 evidence (2026-06-11) showed run #15 errored mid-loop on
+        # a single ``Supplier/Advert/View?advertId=...`` ERR_ABORTED, losing
+        # 200+ later rows. Per-advert navigation failures must NOT kill the
+        # whole run — log them, count them, continue. The deeper Phase-2
+        # work (richer retry / backoff) lands separately.
+        details_skipped: list[str] = []
         with db_factory() as db:
             for row in listing_rows:
                 if config.skip_detail_for_known and _already_seen(db, row.advert_id):
                     # Touch last_seen_at via the same upsert path; we just
                     # don't hit the detail page.
                     continue
-                detail = await _read_detail(bridge, row)
+                try:
+                    detail = await _read_detail(bridge, row)
+                except BridgeError as exc:
+                    details_skipped.append(row.advert_id)
+                    logger.warning(
+                        "discovery.proactis.detail_read_failed",
+                        advert_id=row.advert_id,
+                        error=str(exc),
+                    )
+                    continue
                 if not detail.is_complete_for_dedup():
                     logger.warning(
                         "discovery.proactis.detail_missing_dn",
@@ -262,6 +277,12 @@ async def run(
                 if deduped:
                     result.opportunities_deduped += 1
                 db.commit()
+        if details_skipped:
+            logger.info(
+                "discovery.proactis.details_skipped_summary",
+                count=len(details_skipped),
+                first_advert_ids=details_skipped[:5],
+            )
 
     except NeedsLoginError:
         result.status = "needs_login"

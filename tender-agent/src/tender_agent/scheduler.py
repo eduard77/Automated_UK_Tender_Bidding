@@ -2,16 +2,17 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from tender_agent.adapters import ADAPTERS
 from tender_agent.config import settings
 from tender_agent.db import SessionLocal
-from tender_agent.models import Source
+from tender_agent.models import PollRun, Source
 from tender_agent.services.discovery.proactis_discovery import (
     run as run_proactis_discovery,
 )
@@ -20,6 +21,12 @@ from tender_agent.services.discovery.proactis_filter_config import (
 )
 from tender_agent.services.email.poller import poll_all_mailboxes
 from tender_agent.services.ingestion import poll_source
+
+#: Mark `running` PollRuns as orphaned after this long without a finish.
+#: A successful HTTP source finishes in seconds; the slowest (Proactis
+#: browser discovery) finishes in single-digit minutes. 90 minutes
+#: comfortably exceeds even a stuck Proactis cycle without false-positives.
+ORPHAN_POLL_RUN_AFTER = timedelta(minutes=90)
 
 logger = structlog.get_logger(__name__)
 _scheduler: AsyncIOScheduler | None = None
@@ -78,11 +85,84 @@ def ensure_sources() -> None:
         db.commit()
 
 
+def _orphan_stale_running_runs(db) -> int:
+    """Mark PollRuns left in `running` past the orphan deadline as errored.
+
+    A worker restart mid-poll, or a Proactis cycle that hung past the
+    bridge timeout, leaves rows reading "running" indefinitely — they
+    skew the sources-health diagnosis and the operator's "is the
+    scheduler stuck?" question. Best-effort cleanup at the start of every
+    poll cycle. Never raises (logged-and-swallowed)."""
+    cutoff = datetime.now(UTC) - ORPHAN_POLL_RUN_AFTER
+    try:
+        result = db.execute(
+            update(PollRun)
+            .where(PollRun.status == "running")
+            .where(PollRun.started_at < cutoff)
+            .values(
+                status="error",
+                error=f"orphaned (no finished_at after {cutoff.isoformat()})",
+                finished_at=datetime.now(UTC),
+            )
+        )
+        db.commit()
+        return int(getattr(result, "rowcount", 0) or 0)
+    except Exception:  # noqa: BLE001
+        logger.exception("scheduler.orphan_cleanup_failed")
+        return 0
+
+
 async def poll_all() -> None:
-    """Poll every enabled source sequentially."""
+    """Poll every enabled source sequentially.
+
+    Self-heals scheduling at the top of every cycle (`ensure_sources()`):
+    a new adapter wired in after the previous boot gets its Source row
+    here, so it joins the very next cycle instead of waiting for a
+    redeploy. The per-iteration `scheduler.poll_source_attempt` log line
+    makes the "did we even try to poll X?" question answerable from the
+    Azure Log stream — without it, a source skipped by the iteration was
+    indistinguishable from one whose poll finished cleanly with zero rows.
+    """
+    # Self-heal: ensure every registered adapter has a Source row at the
+    # start of every cycle. Idempotent and cheap; covers the boot-order
+    # case where ensure_sources() ran before a new adapter was registered.
+    ensure_sources()
     with SessionLocal() as db:
-        sources = db.execute(select(Source).where(Source.enabled.is_(True))).scalars().all()
+        orphaned = _orphan_stale_running_runs(db)
+        if orphaned:
+            logger.info(
+                "scheduler.poll_runs_orphaned",
+                count=orphaned,
+                cutoff_minutes=ORPHAN_POLL_RUN_AFTER.total_seconds() // 60,
+            )
+        sources = (
+            db.execute(
+                select(Source)
+                .where(Source.enabled.is_(True))
+                .order_by(Source.id)
+            )
+            .scalars()
+            .all()
+        )
+        registered = list(ADAPTERS)
+        logger.info(
+            "scheduler.poll_all_starting",
+            source_count=len(sources),
+            source_codes=[s.code for s in sources],
+            registered_adapters=registered,
+        )
         for source in sources:
+            adapter_in_registry = source.code in ADAPTERS
+            logger.info(
+                "scheduler.poll_source_attempt",
+                source=source.code,
+                has_adapter=adapter_in_registry,
+            )
+            if not adapter_in_registry:
+                # Source rows for browser-driven flows (PROACTIS) live on
+                # their own job; skip them here without raising, so the
+                # iteration always reaches the HTTP adapters below.
+                continue
             try:
                 await poll_source(db, source)
             except Exception:  # noqa: BLE001

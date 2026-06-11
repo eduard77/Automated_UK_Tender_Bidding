@@ -94,6 +94,9 @@ class PCSAdapter(SourceAdapter):
                 payload = await self._get_json(url, params=params)
             except Exception as exc:
                 self.had_errors = True
+                self.record_error(
+                    f"{params['dateFrom']}: {type(exc).__name__}: {exc}"
+                )
                 logger.error(
                     "pcs.fetch_failed",
                     error=str(exc),
