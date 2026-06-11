@@ -2,7 +2,7 @@
 diagnostic, offline.
 
 In-memory SQLite stands in for Postgres; the auth dependency is overridden
-the same way the other admin-diagnostic tests do. Pins the four diagnosis
+the same way the other admin-diagnostic tests do. Pins the FIVE diagnosis
 classes the endpoint maps the harness's failure modes onto:
 
   never_polled            — Source row exists, no PollRun ever (scheduler /
@@ -10,9 +10,11 @@ classes the endpoint maps the harness's failure modes onto:
   fetch_failing           — newest run errored (the error string then says
                             403 vs 500 vs DNS)
   polling_but_zero_rows   — clean runs, zero tenders (the watermark-trap /
-                            format class this phase fixed for EU-Supply
-                            and Atamis)
-  healthy                 — clean runs, rows present
+                            format class)
+  stale_not_polling       — newest run is clean but finished many poll
+                            intervals ago (added 2026-06-11 rev 3 after a
+                            "healthy"-but-9-days-old readout)
+  healthy                 — recent clean runs, rows present
 """
 from __future__ import annotations
 
@@ -148,6 +150,92 @@ def test_health_runs_are_newest_first_and_capped(client, factory) -> None:
     assert len(fts["latest_runs"]) == 3  # POLL_RUNS_PER_SOURCE
     fetched = [r["fetched"] for r in fts["latest_runs"]]
     assert fetched == [4, 3, 2]  # newest first
+
+
+def test_health_newest_ok_run_beats_older_errored_run(client, factory) -> None:
+    """Phase-1 rev 3 regression: when the NEWEST run is "ok" but an
+    older run still has an error string, the source must NOT be
+    reported `fetch_failing`. The 2026-06-11 12:52Z PROACTIS readout
+    tripped this exact case under the old `any(r.error for r in runs)`
+    rule."""
+    with factory() as db:
+        src = Source(code="PROACTIS", name="Proactis", base_url="x", enabled=True)
+        db.add(src)
+        db.commit()
+        db.add_all(
+            [
+                # Older errored run.
+                PollRun(
+                    source_id=src.id,
+                    started_at=NOW - timedelta(minutes=60),
+                    finished_at=NOW - timedelta(minutes=58),
+                    status="error",
+                    error="BridgeError: ERR_ABORTED on advertId=...",
+                ),
+                # Newest clean run.
+                PollRun(
+                    source_id=src.id,
+                    started_at=NOW - timedelta(minutes=10),
+                    finished_at=NOW - timedelta(minutes=9),
+                    status="ok",
+                    fetched=200,
+                    new_count=61,
+                ),
+            ]
+        )
+        db.add(
+            Tender(
+                source_code="PROACTIS",
+                source_ref="p-1",
+                title="t",
+                first_seen_at=NOW,
+                last_seen_at=NOW,
+            )
+        )
+        db.commit()
+    body = client.get("/admin/diagnostics/sources-health").json()
+    proactis = next(s for s in body["sources"] if s["code"] == "PROACTIS")
+    assert proactis["diagnosis"] == "healthy"
+
+
+def test_health_stale_when_newest_run_finished_long_ago(client, factory) -> None:
+    """Phase-1 rev 3: a "healthy" source whose newest run finished N
+    poll-intervals ago is actually stale — the scheduler isn't
+    firing. The 2026-06-11 12:52Z readout had CF/FTS/PCS reading
+    healthy with newest-run timestamps from 2026-06-02 (nine days
+    earlier across a 30-min interval)."""
+    from tender_agent.api.admin_diagnostics import STALE_POLL_FACTOR
+    from tender_agent.config import settings
+
+    interval = settings.poll_interval_minutes
+    stale_after = timedelta(minutes=interval * STALE_POLL_FACTOR)
+    with factory() as db:
+        src = Source(code="CF", name="Contracts Finder", base_url="x", enabled=True)
+        db.add(src)
+        db.commit()
+        finished = NOW - stale_after - timedelta(minutes=10)
+        db.add(
+            PollRun(
+                source_id=src.id,
+                started_at=finished - timedelta(minutes=1),
+                finished_at=finished,
+                status="ok",
+                fetched=4541,
+            )
+        )
+        db.add(
+            Tender(
+                source_code="CF",
+                source_ref="cf-1",
+                title="t",
+                first_seen_at=NOW,
+                last_seen_at=NOW,
+            )
+        )
+        db.commit()
+    body = client.get("/admin/diagnostics/sources-health").json()
+    cf = next(s for s in body["sources"] if s["code"] == "CF")
+    assert cf["diagnosis"] == "stale_not_polling"
 
 
 def test_health_rejects_anonymous(factory) -> None:

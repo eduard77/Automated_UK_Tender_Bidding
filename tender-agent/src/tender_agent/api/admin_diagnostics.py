@@ -13,7 +13,7 @@ session-test admin endpoints are — an anonymous caller gets 401.
 """
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
@@ -21,6 +21,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from tender_agent.api.deps import require_account
+from tender_agent.config import settings
 from tender_agent.db import get_db
 from tender_agent.diagnostics.cf_survey import (
     DEFAULT_SOURCES,
@@ -167,16 +168,59 @@ class SourcesHealthResponse(BaseModel):
     sources: list[SourceHealthRead]
 
 
+#: If the newest poll run finished more than this many poll-intervals ago
+#: the source is `stale_not_polling`. The 2026-06-11 12:52Z readout showed
+#: CF/FTS/PCS reading "healthy" with newest-run timestamps from 2026-06-02
+#: — nine days stale, the scheduler had not actually fired since. Four
+#: intervals is conservative (a 30-min poll = a 2-hour grace) so a single
+#: missed cycle never trips the flag.
+STALE_POLL_FACTOR = 4
+
+
+def _coerce_aware(value: datetime | None) -> datetime | None:
+    """SQLite drops tzinfo on round-trip; treat naive datetimes as UTC."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value
+
+
 def _diagnose(
-    tender_count: int, runs: list[PollRun], enabled: bool
+    tender_count: int,
+    runs: list[PollRun],
+    enabled: bool,
+    *,
+    now: datetime,
 ) -> str:
+    """Map per-source observed state onto the harness failure classes.
+
+    Order matters here — every branch is decided on `runs[0]`, the
+    newest run, NOT a soft "did ANY run error" predicate. The previous
+    `any(r.error for r in runs)` rule tripped fetch_failing for sources
+    whose newest run was clean (the 2026-06-11 12:52Z readout showed
+    PROACTIS reading fetch_failing despite its newest run being status
+    "ok" — an older orphaned-then-errored run was the trip).
+
+    `stale_not_polling` is new: a "healthy" source whose newest run is
+    multiple poll intervals old means the scheduler itself isn't
+    firing, not that the source is healthy. The CF/FTS/PCS case in the
+    same readout had nine-day-old runs reading "healthy".
+    """
     if not enabled:
         return "disabled"
     if not runs:
         return "never_polled"
     newest = runs[0]
-    if newest.status == "error" or any(r.error for r in runs):
+    if newest.status == "error":
         return "fetch_failing"
+    finished_at = _coerce_aware(newest.finished_at)
+    if finished_at is not None:
+        stale_after = timedelta(
+            minutes=settings.poll_interval_minutes * STALE_POLL_FACTOR
+        )
+        if now - finished_at > stale_after:
+            return "stale_not_polling"
     if tender_count == 0:
         return "polling_but_zero_rows"
     return "healthy"
@@ -240,7 +284,12 @@ def sources_health(db: Session = Depends(get_db)) -> SourcesHealthResponse:
                     )
                     for r in runs
                 ],
-                diagnosis=_diagnose(tender_count, list(runs), bool(source.enabled)),
+                diagnosis=_diagnose(
+                    tender_count,
+                    list(runs),
+                    bool(source.enabled),
+                    now=now,
+                ),
             )
         )
     return SourcesHealthResponse(

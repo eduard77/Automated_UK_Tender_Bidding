@@ -15,11 +15,9 @@ from tender_agent.models import FilterMatch, PollRun, Source, Tender
 from tender_agent.schemas import NormalisedTender
 from tender_agent.services import filter_engine, push
 from tender_agent.services.deduplicator import find_duplicate
-from tender_agent.services.document_downloader import download_documents_for_tender
 from tender_agent.services.portal_classifier import schedule_classification
 from tender_agent.services.portal_discovery import process_tender_for_portals
 from tender_agent.services.regions import resolve_for_tender
-from tender_agent.services.requirements_extractor import extract_requirements
 
 logger = structlog.get_logger(__name__)
 
@@ -117,20 +115,6 @@ def _record_filter_matches(db: Session, tender: Tender) -> list[int]:
     return new_profile_ids
 
 
-async def _enrich_matched_tender(db: Session, tender: Tender) -> None:
-    """Download docs and extract requirements for a matched tender. Best-effort."""
-    try:
-        await download_documents_for_tender(db, tender)
-    except Exception:  # noqa: BLE001
-        logger.exception("enrich.download_failed", tender_id=tender.id)
-    try:
-        # Refresh document_files relationship
-        db.refresh(tender)
-        extract_requirements(db, tender)
-    except Exception:  # noqa: BLE001
-        logger.exception("enrich.extract_failed", tender_id=tender.id)
-
-
 async def poll_source(db: Session, source: Source) -> PollRun:
     """Run one polling cycle for the given source."""
     adapter_cls = ADAPTERS.get(source.code)
@@ -174,17 +158,24 @@ async def poll_source(db: Session, source: Source) -> PollRun:
                 db.commit()
                 for portal_id in queued_portal_ids:
                     schedule_classification(portal_id)
-                # Enrich matched tenders with documents + requirements, then dispatch
-                # push notifications for the newly created matches. Push is
-                # best-effort; failures are logged in services/push and never
-                # raised, so a dead subscriber can't break ingestion.
+                # Dispatch push notifications for new matches immediately.
+                # Document download + Anthropic requirements extraction used
+                # to run HERE in-line; the live 2026-06-11 Log stream showed
+                # that consumed the whole poll interval on FTS alone and
+                # starved late-list sources (EU_SUPPLY/PROACTIS/ATAMIS) from
+                # ever being reached. Enrichment now happens out-of-band in
+                # services.enrichment_worker.process_pending_enrichment, on
+                # its own scheduler interval. Push is best-effort; failures
+                # are logged in services/push and never raised, so a dead
+                # subscriber can't break ingestion.
                 if matched_profile_ids:
-                    try:
-                        await _enrich_matched_tender(db, tender)
-                    except Exception:  # noqa: BLE001
-                        logger.exception("ingest.enrich_failed", tender_id=tender.id)
                     push.send_match_notifications(db, tender, matched_profile_ids)
                     db.commit()
+                    logger.info(
+                        "ingest.enrichment_deferred",
+                        tender_id=tender.id,
+                        match_count=len(matched_profile_ids),
+                    )
             had_errors = bool(getattr(adapter, "had_errors", False))
             adapter_errors = list(getattr(adapter, "error_messages", []) or [])
         if had_errors:

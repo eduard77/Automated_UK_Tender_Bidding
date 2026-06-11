@@ -20,6 +20,7 @@ from tender_agent.services.discovery.proactis_filter_config import (
     ProactisFilterConfig,
 )
 from tender_agent.services.email.poller import poll_all_mailboxes
+from tender_agent.services.enrichment_worker import process_pending_enrichment
 from tender_agent.services.ingestion import poll_source
 
 #: Mark `running` PollRuns as orphaned after this long without a finish.
@@ -51,6 +52,26 @@ async def proactis_discovery_job() -> None:
         await run_proactis_discovery(config=config)
     except Exception:  # noqa: BLE001
         logger.exception("scheduler.proactis_discovery_failed")
+
+
+async def enrichment_worker_job() -> None:
+    """Background per-tender enrichment cycle (Phase-1 rev 3, 2026-06-11).
+
+    Picks up matched-but-unenriched tenders from the implicit queue
+    and runs PDF download + Anthropic requirements extraction off the
+    polling hot path. Bounded by `enrichment_worker_batch_size` so a
+    cycle terminates in predictable time even when a backlog has
+    built up. Exceptions are logged and swallowed so a bad cycle can't
+    trip-line the job queue."""
+    if not settings.enrichment_worker_enabled:
+        return
+    try:
+        with SessionLocal() as db:
+            await process_pending_enrichment(
+                db, limit=settings.enrichment_worker_batch_size
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception("scheduler.enrichment_worker_failed")
 
 
 async def email_poll_job() -> None:
@@ -218,6 +239,26 @@ def start() -> None:
         logger.info(
             "scheduler.email_poll_scheduled",
             interval_minutes=settings.email_poll_interval_minutes,
+        )
+    # Enrichment worker — Phase-1 rev 3 (2026-06-11). Runs on its own
+    # interval so the polling hot path is never blocked behind PDF
+    # downloads + Anthropic extraction. Same coalesce / max_instances
+    # safety as the other jobs.
+    if settings.enrichment_worker_enabled:
+        _scheduler.add_job(
+            enrichment_worker_job,
+            trigger=IntervalTrigger(
+                minutes=settings.enrichment_worker_interval_minutes
+            ),
+            id="enrichment_worker",
+            next_run_time=None,
+            coalesce=True,
+            max_instances=1,
+        )
+        logger.info(
+            "scheduler.enrichment_worker_scheduled",
+            interval_minutes=settings.enrichment_worker_interval_minutes,
+            batch_size=settings.enrichment_worker_batch_size,
         )
     _scheduler.start()
     logger.info("scheduler.started", interval_minutes=settings.poll_interval_minutes)
