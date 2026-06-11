@@ -9,7 +9,7 @@ previous phase being marked DONE.
 | Phase | Title                                                       | Verdict       | Date       | Notes                                                                |
 | ----- | ----------------------------------------------------------- | ------------- | ---------- | -------------------------------------------------------------------- |
 | 0     | Reusable dashboard bot                                      | **PASS** (CI) | 2026-06-11 | Unit-test gate green; live gate is the operator's runbook below.     |
-| 1     | Get the silent sources pulling (Atamis, EU-Supply, Sell2Wales) | not started   | —          | Phase 0 must clear the live gate first.                              |
+| 1     | Get the silent sources pulling (Atamis, EU-Supply, Sell2Wales) | **IN PROGRESS** | 2026-06-11 | Watermark trap fixed + health endpoint shipped; gate awaits live evidence (see Phase 1 section). |
 | 2     | Fix run-15-class discovery errors                           | not started   | —          |                                                                      |
 | 3     | Cross-source CPV/field normalisation (the spine)            | not started   | —          | Likely NEEDS DECISION when reached.                                  |
 | 4     | Keyword/value/buyer filters as first-class                  | not started   | —          |                                                                      |
@@ -111,8 +111,76 @@ as the diagnostic and patch from there (same loop as the Proactis chain).
 **PASS (CI gate cleared)**: unit tests green; live gate is the operator's
 one-command run above. Once the live gate is also clear, Phase 1 begins.
 
+## Phase 1 — IN PROGRESS (2026-06-11): diagnosis + first fixes shipped
+
+### What the diagnosis found (statically provable, no live access needed)
+
+1. **All three adapters ARE registered** (`ADAPTERS` has S2W, EU_SUPPLY,
+   ATAMIS) → Source rows auto-created at boot, scheduler polls them. Not a
+   registration failure.
+2. **The watermark trap (EU_SUPPLY + ATAMIS) — found and fixed.**
+   `poll_source` advances `source.last_polled_at = now` after every clean
+   poll, even with zero rows. Both listing-only adapters post-filtered rows
+   by `published >= since` — but their listings show CURRENTLY-OPEN
+   tenders whose publication/Opens dates are often weeks old. Net effect:
+   first 7-day-lookback poll dropped most rows, watermark advanced, every
+   subsequent ~30-minute window dropped ALL rows, status "ok" — silent
+   forever. **Fix:** listing-only adapters now RECONCILE the whole listed
+   set every sweep (no since-drop); idempotency comes from the upsert
+   change-hash; Atamis stays bounded by ATAMIS_MAX_PAGES. The two
+   adapters' cutoff tests are deliberately REVERSED to pin the new
+   contract.
+3. **S2W:** request shape is byte-identical to the WORKING PCS adapter
+   (same upstream codebase) — no static drift. Its docstring documents the
+   known upstream HTTP-500 ("Error converting data type nvarchar to
+   float"). Whether the live failure is that 500 or an egress 403 is
+   exactly one error-string away (below).
+4. **External probes:** S2W API, EU-Supply, Atamis all 403 this
+   environment's egress (both paths) — expected datacenter blocking;
+   says nothing about Azure's egress. Live evidence required.
+
+### What shipped
+
+- `eu_supply.py` + `atamis.py`: reconcile semantics (the trap fix), with
+  dated WHY-comments; cutoff tests reversed to pin the new contract.
+- **`GET /admin/diagnostics/sources-health`** (require_account,
+  read-only): per source — enabled, watermark, tender_count, latest 3
+  PollRuns with their error strings, and a coarse `diagnosis` field
+  (`never_polled` / `fetch_failing` / `polling_but_zero_rows` /
+  `healthy`). This is the Azure Log stream in one URL. 3 offline tests.
+- `tests/e2e/specs/phase-1.yaml` — the bot gate (each source in the facet
+  with >0 rows), ready to run once evidence-driven fixes complete.
+- `docs/accounts-needed.md`: NEPO recorded (handover §7.3 — separate
+  platform, manual registration) + the standing email-OAuth setup item.
+
+### Why not PASS yet
+
+The phase's bot check needs the deployed fix + a live poll cycle + the
+live bot run — none reachable from this environment (the backend and
+dashboard 403 the sandbox). The remaining unknown (is Azure's egress
+403'd by eu-supply.com / atamis / api.sell2wales?) is one click away.
+
+### Next single action (operator, browser)
+
+1. Merge the Phase-1 PR → auto-deploy → wait one poll cycle (~30 min, or
+   re-fire `POST /admin/poll-now`).
+2. Open `GET /admin/diagnostics/sources-health` on /docs and read the
+   three sources' `diagnosis`:
+   - `healthy` → run the bot gate: `python -m tests.e2e.dashboard_bot
+     tests/e2e/specs/phase-1.yaml` → paste the report → Phase 1 flips to
+     PASS (and phase-0-self.yaml spec 4 flips too).
+   - `fetch_failing` with a 403-ish error → paste the JSON; next run wires
+     that source's fetch through the disguised in-process bridge (the
+     established pattern — no re-investigation).
+   - `fetch_failing` with the S2W 500 → paste the JSON; we decide between
+     a param change (if the error suggests one) and an upstream-bug
+     BLOCKED entry.
+
 ## Next single action
 
-Operator: run the command above against the live dashboard. Once the
-report comes back all-pass (or with only OBSERVED_GAPs that match the
-YAML), open the next harness run; I'll attempt Phase 1.
+Operator: follow Phase 1's three-step readout above (merge → one poll
+cycle → read `GET /admin/diagnostics/sources-health`, then either run
+the phase-1 bot gate or paste the JSON). Phase 0's live self-check
+(`python -m tests.e2e.dashboard_bot tests/e2e/specs/phase-0-self.yaml`)
+can be run in the same sitting — both YAMLs from one residential-IP
+session.

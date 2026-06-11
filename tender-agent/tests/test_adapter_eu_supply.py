@@ -43,21 +43,27 @@ async def test_fetch_since_yields_normalised_tenders() -> None:
         assert t.status == "active"
 
 
-async def test_fetch_since_respects_cutoff() -> None:
-    """Pattern 2: EU-Supply post-filters by publication date. All 5 rows are
-    published 08/06/2026 at different times; a 14:00 cutoff keeps the 3 later
-    ones and drops the 2 earlier ones."""
+async def test_fetch_since_ignores_cutoff_by_design() -> None:
+    """Pattern 2, REVERSED on purpose (Phase-1 silent-source fix,
+    2026-06-11): EU-Supply's listing shows currently-OPEN tenders whose
+    publication date is often older than any poll window, and poll_source
+    advances the watermark to `now` after every clean poll — so the old
+    `published >= since` drop starved this source to zero rows forever.
+    Listing-only adapters now RECONCILE the whole current listing every
+    sweep; idempotency comes from the upsert change-hash, not the cutoff.
+    A cutoff AFTER every fixture row's publication time must still yield
+    all five rows."""
     html = load_text_fixture(FIXTURE)
     adapter = _adapter(static_text_handler(html, content_type="text/html"))
 
-    cutoff = datetime(2026, 6, 8, 14, 0, tzinfo=UTC)
+    cutoff = datetime(2026, 6, 9, 0, 0, tzinfo=UTC)  # later than all 5 rows
     tenders = await collect(adapter, cutoff)
 
     refs = {t.source_ref for t in tenders}
-    assert refs == {"100111328", "100111094", "100111290"}
-    for t in tenders:
-        assert t.published_at is not None
-        assert t.published_at >= cutoff
+    assert len(tenders) == 5
+    assert {"100111328", "100111094", "100111290"} <= refs
+    # published_at is still PARSED and stored — only the drop is gone.
+    assert all(t.published_at is not None for t in tenders)
 
 
 async def test_normalisation_of_known_fields() -> None:
