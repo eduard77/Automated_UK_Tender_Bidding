@@ -53,21 +53,24 @@ async def test_fetch_since_yields_normalised_tenders() -> None:
 # --- pattern 2: cutoff (post-filtering adapter) -------------------------------
 
 
-async def test_fetch_since_respects_cutoff() -> None:
-    """Two captured rows have Opens in 2022/2024 (re-published frameworks);
-    a 2026 cutoff filters them, the other eight pass. The walk does NOT stop
-    at the first old row — Recently Published ordering is not monotonic on
-    Opens (these old rows sit mid-page on the real capture)."""
+async def test_fetch_since_ignores_cutoff_by_design() -> None:
+    """Pattern 2, REVERSED on purpose (Phase-1 silent-source fix,
+    2026-06-11): poll_source advances the source watermark to `now` after
+    every clean poll, so the old Opens-based drop left only a ~30-minute
+    window after the first cycle — starving the source. Each sweep now
+    RECONCILES the newest pages (bounded by ATAMIS_MAX_PAGES); idempotency
+    comes from the upsert change-hash. The two re-published 2022/2024 rows
+    on the real capture must now be KEPT alongside the other eight."""
     html = load_text_fixture(FIXTURE)
     adapter = _adapter(static_text_handler(html, content_type="text/html"))
 
     tenders = await collect(adapter, datetime(2026, 1, 1, tzinfo=UTC))
 
     refs = {t.procurement_ref for t in tenders}
-    assert len(tenders) == 8
-    assert "C452691" not in refs  # Opens 02/05/2022
-    assert "C445365" not in refs  # Opens 25/06/2024
-    assert "C449892" in refs      # Opens 03/06/2026 — later in the page
+    assert len(tenders) == 10
+    assert "C452691" in refs  # Opens 02/05/2022 — re-published, still open
+    assert "C445365" in refs  # Opens 25/06/2024 — re-published, still open
+    assert "C449892" in refs  # Opens 03/06/2026
 
 
 # --- pattern 3: exact field mapping on one known row ---------------------------

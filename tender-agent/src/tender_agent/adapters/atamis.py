@@ -36,8 +36,12 @@ could not be live-verified from CI — the site 403s datacenter IPs): only
 page=1 was captured; if page=2 ever responds with page 1's content the
 identical-uids guard below stops the walk rather than looping. Opens dates
 are NOT monotonic under this sort (real page 1 carries 2022 rows
-re-published), so we never early-stop on the date — the page cap +
-`atamis_max_pages` bounds the walk and `fetch_since` post-filters on Opens.
+re-published), so we never early-stop on the date — the page cap
+(`atamis_max_pages`) bounds the walk. There is deliberately NO
+since-based post-filter either (Phase-1 diagnosis, 2026-06-11): the
+poll watermark advances to `now` each clean cycle, which starved the
+old Opens cutoff to a ~30-minute window — each sweep RECONCILES the
+newest pages and relies on the upsert change-hash for idempotency.
 
 FilterProfile push-down: NONE of CPV / region / keyword is pushed source-side
 — the listing's filter controls are JSF postbacks needing live ViewState (not
@@ -171,8 +175,15 @@ class AtamisAdapter(SourceAdapter):
     async def fetch_since(
         self, since: datetime
     ) -> AsyncIterator[NormalisedTender]:
-        if since.tzinfo is None:
-            since = since.replace(tzinfo=UTC)
+        # `since` is part of the SourceAdapter interface but deliberately
+        # unused here (Phase-1 diagnosis, 2026-06-11): poll_source advances
+        # the source watermark to `now` after every clean poll, so an
+        # Opens-based cutoff meant only tenders OPENING inside the
+        # ~30-minute poll window could ever land after the first cycle —
+        # the silent-source symptom. Listing-only adapters RECONCILE the
+        # newest pages instead; `_upsert_tender`'s change-hash makes
+        # re-yields idempotent and ATAMIS_MAX_PAGES bounds each sweep.
+        del since
 
         # FilterProfile dimensions we deliberately do NOT push source-side —
         # the Visualforce filter controls need live JSF ViewState. Logged so
@@ -206,7 +217,7 @@ class AtamisAdapter(SourceAdapter):
                 new_on_page = 0
                 for row_html in rows:
                     try:
-                        tender = self._row_to_tender(row_html, host, since)
+                        tender = self._row_to_tender(row_html, host)
                     except _SkipRowError:
                         continue
                     except Exception as exc:  # noqa: BLE001 - one bad row mustn't stop the sweep
@@ -241,7 +252,7 @@ class AtamisAdapter(SourceAdapter):
                 page += 1
 
     def _row_to_tender(
-        self, row_html: str, host: str, since: datetime
+        self, row_html: str, host: str
     ) -> NormalisedTender | None:
         anchor = _TITLE_ANCHOR_RE.search(row_html)
         if anchor is None:
@@ -265,11 +276,7 @@ class AtamisAdapter(SourceAdapter):
             for label, value in _DYN_SPAN_RE.findall(row_html)
         }
         published = _parse_dt(labels.get("Opens", ""))
-        if published is not None and published < since:
-            # Post-filter only — "Recently Published" ordering is NOT
-            # monotonic on Opens (verified on the captured page), so we skip
-            # this row but keep walking.
-            return None
+        # No Opens-based drop — see the reconcile note in fetch_since.
 
         return NormalisedTender(
             source_code=self.code,

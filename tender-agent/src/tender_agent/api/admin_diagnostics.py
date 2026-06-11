@@ -13,8 +13,11 @@ session-test admin endpoints are — an anonymous caller gets 401.
 """
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from tender_agent.api.deps import require_account
@@ -24,6 +27,7 @@ from tender_agent.diagnostics.cf_survey import (
     iter_classified,
     summarise,
 )
+from tender_agent.models import PollRun, Source, Tender
 
 router = APIRouter(
     prefix="/admin/diagnostics",
@@ -112,4 +116,133 @@ def cf_onward_routes_survey(
             for portal, count in summary.direct_portal_breakdown
         ],
         sample=sample,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Source-ingestion health — the "Log stream in one URL" diagnostic
+# (Phase 1 of the build harness: why are Atamis / EU-Supply / Sell2Wales
+# silent? The answer lives in each source's latest PollRuns, which only the
+# Azure Log stream used to show.)
+# ---------------------------------------------------------------------------
+
+#: Most recent poll runs echoed per source. Three is enough to tell
+#: "always erroring" from "flapping" from "never ran".
+POLL_RUNS_PER_SOURCE = 3
+
+
+class PollRunRead(BaseModel):
+    """One poll attempt, newest first."""
+
+    started_at: str
+    finished_at: str | None
+    status: str  # "running" | "ok" | "error"
+    fetched: int
+    new_count: int
+    updated_count: int
+    error: str | None
+
+
+class SourceHealthRead(BaseModel):
+    """Everything needed to diagnose ONE source's silence at a glance.
+
+    `diagnosis` is a coarse machine-made hint mapping the observed state
+    onto the harness's failure classes: "never_polled" (scheduler /
+    registration), "fetch_failing" (upstream errors — the error string
+    says whether it's a 403 datacenter block, a 500, or DNS), "polling_
+    but_zero_rows" (fetch fine, nothing yielded — filter/format problem),
+    or "healthy"."""
+
+    code: str
+    name: str
+    enabled: bool
+    last_polled_at: str | None
+    tender_count: int
+    latest_runs: list[PollRunRead]
+    diagnosis: str
+
+
+class SourcesHealthResponse(BaseModel):
+    generated_at: str
+    sources: list[SourceHealthRead]
+
+
+def _diagnose(
+    tender_count: int, runs: list[PollRun], enabled: bool
+) -> str:
+    if not enabled:
+        return "disabled"
+    if not runs:
+        return "never_polled"
+    newest = runs[0]
+    if newest.status == "error" or any(r.error for r in runs):
+        return "fetch_failing"
+    if tender_count == 0:
+        return "polling_but_zero_rows"
+    return "healthy"
+
+
+@router.get("/sources-health", response_model=SourcesHealthResponse)
+def sources_health(db: Session = Depends(get_db)) -> SourcesHealthResponse:
+    """Per-source ingestion health: enabled flag, watermark, tender count,
+    the latest poll runs (status + error strings), and a coarse diagnosis.
+
+    READ-ONLY. This is the browser-accessible version of "open the Log
+    stream and grep for atamis/eu_supply/sell2wales" — the operator clicks
+    once on /docs and pastes the JSON back. The `error` strings are the
+    adapters' own exception texts (an upstream 403 vs 500 vs DNS failure
+    reads directly off them)."""
+    sources = (
+        db.execute(select(Source).order_by(Source.code)).scalars().all()
+    )
+    out: list[SourceHealthRead] = []
+    now = datetime.now(UTC)
+    for source in sources:
+        runs = (
+            db.execute(
+                select(PollRun)
+                .where(PollRun.source_id == source.id)
+                .order_by(PollRun.started_at.desc())
+                .limit(POLL_RUNS_PER_SOURCE)
+            )
+            .scalars()
+            .all()
+        )
+        tender_count = int(
+            db.execute(
+                select(func.count(Tender.id)).where(
+                    Tender.source_code == source.code
+                )
+            ).scalar_one()
+        )
+        out.append(
+            SourceHealthRead(
+                code=source.code,
+                name=source.name,
+                enabled=bool(source.enabled),
+                last_polled_at=(
+                    source.last_polled_at.isoformat()
+                    if source.last_polled_at
+                    else None
+                ),
+                tender_count=tender_count,
+                latest_runs=[
+                    PollRunRead(
+                        started_at=r.started_at.isoformat(),
+                        finished_at=(
+                            r.finished_at.isoformat() if r.finished_at else None
+                        ),
+                        status=r.status,
+                        fetched=r.fetched,
+                        new_count=r.new_count,
+                        updated_count=r.updated_count,
+                        error=r.error,
+                    )
+                    for r in runs
+                ],
+                diagnosis=_diagnose(tender_count, list(runs), bool(source.enabled)),
+            )
+        )
+    return SourcesHealthResponse(
+        generated_at=now.isoformat(), sources=out
     )

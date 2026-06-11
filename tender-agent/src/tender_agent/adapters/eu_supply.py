@@ -142,8 +142,9 @@ class EUSupplyAdapter(SourceAdapter):
     async def fetch_since(
         self, since: datetime
     ) -> AsyncIterator[NormalisedTender]:
-        if since.tzinfo is None:
-            since = since.replace(tzinfo=UTC)
+        # `since` is part of the SourceAdapter interface but deliberately
+        # unused here — see the reconcile note in `_row_to_tender`.
+        del since
 
         for host in self._portals:
             host = host.rstrip("/")
@@ -159,7 +160,7 @@ class EUSupplyAdapter(SourceAdapter):
             rows = _ROW_RE.findall(body.group(1) if body else html)
             for row_html in rows:
                 try:
-                    tender = self._row_to_tender(row_html, host, since)
+                    tender = self._row_to_tender(row_html, host)
                 except _SkipRowError:
                     continue
                 except Exception as exc:  # noqa: BLE001 - one bad row mustn't stop the sweep
@@ -169,7 +170,7 @@ class EUSupplyAdapter(SourceAdapter):
                     yield tender
 
     def _row_to_tender(
-        self, row_html: str, host: str, since: datetime
+        self, row_html: str, host: str
     ) -> NormalisedTender | None:
         cells = _CELL_RE.findall(row_html)
         if len(cells) < _MIN_COLS:
@@ -181,8 +182,15 @@ class EUSupplyAdapter(SourceAdapter):
             raise _SkipRowError
 
         published = _parse_dt(_cell_value(cells[COL_PUBLISHED]))
-        if published is not None and published < since:
-            return None
+        # DELIBERATELY no `published < since` drop (Phase-1 diagnosis,
+        # 2026-06-11): this listing shows CURRENTLY-OPEN tenders whose
+        # publication date is often weeks old. poll_source advances the
+        # source watermark to `now` after every clean poll — so a cutoff
+        # here meant the first 7-day-lookback poll dropped almost
+        # everything, and every subsequent ~30-minute window dropped ALL of
+        # it, status "ok", zero rows forever (the silent-source symptom).
+        # Listing-only adapters RECONCILE the current listing instead;
+        # `_upsert_tender`'s change-hash makes re-yields idempotent.
 
         reference = _cell_value(cells[COL_REFERENCE]) or None
 

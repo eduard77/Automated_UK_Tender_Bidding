@@ -1,0 +1,54 @@
+# Phase 1 gate — "the silent sources pull": each fixed source appears in
+# the dashboard with >0 rows.
+#
+# Run AFTER the Phase-1 fixes deploy and at least one 30-minute poll cycle
+# has completed (or after re-firing a poll). From a residential IP:
+#
+#   python -m tests.e2e.dashboard_bot tests/e2e/specs/phase-1.yaml
+#
+# If a source still shows nothing, read
+# GET /admin/diagnostics/sources-health first — its `diagnosis` +
+# `latest_runs[].error` strings say which failure class remains
+# (fetch_failing with a 403 → the disguised-bridge fix; see
+# docs/build-progress.md Phase 1 notes).
+
+- name: Phase-1/eu-supply-rows-exist
+  rationale: >-
+    EU-Supply was silent because the published>=since post-filter +
+    advancing poll watermark starved it (fixed 2026-06-11 — listing-only
+    adapters now reconcile the whole current listing). Source=EU_SUPPLY
+    must return at least 1 card.
+  expected_outcome: PASS
+  filter:
+    sources: [EU_SUPPLY]
+  search:
+    min_results: 1
+    must_include_sources: [EU_SUPPLY]
+  tags: [phase-1, eu-supply]
+
+- name: Phase-1/atamis-rows-exist
+  rationale: >-
+    Atamis had the same watermark trap (fixed). If rows still don't land,
+    sources-health will show fetch_failing (likely a datacenter 403 →
+    bridge fix next).
+  expected_outcome: PASS
+  filter:
+    sources: [ATAMIS]
+  search:
+    min_results: 1
+    must_include_sources: [ATAMIS]
+  tags: [phase-1, atamis]
+
+- name: Phase-1/sell2wales-rows-exist
+  rationale: >-
+    S2W's request shape is identical to the working PCS adapter; its
+    silence is the upstream-500 its docstring documents, or an egress
+    block — sources-health's error string decides. This spec is the gate
+    once that evidence-driven fix lands.
+  expected_outcome: PASS
+  filter:
+    sources: [S2W]
+  search:
+    min_results: 1
+    must_include_sources: [S2W]
+  tags: [phase-1, sell2wales]
