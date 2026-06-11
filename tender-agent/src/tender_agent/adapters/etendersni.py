@@ -45,6 +45,7 @@ class ETendersNIAdapter(SourceAdapter):
             resp.raise_for_status()
         except httpx.HTTPError as exc:
             self.had_errors = True
+            self.record_error(f"fetch failed: {type(exc).__name__}: {exc}")
             logger.error("ni.fetch_failed", error=str(exc), url=self.base_url)
             return
 
@@ -52,6 +53,7 @@ class ETendersNIAdapter(SourceAdapter):
             root = ET.fromstring(resp.text)
         except ET.ParseError as exc:
             self.had_errors = True
+            self.record_error(f"parse failed: {exc}")
             logger.error("ni.parse_failed", error=str(exc))
             return
 

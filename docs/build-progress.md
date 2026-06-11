@@ -9,7 +9,7 @@ previous phase being marked DONE.
 | Phase | Title                                                       | Verdict       | Date       | Notes                                                                |
 | ----- | ----------------------------------------------------------- | ------------- | ---------- | -------------------------------------------------------------------- |
 | 0     | Reusable dashboard bot                                      | **PASS** (CI) | 2026-06-11 | Unit-test gate green; live gate is the operator's runbook below.     |
-| 1     | Get the silent sources pulling (Atamis, EU-Supply, Sell2Wales) | **IN PROGRESS** | 2026-06-11 | Watermark trap fixed + health endpoint shipped; gate awaits live evidence (see Phase 1 section). |
+| 1     | Get the silent sources pulling (Atamis, EU-Supply, Sell2Wales) | **IN PROGRESS (rev 2)** | 2026-06-11 | Watermark + scheduler self-heal + iteration logging + real-error surface + per-advert guard; gate awaits next health readout. |
 | 2     | Fix run-15-class discovery errors                           | not started   | —          |                                                                      |
 | 3     | Cross-source CPV/field normalisation (the spine)            | not started   | —          | Likely NEEDS DECISION when reached.                                  |
 | 4     | Keyword/value/buyer filters as first-class                  | not started   | —          |                                                                      |
@@ -184,3 +184,98 @@ the phase-1 bot gate or paste the JSON). Phase 0's live self-check
 (`python -m tests.e2e.dashboard_bot tests/e2e/specs/phase-0-self.yaml`)
 can be run in the same sitting — both YAMLs from one residential-IP
 session.
+
+## Phase 1 — IN PROGRESS rev 2 (2026-06-11): scheduler self-heal + real-error surface
+
+### What the readout proved (operator's `GET /admin/diagnostics/sources-health`, 11:28Z)
+
+- **ATAMIS, EU_SUPPLY = `never_polled`**: Source rows exist (`enabled: true`),
+  zero `latest_runs`, `last_polled_at: null`. The watermark fix from rev 1
+  was correct but not enough — the scheduler never invoked their adapters
+  to begin with. Likeliest explanation (the static-code diagnosis cannot
+  uniquely prove it from this environment, so the fix is defensive):
+  these Source rows were created on a deploy AFTER the most recent
+  `ensure_sources()` boot pass, OR a previous poll cycle was still
+  in-flight at readout time.
+- **S2W, NI = `fetch_failing` with the generic "upstream HTTP requests
+  failed (see adapter log events)"**: the real cause (403 vs 500 vs DNS)
+  was hidden in the log stream the harness explicitly wants the
+  health endpoint to expose. Fixed below.
+- **PROACTIS = `fetch_failing` with `BridgeError: navigation failed:
+  Page.goto: net::ERR_ABORTED at .../Supplier/Advert/View?advertId=...`
+  after `new_count: 61`**: one bad advert killed a run that had already
+  ingested 61 rows. That's Phase-2 territory, but the small in-scope
+  guard lands now.
+- **One PROACTIS run stuck `running`** (orphaned by a restart).
+
+### What this PR ships (rev 2 on top of #122)
+
+1. **Scheduler self-heal.** `poll_all()` now calls `ensure_sources()` at
+   the start of every cycle (not only at boot). A new adapter wired in
+   after the previous boot joins the very next cycle — covers the
+   never-polled case directly without speculating on the exact root
+   cause. Idempotent; cheap (one read per code, one insert per missing).
+2. **Per-iteration `scheduler.poll_source_attempt` log line** with
+   `{source, has_adapter}`. The "did we even try to poll X?" question
+   becomes a Log-stream grep, not a code-archaeology dig. Plus a
+   `scheduler.poll_all_starting` line at the top of every cycle with
+   `source_codes` and `registered_adapters` so the two lists can be
+   compared at a glance.
+3. **Real upstream errors on PollRun.error.** `SourceAdapter.record_error()`
+   appends a short, length-bounded message every time an adapter sets
+   `had_errors = True`. All HTTP adapters now call it (CF, FTS, PCS,
+   S2W, NI, EU-Supply, Atamis). `poll_source` joins the last 3
+   messages into `PollRun.error` instead of the legacy generic string —
+   so the sources-health row carries the precise upstream cause.
+4. **Orphaned PollRun cleanup.** `_orphan_stale_running_runs(db)` marks
+   PollRuns left in `running` past 90 minutes as `status="error"` with
+   `error="orphaned …"` and a `finished_at` of now. Runs at the top of
+   every `poll_all` cycle.
+5. **PROACTIS per-advert detail guard.** A `BridgeError` while reading
+   one advert's detail page now logs + counts + continues, instead of
+   killing the whole run. Trivial, in-scope: the deeper retry/backoff
+   work stays for Phase 2.
+6. **PROACTIS Source row safely skipped in `poll_all`.** The HTTP path
+   never had an adapter for it (browser-driven discovery is a separate
+   APScheduler job); the loop now skips with `has_adapter=false` in
+   the log instead of raising `ValueError("No adapter…")`.
+
+### Tests (offline, no Postgres)
+
+- `tests/test_scheduler_self_heal.py` (5 tests): ensure_sources called
+  first; per-iteration log lines present with correct codes; PROACTIS
+  iterates but skips without an adapter; orphan cleanup flips the stale
+  row only; cleanup is invoked from `poll_all`.
+- Adapter test updates: same fixtures, the contracts kept; CF/FTS/PCS/
+  S2W/NI/EU_SUPPLY/Atamis all still pass.
+- 57 backend tests + the 3 sources-health tests pass under the same
+  in-memory SQLite setup.
+- Ruff clean.
+
+### Phase 1 verdict — still IN PROGRESS
+
+Same reason as rev 1: the gate is the live `GET /admin/diagnostics/
+sources-health` readout AFTER merge + deploy + at least one poll cycle
+(or `POST /admin/poll-now`). Three of the four findings now lead to
+specific evidence-driven follow-ups:
+
+- ATAMIS / EU_SUPPLY should leave `never_polled` and either show
+  `healthy` (this run's fix sufficed) or `fetch_failing` with a real
+  error string. If 403, route via the disguised bridge next PR; if
+  something else, paste it.
+- S2W and NI should show a SPECIFIC error class + URL, not the generic
+  string. If the readout confirms the documented Sell2Wales 500, the
+  pending-row in `docs/accounts-needed.md` is promoted to a real
+  BLOCKED-UPSTREAM entry next PR; the eTendersNI string drives a
+  matching decision.
+- PROACTIS gets the small per-advert guard now; the deeper run-15
+  resilience work is Phase 2 and stays out of this PR.
+
+### Next single action
+
+Operator: merge → wait one poll cycle (or fire `POST /admin/poll-now`)
+→ open `GET /admin/diagnostics/sources-health` → paste the JSON. With
+the real error strings in hand, the next harness run either flips
+Phase 1 to PASS (run the bot gate `tests/e2e/specs/phase-1.yaml` if the
+operator can reach the live URL; the CI unit-test gate is the automated
+fallback) or implements the precise next fix.

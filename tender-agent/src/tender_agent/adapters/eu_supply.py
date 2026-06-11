@@ -153,6 +153,7 @@ class EUSupplyAdapter(SourceAdapter):
                 html = await self._get_text(url)
             except httpx.HTTPError as exc:
                 self.had_errors = True
+                self.record_error(f"{host}: {type(exc).__name__}: {exc}")
                 logger.error("eu_supply.fetch_failed", host=host, error=str(exc))
                 continue
 

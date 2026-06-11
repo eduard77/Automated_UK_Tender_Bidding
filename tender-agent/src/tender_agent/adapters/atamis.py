@@ -205,6 +205,7 @@ class AtamisAdapter(SourceAdapter):
                     html = await self._get_text(url)
                 except httpx.HTTPError as exc:
                     self.had_errors = True
+                    self.record_error(f"{host} p{page}: {type(exc).__name__}: {exc}")
                     logger.error(
                         "atamis.fetch_failed", host=host, page=page, error=str(exc)
                     )

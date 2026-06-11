@@ -186,9 +186,17 @@ async def poll_source(db: Session, source: Source) -> PollRun:
                     push.send_match_notifications(db, tender, matched_profile_ids)
                     db.commit()
             had_errors = bool(getattr(adapter, "had_errors", False))
+            adapter_errors = list(getattr(adapter, "error_messages", []) or [])
         if had_errors:
             run.status = "error"
-            error = "upstream HTTP requests failed (see adapter log events)"
+            # NEW (Phase-1 continuation, 2026-06-11): surface the REAL
+            # upstream cause that the sources-health endpoint reads back.
+            # The legacy generic message was the only thing the operator
+            # ever saw, hiding 403-vs-500-vs-DNS behind one string.
+            if adapter_errors:
+                error = " | ".join(adapter_errors[-3:])
+            else:
+                error = "upstream HTTP requests failed (see adapter log events)"
         else:
             source.last_polled_at = datetime.now(UTC)
             run.status = "ok"

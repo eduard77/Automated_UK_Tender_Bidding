@@ -52,6 +52,9 @@ class Sell2WalesAdapter(SourceAdapter):
                 payload = await self._get_json(url, params=params)
             except Exception as exc:
                 self.had_errors = True
+                self.record_error(
+                    f"{params['dateFrom']}: {type(exc).__name__}: {exc}"
+                )
                 logger.error(
                     "s2w.fetch_failed",
                     error=str(exc),
