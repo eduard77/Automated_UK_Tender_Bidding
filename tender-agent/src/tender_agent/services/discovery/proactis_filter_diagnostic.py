@@ -25,6 +25,7 @@ in by callers.
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import re
 from dataclasses import asdict, dataclass, field
@@ -33,7 +34,12 @@ from typing import Any
 import structlog
 
 from tender_agent.services.bridge_client import BridgeClient, BridgeError
-from tender_agent.services.discovery.proactis_dynatree import DYNATREE_SELECTORS
+from tender_agent.services.discovery import proactis_dynatree as _dynatree
+from tender_agent.services.discovery.proactis_dynatree import (
+    DYNATREE_SELECTORS,
+    PopupSearchState,
+    read_search_state,
+)
 from tender_agent.services.discovery.proactis_login import (
     login_with_credentials,
 )
@@ -76,12 +82,21 @@ def _slice_html(html: str, limit: int = HTML_EXCERPT_CHARS) -> str:
 class SearchProbe:
     """One search attempt against the category Dynatree popup.
 
-    `nodes_excerpt` is a TAG-PRESERVING slice of the tree container so the
-    operator can see the real li/span/text/attribute shapes."""
+    Verdicts come from `read_search_state` — the SAME scoped + settled
+    classifier the discovery driver uses, so the diagnostic can never
+    disagree with the run: `matched` means at least one node rendered in
+    the OPEN dialog's tree; `no_results_marker_visible` means the scoped
+    marker is actually DISPLAYED with zero nodes (mere presence of the
+    permanently-in-DOM, hidden marker no longer counts — the 2026-06-10
+    capture showed a successful search misread that way). `tree_status` is
+    the raw classifier verdict (results / no_results / loading / pending /
+    unread). `nodes_excerpt` is a TAG-PRESERVING slice of the tree container
+    so the operator can see the real li/span/text/attribute shapes."""
 
     term: str
-    matched: bool  # True when the no-results marker is NOT visible
+    matched: bool  # True when the scoped, settled tree rendered >= 1 node
     no_results_marker_visible: bool
+    tree_status: str = ""
     nodes_excerpt: str = ""
     error: str | None = None
 
@@ -202,13 +217,19 @@ _PANEL_HTML_JS = """
 
 # JS that returns the OUTER HTML of the dynatree popup container — the
 # whole purpose of probe-and-snapshot is to see the real node shape on a
-# CPV miss vs hit.
+# CPV miss vs hit. Scoped to the VISIBLE dialog: the popup ids are not
+# unique once more than one category dialog has been instantiated, so an
+# unscoped querySelector can return a STALE dialog's tree/marker.
 _POPUP_HTML_JS = """
 () => {
-  const el = document.querySelector(
+  const dialogs = Array.from(document.querySelectorAll(".ui-dialog"))
+    .filter((el) => el.offsetParent !== null);
+  const host = dialogs.length ? dialogs[dialogs.length - 1] : document;
+  const el = host.querySelector(
     "#DivTree, .dynatree-container, .modal-content, .ui-dialog-content"
   );
-  return (el && el.outerHTML) || "";
+  if (el) return el.outerHTML;
+  return host === document ? "" : host.outerHTML;
 }
 """
 
@@ -255,12 +276,15 @@ async def _capture_category_popup(
     if isinstance(popup_html, str) and popup_html:
         snapshot.search_input_excerpt = _slice_html(popup_html)
 
-    # Probe ONE numeric code and ONE descriptive word. If the code returns
-    # `no_results_marker` but the word does not, the diagnosis is the
-    # bare-prefix format — exactly the gap the task description suspects.
+    # Probe ONE numeric code and ONE descriptive word. The verdict per probe
+    # comes from `read_search_state` over the scoped, SETTLED DOM — exactly
+    # what the discovery driver does, so the two can never disagree.
     for term in (CATEGORY_PROBE_CODE, CATEGORY_PROBE_WORD):
         probe = SearchProbe(
-            term=term, matched=False, no_results_marker_visible=False
+            term=term,
+            matched=False,
+            no_results_marker_visible=False,
+            tree_status="unread",
         )
         try:
             await bridge.fill(slug, DYNATREE_SELECTORS["search_input"], "")
@@ -270,24 +294,36 @@ async def _capture_category_popup(
             probe.error = f"search drive failed: {exc}"
             snapshot.probes.append(probe)
             continue
-        # Wait for the tree to settle OR the no-results marker to appear.
-        with contextlib.suppress(BridgeError):
-            await bridge.rendered_html(
-                slug,
-                wait_for_selector=DYNATREE_SELECTORS["tree_settled_wait"],
-                timeout_ms=4000,
-            )
-        try:
-            probe.no_results_marker_visible = await bridge.element_exists(
-                slug, DYNATREE_SELECTORS["no_results_marker"]
-            )
-        except BridgeError:
-            probe.no_results_marker_visible = False
-        probe.matched = not probe.no_results_marker_visible
-        # The actual tree markup — the whole point of this diagnostic.
+        # Re-read the rendered DOM until the tree settles (the Loading…
+        # status node clears) — never judge a search mid-flight. Pacing
+        # constants are read off the module at call time so they stay in
+        # lock-step with the discovery driver (which late-binds them too),
+        # including under test monkeypatching.
+        state: PopupSearchState | None = None
+        for attempt in range(_dynatree.TREE_SETTLE_RETRIES + 1):
+            if attempt:
+                await asyncio.sleep(_dynatree.TREE_SETTLE_RETRY_DELAY_S)
+            with contextlib.suppress(BridgeError):
+                rendered = await bridge.rendered_html(
+                    slug,
+                    wait_for_selector=DYNATREE_SELECTORS["tree_settled_wait"],
+                    timeout_ms=_dynatree.TREE_SETTLE_READ_TIMEOUT_MS,
+                )
+                state = read_search_state(rendered.html)
+            if state is not None and state.status in ("results", "no_results"):
+                break
+        if state is not None:
+            probe.tree_status = state.status
+            probe.matched = state.status == "results"
+            probe.no_results_marker_visible = state.status == "no_results"
+        # The actual tree markup — the whole point of this diagnostic. The
+        # scoped slice from the classifier is the fallback when the bridge
+        # has no `evaluate`.
         popup_html = await _evaluate(bridge, slug, _POPUP_HTML_JS)
         if isinstance(popup_html, str) and popup_html:
             probe.nodes_excerpt = _slice_html(popup_html)
+        elif state is not None and state.scope_html:
+            probe.nodes_excerpt = _slice_html(state.scope_html)
         snapshot.probes.append(probe)
 
     try:

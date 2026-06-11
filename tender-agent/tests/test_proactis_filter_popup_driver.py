@@ -174,11 +174,12 @@ async def test_driver_continues_through_mixed_match_and_miss():
     assert outcome.not_found == ["99999999"]
     # Apply still fires only ONCE at the end (not once per item).
     assert sum(1 for c in bridge.clicks if "BtnSelect" in c) == 1
-    # Both matched node checkboxes were clicked, in order.
+    # Both matched node checkboxes were clicked, in order — via the
+    # open-dialog-scoped selector (node ids repeat across stale dialogs).
     tick_clicks = [c for c in bridge.clicks if "dynatree-checkbox" in c]
     assert tick_clicks == [
-        'li[id="node~CPV~45000000-7"] span.dynatree-checkbox',
-        'li[id="node~CPV~72000000-5"] span.dynatree-checkbox',
+        '.ui-dialog:visible li[id="node~CPV~45000000-7"] span.dynatree-checkbox',
+        '.ui-dialog:visible li[id="node~CPV~72000000-5"] span.dynatree-checkbox',
     ]
 
 
@@ -256,9 +257,11 @@ async def test_apply_filters_from_profile_populates_run_summary():
             # navigate gets called first; then categories popup open + search.
             "<div id='DivTree'></div>",   # category popup open
             _POPULATED_HTML,              # search 45000000
+            _POPULATED_HTML,              # post-tick DivSelected verification
             # regions popup open + search.
             "<div id='DivTree'></div>",   # region popup open
             _REGION_HTML,                 # search North West
+            _REGION_HTML,                 # post-tick DivSelected verification
             # Listing render wait.
             "<table class='opportunities'></table>",
         ]
@@ -530,3 +533,206 @@ async def test_apply_filters_opens_the_cpv_trigger_not_unspsc():
     trigger_clicks = [c for c in bridge.clicks if "categor" in c.lower()]
     assert any("Add CPV categories" in c for c in trigger_clicks)
     assert not any("UNSPSC" in c for c in bridge.clicks)
+
+
+# ---------------------------------------------------------------------------
+# Detection fix (2026-06-10 follow-up capture): the search SUCCEEDED — the
+# tree held exactly `45000000-7 - Construction work` — yet the old
+# presence-based marker check reported "divNoSearchResults visible" and the
+# tick never happened. These tests run the driver against the captured
+# popup shape end-to-end.
+# ---------------------------------------------------------------------------
+
+from tests.conftest import load_text_fixture  # noqa: E402
+
+_LIVE_CPV_POPUP_HTML = load_text_fixture("proactis_cpv_popup_live.html")
+
+# The same popup after the tick — DivSelected carries the chosen category.
+_LIVE_CPV_POPUP_TICKED_HTML = _LIVE_CPV_POPUP_HTML.replace(
+    '<div id="DivSelected"></div>',
+    '<div id="DivSelected"><span>45000000-7 - Construction work</span></div>',
+)
+
+_LIVE_CPV_POPUP_LOADING_HTML = _LIVE_CPV_POPUP_HTML.replace(
+    '<li id="node~CPV~45000000-7">',
+    '<li><span class="dynatree-node dynatree-statusnode-wait">'
+    '<a class="dynatree-title">Loading&#8230;</a></span></li>'
+    '<li id="node~CPV~45000000-7" style="display:none">',
+)
+
+
+@pytest.mark.asyncio
+async def test_driver_ticks_despite_hidden_no_results_marker():
+    """THE live regression: hidden `#divNoSearchResults` is present in the
+    captured popup alongside the ONE correct CPV node — the driver must
+    treat that as results, tick the node, and verify it in DivSelected."""
+    bridge = _FakeBridge(
+        html_responses=[
+            "<div id='DivTree'></div>",   # popup-open wait
+            _LIVE_CPV_POPUP_HTML,         # search "45000000" — settled hit
+            _LIVE_CPV_POPUP_TICKED_HTML,  # post-tick DivSelected verification
+        ]
+    )
+    outcome = await _drive_dynatree_popup(
+        bridge,
+        open_trigger_selector=".trigger",
+        items=["45"],
+        matcher="code",
+        popup_kind="category",
+    )
+    assert outcome.applied == 1
+    assert outcome.not_found == []
+    # The tick went to the node, scoped to the OPEN dialog.
+    assert (
+        '.ui-dialog:visible li[id="node~CPV~45000000-7"] span.dynatree-checkbox'
+        in bridge.clicks
+    )
+
+
+@pytest.mark.asyncio
+async def test_driver_waits_out_the_loading_status_node(monkeypatch):
+    """The tree loads asynchronously — a Loading… status row must mean
+    'wait and re-read', never 'no match while loading'."""
+    from tender_agent.services.discovery import proactis_dynatree
+
+    monkeypatch.setattr(proactis_dynatree, "TREE_SETTLE_RETRY_DELAY_S", 0.01)
+    bridge = _FakeBridge(
+        html_responses=[
+            "<div id='DivTree'></div>",    # popup-open wait
+            _LIVE_CPV_POPUP_LOADING_HTML,  # search settled-wait: still loading
+            _LIVE_CPV_POPUP_HTML,          # re-read: tree settled with the hit
+            _LIVE_CPV_POPUP_TICKED_HTML,   # post-tick verification
+        ]
+    )
+    outcome = await _drive_dynatree_popup(
+        bridge,
+        open_trigger_selector=".trigger",
+        items=["45000000"],
+        matcher="code",
+        popup_kind="category",
+    )
+    assert outcome.applied == 1
+    assert outcome.not_found == []
+
+
+@pytest.mark.asyncio
+async def test_driver_ignores_stale_dialog_marker_via_scoping():
+    """Duplicate-ID scenario: a STALE hidden dialog's marker is VISIBLE in
+    its own subtree; the OPEN dialog has the real results. The scoped read
+    must ignore the stale marker."""
+    stale = (
+        '<div class="ui-dialog" style="display: none;">'
+        '<div id="divNoSearchResults">Your criteria returned no results</div>'
+        '<div id="DivTree"><ul class="dynatree-container"></ul></div></div>'
+    )
+    bridge = _FakeBridge(
+        html_responses=[
+            "<div id='DivTree'></div>",
+            stale + _LIVE_CPV_POPUP_HTML,
+            stale + _LIVE_CPV_POPUP_TICKED_HTML,
+        ]
+    )
+    outcome = await _drive_dynatree_popup(
+        bridge,
+        open_trigger_selector=".trigger",
+        items=["45000000"],
+        matcher="code",
+        popup_kind="category",
+    )
+    assert outcome.applied == 1
+    assert outcome.not_found == []
+
+
+@pytest.mark.asyncio
+async def test_driver_genuine_no_results_still_recorded(monkeypatch):
+    """Safety preserved: a DISPLAYED marker with an EMPTY tree in the open
+    dialog is a real miss — logged, skipped, run continues."""
+    from tender_agent.services.discovery import proactis_dynatree
+
+    monkeypatch.setattr(proactis_dynatree, "TREE_SETTLE_RETRY_DELAY_S", 0.01)
+    empty = _LIVE_CPV_POPUP_HTML.replace(
+        '<div id="divNoSearchResults" style="display: none;">',
+        '<div id="divNoSearchResults">',
+    )
+    empty = empty.replace(
+        '<li id="node~CPV~45000000-7">',
+        '<li style="display:none" data-removed="',
+    )
+    bridge = _FakeBridge(
+        html_responses=["<div id='DivTree'></div>", empty]
+    )
+    outcome = await _drive_dynatree_popup(
+        bridge,
+        open_trigger_selector=".trigger",
+        items=["99999999"],
+        matcher="code",
+        popup_kind="category",
+    )
+    assert outcome.applied == 0
+    assert outcome.not_found == ["99999999"]
+
+
+@pytest.mark.asyncio
+async def test_driver_never_ticks_a_stale_dialogs_node():
+    """The mirror of the stale-marker case (and the reason scoping exists
+    at driver level): a hidden UNSPSC dialog left leftover NODES behind
+    while the OPEN CPV dialog genuinely matched nothing — the driver must
+    record the miss, not tick the wrong taxonomy's node."""
+    stale_with_nodes = (
+        '<div class="ui-dialog" style="display: none;">'
+        '<div id="divNoSearchResults" style="display: none;"></div>'
+        '<div id="DivTree"><ul class="dynatree-container">'
+        '<li id="node~UNSPSC~45000000"><span class="dynatree-node">'
+        '<span class="dynatree-checkbox">&nbsp;</span>'
+        '<a class="dynatree-title">45000000 - Printing and Photographic '
+        "Equipment</a></span></li></ul></div></div>"
+    )
+    open_miss = (
+        '<div class="ui-dialog" style="display: block;">'
+        "<h1>CPV category selection</h1>"
+        '<div id="divNoSearchResults">Your criteria returned no results</div>'
+        '<div id="DivTree"><ul class="dynatree-container"></ul></div></div>'
+    )
+    bridge = _FakeBridge(
+        html_responses=[
+            "<div id='DivTree'></div>",
+            stale_with_nodes + open_miss,
+        ]
+    )
+    outcome = await _drive_dynatree_popup(
+        bridge,
+        open_trigger_selector=".trigger",
+        items=["45000000"],
+        matcher="code",
+        popup_kind="category",
+    )
+    assert outcome.applied == 0
+    assert outcome.not_found == ["45000000"]
+    assert not any("dynatree-checkbox" in c for c in bridge.clicks)
+
+
+@pytest.mark.asyncio
+async def test_probe_skips_scoped_selectors_that_dont_exist():
+    """Probe-before-act: when the page has no ui-dialog wrapper (older
+    variants), the scoped selectors probe absent and the driver goes
+    straight to the bare forms — never paying a click/fill timeout on a
+    selector that cannot match."""
+
+    class _ProbingBridge(_FakeBridge):
+        async def element_exists(self, _slug, selector):
+            return ".ui-dialog" not in selector
+
+    bridge = _ProbingBridge(
+        html_responses=["<div id='DivTree'></div>", _POPULATED_HTML]
+    )
+    outcome = await _drive_dynatree_popup(
+        bridge,
+        open_trigger_selector=".trigger",
+        items=["45000000"],
+        matcher="code",
+        popup_kind="category",
+    )
+    assert outcome.applied == 1
+    # No scoped interaction was ever attempted — the probe filtered them.
+    assert not any(".ui-dialog" in c for c in bridge.clicks)
+    assert not any(".ui-dialog" in s for s, _v in bridge.fills)

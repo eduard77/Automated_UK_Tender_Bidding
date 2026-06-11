@@ -464,9 +464,9 @@ async def _apply_filters(
 
 #: How long to wait for the Dynatree popup to render after the trigger click.
 DYNATREE_POPUP_WAIT_MS = 10_000
-#: How long to wait for the tree to settle after each Search click. The XHR
-#: is sub-second on the live site; this is a generous outer bound.
-DYNATREE_SEARCH_WAIT_MS = 8_000
+#: Per-read settle wait + retry pacing live in proactis_dynatree
+#: (TREE_SETTLE_READ_TIMEOUT_MS / TREE_SETTLE_RETRIES / _RETRY_DELAY_S) —
+#: shared with the filter diagnostic so the two flows pace identically.
 
 
 @dataclass
@@ -483,30 +483,91 @@ class PopupApplyOutcome:
     error: str | None = None
 
 
+async def _act_first(bridge: BridgeClient, selectors: list[str], action) -> None:
+    """Run `action` on the first selector that's PRESENT — open-dialog
+    scoped form first, bare-id fallback second (popup ids are NOT unique
+    once more than one dialog has been instantiated on the page).
+
+    Probe-before-act: `element_exists` (an immediate query_selector that
+    honours `:visible`) gates each attempt, because a click/fill on a
+    non-matching selector blocks for Playwright's full 30s default timeout
+    — the bridge API has no per-call timeout knob. Bridges without the
+    probe surface attempt each selector directly. If nothing probed
+    present, one final direct attempt on the LAST (bare) selector lets
+    Playwright's own actionability wait cover late renders — but never
+    re-attempts a selector that already failed (that would double the
+    timeout burn)."""
+    probe = getattr(bridge, "element_exists", None)
+    last_error: BridgeError | None = None
+    attempted: set[str] = set()
+    for selector in selectors:
+        try:
+            if probe is not None and not await probe(
+                PROACTIS_BRIDGE_SLUG, selector
+            ):
+                continue
+            attempted.add(selector)
+            await action(selector)
+            return
+        except BridgeError as exc:
+            last_error = exc
+    fallback = selectors[-1]
+    if fallback in attempted:
+        raise last_error if last_error else BridgeError("action failed")
+    await action(fallback)
+
+
+async def _fill_first(
+    bridge: BridgeClient, selectors: list[str], value: str
+) -> None:
+    async def _do(selector: str) -> None:
+        await bridge.fill(PROACTIS_BRIDGE_SLUG, selector, value)
+
+    await _act_first(bridge, selectors, _do)
+
+
+async def _click_first(bridge: BridgeClient, selectors: list[str]) -> None:
+    async def _do(selector: str) -> None:
+        await bridge.click(PROACTIS_BRIDGE_SLUG, selector)
+
+    await _act_first(bridge, selectors, _do)
+
+
 async def _popup_search(bridge: BridgeClient, term: str, popup_kind: str):
     """Drive ONE search inside an already-open Dynatree popup: clear the
     pre-filled placeholder, type `term`, re-assert Exact mode, click Search,
-    wait for the tree (or the no-results marker) to settle. Returns the
-    rendered page; raises BridgeError on a hard bridge failure so the caller
-    can record the item and move on."""
+    then RE-READ the rendered DOM until the tree settles. Every interaction
+    tries the open-dialog scoped selector first (ids repeat across stale
+    dialog instances); every read is scoped + settled via
+    `read_search_state`, so a hidden/stale `#divNoSearchResults` can never
+    masquerade as a miss. Returns a `PopupSearchState`; raises BridgeError
+    on a hard bridge failure so the caller can record the item and move on."""
     from tender_agent.services.discovery.proactis_dynatree import (
         DYNATREE_SELECTORS,
+        TREE_SETTLE_READ_TIMEOUT_MS,
+        TREE_SETTLE_RETRIES,
+        TREE_SETTLE_RETRY_DELAY_S,
+        read_search_state,
     )
 
     # Clear THEN fill — Proactis pre-fills the box with placeholder text as
     # the literal value, so a plain fill on top would corrupt the query.
-    await bridge.fill(
-        PROACTIS_BRIDGE_SLUG, DYNATREE_SELECTORS["search_input"], ""
-    )
-    await bridge.fill(
-        PROACTIS_BRIDGE_SLUG, DYNATREE_SELECTORS["search_input"], term
-    )
+    search_inputs = [
+        DYNATREE_SELECTORS["search_input_scoped"],
+        DYNATREE_SELECTORS["search_input"],
+    ]
+    await _fill_first(bridge, search_inputs, "")
+    await _fill_first(bridge, search_inputs, term)
 
     # Belt-and-braces: ensure Exact match is selected. Default checked; a
     # no-op click on a checked radio is harmless.
     try:
-        await bridge.click(
-            PROACTIS_BRIDGE_SLUG, DYNATREE_SELECTORS["exact_match_radio"]
+        await _click_first(
+            bridge,
+            [
+                DYNATREE_SELECTORS["exact_match_radio_scoped"],
+                DYNATREE_SELECTORS["exact_match_radio"],
+            ],
         )
     except BridgeError:
         # Some Proactis variants strip the radio when only one mode is
@@ -515,17 +576,37 @@ async def _popup_search(bridge: BridgeClient, term: str, popup_kind: str):
             "discovery.proactis.exact_radio_missing", popup=popup_kind
         )
 
-    await bridge.click(
-        PROACTIS_BRIDGE_SLUG, DYNATREE_SELECTORS["search_button"]
+    await _click_first(
+        bridge,
+        [
+            DYNATREE_SELECTORS["search_button_scoped"],
+            DYNATREE_SELECTORS["search_button"],
+        ],
     )
 
-    # The XHR returns either a populated tree OR shows the no-results
-    # marker; both selectors are in our wait expression.
-    return await bridge.rendered_html(
+    # The tree loads ASYNCHRONOUSLY (a Loading… status node appears first)
+    # and Playwright's wait_for_selector judges only the FIRST DOM match —
+    # with stale hidden dialog copies on the page the wait may never
+    # satisfy, so a long per-read wait is pure dead time. The verdict comes
+    # from re-reading the scoped DOM until it settles; each read uses the
+    # SHORT shared timeout and the loop paces via the retry delay.
+    rendered = await bridge.rendered_html(
         PROACTIS_BRIDGE_SLUG,
         wait_for_selector=DYNATREE_SELECTORS["tree_settled_wait"],
-        timeout_ms=DYNATREE_SEARCH_WAIT_MS,
+        timeout_ms=TREE_SETTLE_READ_TIMEOUT_MS,
     )
+    state = read_search_state(rendered.html)
+    attempts = 0
+    while state.status in ("loading", "pending") and attempts < TREE_SETTLE_RETRIES:
+        await asyncio.sleep(TREE_SETTLE_RETRY_DELAY_S)
+        rendered = await bridge.rendered_html(
+            PROACTIS_BRIDGE_SLUG,
+            wait_for_selector=DYNATREE_SELECTORS["tree_settled_wait"],
+            timeout_ms=TREE_SETTLE_READ_TIMEOUT_MS,
+        )
+        state = read_search_state(rendered.html)
+        attempts += 1
+    return state
 
 
 async def _drive_dynatree_popup(
@@ -551,9 +632,9 @@ async def _drive_dynatree_popup(
         expand_cpv_prefix,
         match_node_for_code,
         match_node_for_region,
-        no_results_visible,
         node_checkbox_selector,
-        parse_dynatree_nodes,
+        normalise_code,
+        selection_confirmed,
     )
 
     outcome = PopupApplyOutcome(requested=len(items))
@@ -571,11 +652,15 @@ async def _drive_dynatree_popup(
         )
         return outcome
 
-    # Wait for the popup to render the search box.
+    # Wait for the popup to render the search box. Scoped to the OPEN
+    # dialog: a bare `input#TxtFilterNodes` wait would judge the FIRST DOM
+    # match, which is a STALE hidden copy whenever a previous popup left
+    # one behind — and then burn the full timeout even though the new
+    # popup rendered instantly.
     try:
         await bridge.rendered_html(
             PROACTIS_BRIDGE_SLUG,
-            wait_for_selector=DYNATREE_SELECTORS["search_input"],
+            wait_for_selector=DYNATREE_SELECTORS["search_input_scoped"],
             timeout_ms=DYNATREE_POPUP_WAIT_MS,
         )
     except BridgeError as exc:
@@ -608,7 +693,7 @@ async def _drive_dynatree_popup(
         no_match_reason = "no search attempted"
         for attempt_index, term in enumerate(search_terms):
             try:
-                rendered = await _popup_search(bridge, term, popup_kind)
+                state = await _popup_search(bridge, term, popup_kind)
             except BridgeError as exc:
                 no_match_reason = f"search drive failed: {exc}"
                 logger.warning(
@@ -620,15 +705,23 @@ async def _drive_dynatree_popup(
                 )
                 break  # hard bridge failure — don't retry other terms
 
-            if no_results_visible(rendered.html):
-                no_match_reason = "divNoSearchResults visible"
+            # The verdict comes from the SCOPED, SETTLED state — a node in
+            # the open dialog's tree IS a result, regardless of any (hidden
+            # or stale) no-results marker elsewhere on the page.
+            if state.status == "no_results":
+                no_match_reason = (
+                    "no-results marker displayed (scoped, tree settled,"
+                    " 0 nodes)"
+                )
+                continue
+            if state.status != "results":
+                no_match_reason = f"tree never settled (status={state.status})"
                 continue
 
-            nodes = parse_dynatree_nodes(rendered.html)
             node = (
-                match_node_for_code(nodes, target)
+                match_node_for_code(state.nodes, target)
                 if matcher == "code"
-                else match_node_for_region(nodes, target)
+                else match_node_for_region(state.nodes, target)
             )
             if node is not None:
                 if attempt_index > 0:
@@ -639,7 +732,9 @@ async def _drive_dynatree_popup(
                         used=term,
                     )
                 break
-            no_match_reason = f"no node matched among {len(nodes)} results"
+            no_match_reason = (
+                f"no node matched among {len(state.nodes)} results"
+            )
 
         if node is None:
             outcome.not_found.append(item)
@@ -652,20 +747,17 @@ async def _drive_dynatree_popup(
             )
             continue
 
-        # Tick the checkbox span. node_checkbox_selector emits a CSS
-        # selector specific to THIS node so the click never lands on the
-        # wrong row.
-        tick_selector = node_checkbox_selector(node.node_id)
+        # Tick the checkbox span — open-dialog scoped first (node ids repeat
+        # across stale dialog instances), bare-id fallback second; either
+        # way the selector is specific to THIS node so the click never lands
+        # on the wrong row.
         try:
-            await bridge.click(PROACTIS_BRIDGE_SLUG, tick_selector)
-            outcome.applied += 1
-            logger.info(
-                "discovery.proactis.popup_ticked",
-                popup=popup_kind,
-                item=item,
-                search_term=target,
-                node_id=node.node_id,
-                title=node.title_text,
+            await _click_first(
+                bridge,
+                [
+                    node_checkbox_selector(node.node_id, scoped=True),
+                    node_checkbox_selector(node.node_id),
+                ],
             )
         except BridgeError as exc:
             outcome.not_found.append(item)
@@ -678,12 +770,57 @@ async def _drive_dynatree_popup(
             )
             continue
 
+        # Verify the tick landed in the open dialog's #DivSelected panel
+        # before the final BtnSelect confirm. Best-effort: None = the panel
+        # wasn't readable (no warning); False = panel read but the selection
+        # is missing — loud, but the run continues (the tick click itself
+        # succeeded and BtnSelect will apply whatever IS selected).
+        needle = (
+            normalise_code(target) if matcher == "code" else node.title_text
+        )
+        confirmed: bool | None = None
+        try:
+            # Short wait — the tick updates DivSelected synchronously; the
+            # wait is only pacing and may be unsatisfiable (first-DOM-match
+            # rule) when stale dialog copies exist.
+            verify_render = await bridge.rendered_html(
+                PROACTIS_BRIDGE_SLUG,
+                wait_for_selector=DYNATREE_SELECTORS["selected_list"],
+                timeout_ms=800,
+            )
+            confirmed = selection_confirmed(verify_render.html, needle)
+        except BridgeError:
+            confirmed = None
+        if confirmed is False:
+            logger.warning(
+                "discovery.proactis.popup_tick_unconfirmed",
+                popup=popup_kind,
+                item=item,
+                node_id=node.node_id,
+                detail="ticked node not visible in DivSelected",
+            )
+
+        outcome.applied += 1
+        logger.info(
+            "discovery.proactis.popup_ticked",
+            popup=popup_kind,
+            item=item,
+            search_term=target,
+            node_id=node.node_id,
+            title=node.title_text,
+            selected_confirmed=confirmed,
+        )
+
     # 3. Apply once. If we ticked nothing, we still click Apply to close the
     # popup cleanly — leaving it open would block the next filter and the
     # subsequent listing read.
     try:
-        await bridge.click(
-            PROACTIS_BRIDGE_SLUG, DYNATREE_SELECTORS["apply_button"]
+        await _click_first(
+            bridge,
+            [
+                DYNATREE_SELECTORS["apply_button_scoped"],
+                DYNATREE_SELECTORS["apply_button"],
+            ],
         )
     except BridgeError as exc:
         # If Apply genuinely failed, fall back to Cancel so the popup

@@ -1,0 +1,42 @@
+<!--
+  The CPV category popup as the live filter-diagnostic captured it AFTER a
+  SUCCESSFUL search for "45000000" (2026-06-10 follow-up run). This fixture
+  pins the exact shape that the old detection misread as a miss:
+
+  * The popup is a jQuery-UI dialog (wrapper div class "ui-dialog", inline
+    display: block while open) with the heading "CPV category selection".
+  * The search filtered the tree to EXACTLY ONE node, titled with a
+    check-digit: "45000000-7 - Construction work".
+  * #divNoSearchResults EXISTS but is HIDDEN (inline display: none) — its
+    mere presence made the old presence-based check report
+    "divNoSearchResults visible" and skip the tick.
+  * #DivSelected is empty until a node is ticked; #BtnSelect confirms.
+-->
+<div class="ui-dialog ui-corner-all ui-widget ui-widget-content ui-front" style="position: absolute; height: auto; width: 620px; top: 120px; left: 240px; display: block;">
+  <div class="ui-dialog-titlebar ui-corner-all ui-widget-header">
+    <span class="ui-dialog-title">Category selection</span>
+  </div>
+  <div class="ui-dialog-content ui-widget-content">
+    <h1>CPV category selection</h1>
+    <input id="TxtFilterNodes" class="CategoryTextBox" type="text" value="45000000" />
+    <input id="BtnSearchCat" type="button" value="Search" />
+    <label><input id="radExact" name="searchMode" type="radio" value="ExactSearch" checked="checked" /> Exact match</label>
+    <label><input id="radFuzzy" name="searchMode" type="radio" value="FuzzySearch" /> Fuzzy match</label>
+    <input id="hdnNoSearchResultsText" type="hidden" value="Your criteria returned no results" />
+    <div id="divNoSearchResults" style="display: none;">Your criteria returned no results</div>
+    <div id="DivTree">
+      <ul class="dynatree-container">
+        <li id="node~CPV~45000000-7">
+          <span class="dynatree-node dynatree-checkbox-target">
+            <span class="dynatree-expander">&nbsp;</span>
+            <span class="dynatree-checkbox">&nbsp;</span>
+            <a class="dynatree-title">45000000-7 - Construction work</a>
+          </span>
+        </li>
+      </ul>
+    </div>
+    <div id="DivSelected"></div>
+    <input id="BtnSelect" type="button" value="Select categories" />
+    <a class="cancel" href="#">Cancel</a>
+  </div>
+</div>

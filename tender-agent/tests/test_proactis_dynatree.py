@@ -11,6 +11,7 @@ import pytest
 
 from tender_agent.services.discovery.proactis_dynatree import (
     DYNATREE_SELECTORS,
+    DynatreeNode,
     expand_cpv_prefix,
     match_node_for_code,
     match_node_for_region,
@@ -18,7 +19,12 @@ from tender_agent.services.discovery.proactis_dynatree import (
     node_checkbox_selector,
     normalise_code,
     parse_dynatree_nodes,
+    read_search_state,
+    scope_to_open_dialog,
+    selection_confirmed,
+    tree_loading,
 )
+from tests.conftest import load_text_fixture
 
 # ---------------------------------------------------------------------------
 # Fixture HTML — captured-shape Dynatree popups.
@@ -331,3 +337,213 @@ def test_non_numeric_labels_pass_through():
     assert expand_cpv_prefix("Construction work") == "Construction work"
     assert expand_cpv_prefix("") == ""
     assert expand_cpv_prefix("  45  ") == "45000000"
+
+
+# ---------------------------------------------------------------------------
+# Detection fix (2026-06-10 follow-up capture): the SEARCH worked but the
+# detection misread it. The live popup keeps #divNoSearchResults in the DOM
+# permanently (hidden when there are results), popup ids repeat across stale
+# dialog instances, and the tree loads asynchronously behind a Loading…
+# status node. `read_search_state` is the single scoped + settled classifier
+# both the driver and the diagnostic use.
+# ---------------------------------------------------------------------------
+
+_LIVE_CPV_POPUP_HTML = load_text_fixture("proactis_cpv_popup_live.html")
+
+_LOADING_POPUP_HTML = """
+<div class="ui-dialog ui-widget" style="display: block;">
+  <div class="ui-dialog-content">
+    <h1>CPV category selection</h1>
+    <input id="TxtFilterNodes" type="text" value="45000000" />
+    <div id="divNoSearchResults" style="display: none;">Your criteria returned no results</div>
+    <div id="DivTree">
+      <ul class="dynatree-container">
+        <li><span class="dynatree-node dynatree-statusnode-wait">
+          <a class="dynatree-title">Loading&#8230;</a>
+        </span></li>
+      </ul>
+    </div>
+  </div>
+</div>
+"""
+
+_EMPTY_RESULT_POPUP_HTML = """
+<div class="ui-dialog ui-widget" style="display: block;">
+  <div class="ui-dialog-content">
+    <h1>CPV category selection</h1>
+    <div id="divNoSearchResults">Your criteria returned no results</div>
+    <div id="DivTree"><ul class="dynatree-container"></ul></div>
+  </div>
+</div>
+"""
+
+# A STALE (closed) dialog whose own marker is VISIBLE — left behind by a
+# previous category-popup instantiation. Its ids duplicate the open dialog's.
+_STALE_DIALOG_VISIBLE_MARKER = """
+<div class="ui-dialog ui-widget" style="display: none;">
+  <div class="ui-dialog-content">
+    <h1>UNSPSC category selection</h1>
+    <div id="divNoSearchResults">Your criteria returned no results</div>
+    <div id="DivTree"><ul class="dynatree-container"></ul></div>
+  </div>
+</div>
+"""
+
+_STALE_DIALOG_WITH_NODES = """
+<div class="ui-dialog ui-widget" style="display: none;">
+  <div class="ui-dialog-content">
+    <h1>UNSPSC category selection</h1>
+    <div id="divNoSearchResults" style="display: none;"></div>
+    <div id="DivTree"><ul class="dynatree-container">
+      <li id="node~UNSPSC~45000000"><span class="dynatree-node">
+        <span class="dynatree-checkbox">&nbsp;</span>
+        <a class="dynatree-title">45000000 - Printing and Photographic Equipment</a>
+      </span></li>
+    </ul></div>
+  </div>
+</div>
+"""
+
+
+def test_live_capture_classifies_as_results_despite_hidden_marker():
+    """THE regression: tree filtered to `45000000-7 - Construction work`,
+    marker present-but-hidden — must be RESULTS, never a miss."""
+    state = read_search_state(_LIVE_CPV_POPUP_HTML)
+    assert state.status == "results"
+    assert [n.node_id for n in state.nodes] == ["node~CPV~45000000-7"]
+    assert state.nodes[0].title_text == "45000000-7 - Construction work"
+
+
+def test_live_capture_node_matches_every_check_digit_form():
+    state = read_search_state(_LIVE_CPV_POPUP_HTML)
+    for code in ("45000000", "45000000-7", "45"):
+        # "45" is expanded by the driver before matching; simulate that.
+        target = expand_cpv_prefix(code)
+        match = match_node_for_code(state.nodes, target)
+        assert match is not None, code
+        assert match.node_id == "node~CPV~45000000-7"
+
+
+def test_loading_status_node_classifies_as_loading_not_no_match():
+    state = read_search_state(_LOADING_POPUP_HTML)
+    assert state.status == "loading"
+    assert tree_loading(state.scope_html) is True
+
+
+def test_genuinely_empty_result_classifies_as_no_results():
+    state = read_search_state(_EMPTY_RESULT_POPUP_HTML)
+    assert state.status == "no_results"
+
+
+def test_stale_dialog_marker_is_ignored_when_open_dialog_has_results():
+    """Duplicate-ID scenario from the brief: the marker is VISIBLE in a
+    STALE (hidden) dialog only — the scoped check must read the OPEN
+    dialog and report results."""
+    page = _STALE_DIALOG_VISIBLE_MARKER + _LIVE_CPV_POPUP_HTML
+    state = read_search_state(page)
+    assert state.status == "results"
+    assert state.nodes[0].node_id == "node~CPV~45000000-7"
+    # Order independence: stale dialog after the open one too.
+    state = read_search_state(_LIVE_CPV_POPUP_HTML + _STALE_DIALOG_VISIBLE_MARKER)
+    assert state.status == "results"
+
+
+def test_stale_dialog_nodes_are_ignored_when_open_dialog_is_empty():
+    """The mirror hazard: leftover NODES in a hidden UNSPSC dialog must not
+    fake a result when the open CPV dialog genuinely matched nothing."""
+    page = _STALE_DIALOG_WITH_NODES + _EMPTY_RESULT_POPUP_HTML
+    state = read_search_state(page)
+    assert state.status == "no_results"
+    assert state.nodes == []
+
+
+def test_unwrapped_popup_html_still_classifies():
+    """Older/test markup without a ui-dialog wrapper passes through the
+    scoper unchanged — detection stays backward-compatible."""
+    html = (
+        '<div id="DivTree"><ul class="dynatree-container">'
+        '<li id="node~CPV~71000000-8"><span class="dynatree-node">'
+        '<a class="dynatree-title">71000000-8 - Architectural services</a>'
+        "</span></li></ul></div>"
+    )
+    assert scope_to_open_dialog(html) == html
+    assert read_search_state(html).status == "results"
+
+
+def test_all_dialogs_closed_classifies_as_pending():
+    state = read_search_state(_STALE_DIALOG_VISIBLE_MARKER)
+    assert state.status == "pending"
+
+
+def test_later_open_non_popup_dialog_does_not_shadow_the_popup():
+    """A session-timeout warning / validation alert appended (and open)
+    AFTER the popup must not win last-open-wins — the popup-marked chunk
+    is the one read."""
+    timeout_dialog = (
+        '<div class="ui-dialog ui-widget" style="display: block;">'
+        "<p>Your session will expire soon</p></div>"
+    )
+    state = read_search_state(_LIVE_CPV_POPUP_HTML + timeout_dialog)
+    assert state.status == "results"
+    assert state.nodes[0].node_id == "node~CPV~45000000-7"
+    # And in front of the popup too.
+    state = read_search_state(timeout_dialog + _LIVE_CPV_POPUP_HTML)
+    assert state.status == "results"
+
+
+def test_unwrapped_popup_survives_a_hidden_dialog_elsewhere_on_the_page():
+    """Safety net for older tenant variants: the popup renders WITHOUT a
+    ui-dialog wrapper while some unrelated hidden dialog sits appended at
+    the end of body — the pre-wrapper page content must still be read (not
+    classified pending forever)."""
+    unwrapped = (
+        '<div id="DivTree"><ul class="dynatree-container">'
+        '<li id="node~CPV~45000000-7"><span class="dynatree-node">'
+        '<span class="dynatree-checkbox">&nbsp;</span>'
+        '<a class="dynatree-title">45000000-7 - Construction work</a>'
+        "</span></li></ul></div>"
+    )
+    state = read_search_state(unwrapped + _STALE_DIALOG_VISIBLE_MARKER)
+    assert state.status == "results"
+    assert state.nodes[0].node_id == "node~CPV~45000000-7"
+
+
+def test_no_results_visible_requires_displayed_marker():
+    hidden = '<div id="divNoSearchResults" style="display: none;">none</div>'
+    shown = '<div id="divNoSearchResults">none</div>'
+    assert no_results_visible(hidden) is False
+    assert no_results_visible(shown) is True
+    assert no_results_visible(hidden + shown) is True
+
+
+def test_match_falls_back_to_title_prefix_when_token_missing():
+    """Fix 1 belt-and-braces: a title whose leading token the extractor
+    didn't recognise still matches by check-digit-tolerant prefix."""
+    node = DynatreeNode(
+        node_id="node~CPV~45000000-7",
+        title_text="45000000-7 - Construction work",
+        code_token=None,  # token extraction failed (formatting drift)
+    )
+    match = match_node_for_code([node], "45000000")
+    assert match is node
+    # A different code must NOT prefix-match.
+    assert match_node_for_code([node], "45100000") is None
+
+
+def test_selection_confirmed_reads_the_open_dialogs_selected_panel():
+    ticked = _LIVE_CPV_POPUP_HTML.replace(
+        '<div id="DivSelected"></div>',
+        '<div id="DivSelected"><span>45000000-7 - Construction work</span></div>',
+    )
+    assert selection_confirmed(ticked, "45000000") is True
+    # Panel present but the selection is missing -> explicit False.
+    assert selection_confirmed(_LIVE_CPV_POPUP_HTML, "45000000") is False
+    # Panel absent -> None (cannot verify, never treated as failure).
+    assert selection_confirmed("<div id='DivTree'></div>", "45000000") is None
+
+
+def test_node_checkbox_selector_scoped_variant():
+    bare = node_checkbox_selector("node~CPV~45000000-7")
+    scoped = node_checkbox_selector("node~CPV~45000000-7", scoped=True)
+    assert bare == 'li[id="node~CPV~45000000-7"] span.dynatree-checkbox'
+    assert scoped == f".ui-dialog:visible {bare}"
