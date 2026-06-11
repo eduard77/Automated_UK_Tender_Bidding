@@ -49,6 +49,9 @@ dev = [
     "pytest-asyncio>=0.24.0",
     "ruff>=0.7.0",
     "mypy>=1.13.0",
+    # Dashboard bot (tests/e2e/dashboard_bot/) reads its check-spec YAML
+    # files via PyYAML. Small, well-known, no runtime import in shipped code.
+    "PyYAML>=6.0",
 ]
 # playwright-stealth is best-effort; the browser manager degrades gracefully if
 # it's absent or its API drifts. Kept in an optional extra so a broken release
@@ -77,3 +80,6 @@ select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "SIM", "RET"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+  "e2e: live-dashboard end-to-end check (skipped unless E2E=1 in the env)",
+]

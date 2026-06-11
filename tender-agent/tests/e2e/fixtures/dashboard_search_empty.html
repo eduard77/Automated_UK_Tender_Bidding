@@ -1,0 +1,20 @@
+<!--
+  EmptyState rendered when SearchPage.tsx finds zero results: the
+  handover's "CPV filter currently returns nothing for Proactis" path.
+  The parser must return [] for this DOM and the verdict-logic must
+  classify max_results=0 as a satisfied OBSERVED_GAP for the matching
+  spec.
+-->
+<form aria-label="Tender search filters">
+  <fieldset>
+    <legend>Source (default: all)</legend>
+    <button type="button" aria-pressed="true">Proactis / ProContract</button>
+  </fieldset>
+</form>
+
+<section>
+  <div>
+    <h2>No tenders match these filters.</h2>
+    <p>Try widening the value range, clearing the deadline window, or removing a source restriction.</p>
+  </div>
+</section>
