@@ -7,6 +7,7 @@ Reference: https://www.find-tender.service.gov.uk/apidocumentation
 """
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
@@ -35,6 +36,22 @@ class FTSAdapter(SourceAdapter):
             page += 1
             try:
                 payload = await self._get_json(url, params=params if page == 1 else None)
+            except json.JSONDecodeError as exc:
+                # A malformed / truncated feed response. FTS occasionally
+                # returns a bad batch (a transient JSONDecodeError was observed
+                # 2026-06-12). Catch it, log it, and stop paginating for THIS
+                # cycle WITHOUT failing the run: one unparseable page must not
+                # turn a ~4,000-tender source red, and we can't read a `next`
+                # cursor out of it to continue anyway. The releases already
+                # yielded this cycle stand; the next cycle retries from the
+                # watermark. Trade-off (accepted, operator's call 2026-06-12):
+                # a PERSISTENTLY malformed feed reads as a clean poll rather
+                # than fetch_failing — acceptable because FTS is high-volume
+                # and transient bad batches are the observed reality.
+                logger.warning(
+                    "fts.malformed_feed", error=str(exc), url=url, page=page
+                )
+                break
             except Exception as exc:
                 self.had_errors = True
                 self.record_error(f"{type(exc).__name__}: {exc}")

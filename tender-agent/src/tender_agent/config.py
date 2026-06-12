@@ -87,17 +87,19 @@ class Settings(BaseSettings):
     # (used for the Source row); `eu_supply_portals` is the full host list the
     # adapter sweeps. Add tenants here as the operator needs them.
     eu_supply_api_base: str = "https://yortender.eu-supply.com"
-    # bluelight.eu-supply.com is the police/emergency-services ("Blue Light")
-    # tenant flagged by the portal survey. Added to the default sweep — the
-    # adapter is host-parameterised so this is pure config. NOTE: could not
-    # be live-verified from CI (eu-supply.com 403s datacenter IPs); the
-    # survey also mentioned uk.eu-supply.com, NOT added here to avoid
-    # double-ingesting if it aliases the same tenants — verify in the
-    # structured logs after the first scheduled sweep.
+    # bluelight.eu-supply.com ("Blue Light", police/emergency services) was
+    # added to the default sweep from the portal survey but could not be
+    # live-verified from CI. The 2026-06-12T11:26Z live sources-health readout
+    # proved its /ctm/Supplier/PublicTenders path returns 404 — that tenant
+    # doesn't expose the public listing at the standard CTM path (or the host
+    # is wrong). REMOVED from the default sweep so it stops erroring every
+    # cycle; the working tenant(s) keep ingesting (25 tenders in that readout).
+    # We don't guess a replacement URL — re-add a corrected Blue Light tenant
+    # host here if the operator determines one. (The survey also mentioned
+    # uk.eu-supply.com; not added, for the same unverified reason.)
     eu_supply_portals: list[str] = Field(
         default_factory=lambda: [
             "https://yortender.eu-supply.com",
-            "https://bluelight.eu-supply.com",
         ]
     )
 

@@ -9,7 +9,7 @@ previous phase being marked DONE.
 | Phase | Title                                                       | Verdict       | Date       | Notes                                                                |
 | ----- | ----------------------------------------------------------- | ------------- | ---------- | -------------------------------------------------------------------- |
 | 0     | Reusable dashboard bot                                      | **PASS** (CI) | 2026-06-11 | Unit-test gate green; live gate is the operator's runbook below.     |
-| 1     | Get the silent sources pulling (Atamis, EU-Supply, Sell2Wales) | **IN PROGRESS (rev 4)** | 2026-06-12 | rev 4: concurrent per-source poll so a high-volume source (FTS) can't starve the tail; gate awaits next health readout. |
+| 1     | Get the silent sources pulling (Atamis, EU-Supply, Sell2Wales) | **PASS — with-blocked-upstreams-recorded** | 2026-06-12 | Every source reached each cycle; ATAMIS/EU_SUPPLY now ingest. Remaining 2 (NI 500, S2W expired-cert) are proven upstream outages, recorded in accounts-needed.md. |
 | 2     | Fix run-15-class discovery errors                           | not started   | —          |                                                                      |
 | 3     | Cross-source CPV/field normalisation (the spine)            | not started   | —          | Likely NEEDS DECISION when reached.                                  |
 | 4     | Keyword/value/buyer filters as first-class                  | not started   | —          |                                                                      |
@@ -540,3 +540,79 @@ read the Log stream for `poll_source_attempt` on EU_SUPPLY + ATAMIS, then
 open `GET /admin/diagnostics/sources-health` and paste the JSON. The CI
 dashboard-bot is the automated gate; the residential-IP live bot run is
 optional.
+
+## Phase 1 — PASS — with-blocked-upstreams-recorded (2026-06-12): gate evidence in, phase closed
+
+### Verdict: Phase 1 PASS (with-blocked-upstreams-recorded)
+
+The rev-4 concurrent-poll fix (#126) is merged and live. The operator ran
+the live browser gate and captured the `sources-health` readout
+(2026-06-12T11:26Z). **Every registered source is now reached each cycle —
+the Phase 1 goal is MET.**
+
+### Gate evidence (operator browser readout, 2026-06-12T11:26Z)
+
+| Source | State | Result |
+| --- | --- | --- |
+| **ATAMIS** | was `never_polled` → has a run, **tender_count 70** | ✅ REACHED + ingesting |
+| **EU_SUPPLY** | was `never_polled` → runs present, **tender_count 25** | ✅ REACHED + ingesting |
+| **CF** | healthy, fresh run | 5665 tenders |
+| **FTS** | healthy, fresh run | 3977 tenders |
+| **PCS** | healthy, fresh run | 51 tenders |
+| **PROACTIS** | `stale_not_polling` | 264 — logged-in discovery is manual/separate; expected |
+| **NI (eTendersNI)** | `fetch_failing` → **HTTP 500** | upstream server fault (recorded) |
+| **S2W (Sell2Wales)** | `fetch_failing` → **SSL cert expired** | upstream cert fault (recorded) |
+
+The tail sources (EU_SUPPLY, ATAMIS) that were the original "silent sources"
+now poll and ingest. The two remaining failures are **genuine upstream
+outages on the providers' side**, now PROVEN by specific error strings (the
+rev-2 `record_error` path, finally exercised because the sources are reached).
+
+### What this PR ships (the small in-scope close-out fixes)
+
+1. **EU-Supply Blue Light host removed.** The readout showed one configured
+   EU-Supply host, `bluelight.eu-supply.com`, 404ing on
+   `/ctm/Supplier/PublicTenders` (the working tenant pulled 25 tenders).
+   `bluelight.eu-supply.com` is removed from the default `eu_supply_portals`
+   so it stops erroring every cycle; the working tenant(s) keep ingesting. No
+   replacement URL is guessed — a corrected Blue Light tenant host can be
+   re-added by the operator. (`config.py`; test flipped to pin exclusion.)
+2. **FTS malformed-feed resilience.** The readout noted a transient
+   `JSONDecodeError` on a prior FTS run (a malformed batch). The adapter now
+   catches `json.JSONDecodeError` separately, logs `fts.malformed_feed`, and
+   stops paginating for that cycle WITHOUT setting `had_errors` — one bad
+   batch can no longer flip a ~4,000-tender source to `fetch_failing`; the
+   next cycle retries from the watermark. (Trade-off noted in-code: a
+   *persistently* malformed feed would read as a clean poll rather than
+   fetch_failing — accepted for a high-volume source where transient bad
+   batches are the observed reality.) Two tests added (single bad page;
+   bad page mid-stream keeps the earlier records).
+3. **Blocked-upstreams recorded** in `docs/accounts-needed.md`: eTendersNI
+   (HTTP 500) and Sell2Wales (expired TLS cert) as provider-side outages,
+   plus the EU-Supply Blue Light 404 removal. The Sell2Wales note explicitly
+   warns against disabling cert verification as a workaround (MITM exposure);
+   default is wait-for-upstream.
+
+Overlapping manual + scheduled polls were seen leaving runs stuck `running`;
+the existing `_orphan_stale_running_runs` self-heal already cleans these at
+the top of every cycle, so no new guard is added (noted, not expanded —
+out of scope to over-engineer).
+
+### Tests (offline, no Postgres)
+
+- `tests/test_adapter_fts.py`: malformed feed response doesn't fail the run
+  (`had_errors` stays False, nothing yielded); a bad batch on a later page
+  keeps page-1's records and still completes. Existing 5 FTS patterns pass.
+- `tests/test_adapter_eu_supply.py`: the default sweep no longer includes the
+  404-ing `bluelight.eu-supply.com`; the working-host sweep still ingests
+  (existing single/multi-host + one-host-failure tests pass).
+- Concurrent-poll, enrichment-worker, watermark/reconcile, and self-heal
+  tests all still green (no regression).
+- Ruff clean.
+
+### Phase 1 is DONE
+
+Every source is reached each cycle; six ingest; the remaining two are
+recorded upstream outages. **Phase 2 (fix run-15-class Proactis discovery
+errors) is the next phase to attempt on the following harness run** — not
+started in this run per the one-phase-per-run gate.
