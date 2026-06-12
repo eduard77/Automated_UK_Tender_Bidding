@@ -102,3 +102,136 @@ async def test_handles_malformed_entry_gracefully() -> None:
     assert len(tenders) == 5
     titles = [t.title for t in tenders]
     assert not any("Malformed: no ocid" in title for title in titles)
+
+
+# ---------------------------------------------------------------------------
+# 429 handling + pacing + incremental watermark (2026-06-12 CF 429 spiral)
+# ---------------------------------------------------------------------------
+
+
+def _release(ocid: str, date: str) -> dict:
+    return {
+        "ocid": ocid,
+        "id": f"{ocid}-1",
+        "date": date,
+        "tag": ["tender"],
+        "tender": {"title": f"Tender {ocid}", "status": "active"},
+    }
+
+
+def _page(releases: list[dict], next_url: str | None) -> dict:
+    payload: dict = {"releases": releases}
+    if next_url:
+        payload["links"] = {"next": next_url}
+    return payload
+
+
+def _no_sleep_adapter(handler) -> tuple[ContractsFinderAdapter, list[float]]:
+    """Adapter with MockTransport + recorded (not slept) sleeps."""
+    adapter = build_adapter(ContractsFinderAdapter, handler)
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    adapter._sleep = fake_sleep
+    return adapter, sleeps
+
+
+async def test_429_with_retry_after_is_honoured_then_succeeds() -> None:
+    """One 429 carrying Retry-After: the adapter waits THAT long (not a
+    blind hammer-retry) and the page then succeeds."""
+    calls = {"n": 0}
+    page = _page([_release("ocds-cf-1", "2026-06-10T10:00:00Z")], None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429, headers={"Retry-After": "7"})
+        return httpx.Response(200, json=page)
+
+    adapter, sleeps = _no_sleep_adapter(handler)
+    tenders = await collect(adapter, CUTOFF)
+
+    assert len(tenders) == 1
+    assert adapter.had_errors is False
+    assert 7.0 in sleeps  # the Retry-After value, honoured verbatim
+
+
+async def test_persistent_429_aborts_gracefully_keeping_progress() -> None:
+    """Pages 1+2 succeed, page 3 is 429 forever: the run aborts AFTER the
+    bounded retry budget with a clear error — and the watermark covers the
+    CONFIRMED pages, so the next run's window shrinks instead of replaying
+    the whole backlog (the spiral)."""
+    page1 = _page(
+        [_release("ocds-cf-1", "2026-06-01T10:00:00Z")], "https://x.test/p2"
+    )
+    page2 = _page(
+        [_release("ocds-cf-2", "2026-06-05T10:00:00Z")], "https://x.test/p3"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/p2" in str(request.url):
+            return httpx.Response(200, json=page2)
+        if "/p3" in str(request.url):
+            return httpx.Response(429)
+        return httpx.Response(200, json=page1)
+
+    adapter, sleeps = _no_sleep_adapter(handler)
+    tenders = await collect(adapter, CUTOFF)
+
+    assert len(tenders) == 2  # both good pages ingested before the abort
+    assert adapter.had_errors is True
+    assert any("429" in m for m in adapter.error_messages)
+    # Page 2's processing confirmed page 1; page 3 never confirmed page 2 —
+    # the safe watermark is page 1's max.
+    assert adapter.progress_watermark == datetime(
+        2026, 6, 1, 10, 0, tzinfo=UTC
+    )
+    # Backoff happened between 429 attempts (no Retry-After → exponential).
+    assert any(s >= 10.0 for s in sleeps)
+
+
+async def test_pages_are_paced_with_inter_page_delay() -> None:
+    """Back-to-back page pulls tripped CF's rate limiter — pages after the
+    first now wait INTER_PAGE_DELAY_S."""
+    from tender_agent.adapters.contracts_finder import INTER_PAGE_DELAY_S
+
+    page1 = _page(
+        [_release("ocds-cf-1", "2026-06-01T10:00:00Z")], "https://x.test/p2"
+    )
+    page2 = _page([_release("ocds-cf-2", "2026-06-05T10:00:00Z")], None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/p2" in str(request.url):
+            return httpx.Response(200, json=page2)
+        return httpx.Response(200, json=page1)
+
+    adapter, sleeps = _no_sleep_adapter(handler)
+    await collect(adapter, CUTOFF)
+
+    assert INTER_PAGE_DELAY_S in sleeps
+
+
+async def test_descending_feed_never_advances_watermark() -> None:
+    """Safety property of the confirm-then-advance tracker: if pages arrive
+    NEWEST-first, a partial watermark would skip the older unfetched pages —
+    so it must never advance."""
+    page1 = _page(
+        [_release("ocds-cf-9", "2026-06-09T10:00:00Z")], "https://x.test/p2"
+    )
+    page2 = _page(
+        [_release("ocds-cf-1", "2026-06-01T10:00:00Z")], "https://x.test/p3"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/p2" in str(request.url):
+            return httpx.Response(200, json=page2)
+        if "/p3" in str(request.url):
+            return httpx.Response(429)
+        return httpx.Response(200, json=page1)
+
+    adapter, _sleeps = _no_sleep_adapter(handler)
+    await collect(adapter, CUTOFF)
+
+    assert adapter.progress_watermark is None  # frozen, never advanced

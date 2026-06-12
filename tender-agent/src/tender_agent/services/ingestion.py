@@ -134,9 +134,11 @@ async def poll_source(db: Session, source: Source) -> PollRun:
     fetched = new_count = updated_count = 0
     error: str | None = None
     had_errors = False
+    adapter = None
 
     try:
-        async with adapter_cls() as adapter:
+        adapter = adapter_cls()
+        async with adapter:
             async for normalised in adapter.fetch_since(since):
                 fetched += 1
                 tender, action = _upsert_tender(db, normalised)
@@ -196,6 +198,25 @@ async def poll_source(db: Session, source: Source) -> PollRun:
         run.status = "error"
         logger.exception("ingest.failed", source=source.code)
         db.rollback()
+
+    # Partial-progress watermark (2026-06-12, the CF 429 spiral): a FAILED
+    # run used to leave `last_polled_at` untouched, so every retry re-fetched
+    # the entire window — re-triggering the very rate limit that failed it.
+    # Paging adapters now report the timestamp safely covered by CONFIRMED
+    # pages; persist it so retries shrink. Monotonic: never moves backwards.
+    if run.status == "error" and adapter is not None:
+        progress = getattr(adapter, "progress_watermark", None)
+        if progress is not None:
+            current = source.last_polled_at
+            if current is not None and current.tzinfo is None:
+                current = current.replace(tzinfo=UTC)
+            if current is None or progress > current:
+                source.last_polled_at = progress
+                logger.info(
+                    "ingest.partial_watermark_advance",
+                    source=source.code,
+                    watermark=progress.isoformat(),
+                )
 
     run.fetched = fetched
     run.new_count = new_count

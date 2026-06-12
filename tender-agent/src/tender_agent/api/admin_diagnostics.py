@@ -164,8 +164,23 @@ class SourceHealthRead(BaseModel):
     diagnosis: str
 
 
+class SchedulerHeartbeatRead(BaseModel):
+    """Liveness of the poll scheduler itself (2026-06-12 outage: per-source
+    diagnoses said `stale_not_polling` while the actual fault was a DEAD
+    scheduler — this block makes that distinction readable at a glance)."""
+
+    scheduler_running: bool
+    process_started_at: str | None
+    last_cycle_started_at: str | None
+    last_cycle_finished_at: str | None
+    cycle_running: bool
+    last_cycle_error: str | None
+    next_cycle_at: str | None
+
+
 class SourcesHealthResponse(BaseModel):
     generated_at: str
+    scheduler: SchedulerHeartbeatRead
     sources: list[SourceHealthRead]
 
 
@@ -294,7 +309,28 @@ def sources_health(db: Session = Depends(get_db)) -> SourcesHealthResponse:
             )
         )
     return SourcesHealthResponse(
-        generated_at=now.isoformat(), sources=out
+        generated_at=now.isoformat(),
+        scheduler=_scheduler_heartbeat_read(),
+        sources=out,
+    )
+
+
+def _iso_or_none(value) -> str | None:
+    return value.isoformat() if isinstance(value, datetime) else None
+
+
+def _scheduler_heartbeat_read() -> SchedulerHeartbeatRead:
+    from tender_agent import scheduler as scheduler_module
+
+    beat = scheduler_module.heartbeat()
+    return SchedulerHeartbeatRead(
+        scheduler_running=bool(beat.get("scheduler_running")),
+        process_started_at=_iso_or_none(beat.get("process_started_at")),
+        last_cycle_started_at=_iso_or_none(beat.get("last_cycle_started_at")),
+        last_cycle_finished_at=_iso_or_none(beat.get("last_cycle_finished_at")),
+        cycle_running=bool(beat.get("cycle_running")),
+        last_cycle_error=beat.get("last_cycle_error"),
+        next_cycle_at=_iso_or_none(beat.get("next_cycle_at")),
     )
 
 

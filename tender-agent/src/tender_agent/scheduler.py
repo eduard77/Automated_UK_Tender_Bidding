@@ -32,8 +32,60 @@ from tender_agent.services.ingestion import poll_source
 #: comfortably exceeds even a stuck Proactis cycle without false-positives.
 ORPHAN_POLL_RUN_AFTER = timedelta(minutes=90)
 
+#: How long after a `running` PollRun started we still treat it as genuinely
+#: active (per-source single-flight: a new cycle SKIPS such a source instead
+#: of starting a duplicate poll). Derived from the per-source timeout plus a
+#: margin, so a run our own timeout would have killed is never respected.
+def _active_run_grace() -> timedelta:
+    return timedelta(minutes=settings.poll_source_timeout_minutes + 5)
+
+
+#: Delay before the FIRST poll cycle after boot. The job used to start with
+#: next_run_time=None, so a deploy waited a full poll_interval (30 min)
+#: before discovering anything — during the 2026-06-12 outage that read as
+#: "two deploys and still no polls". 90 s lets the app finish booting, then
+#: discovery resumes promptly.
+FIRST_CYCLE_DELAY_S = 90
+
 logger = structlog.get_logger(__name__)
 _scheduler: AsyncIOScheduler | None = None
+
+#: Global single-flight for the poll cycle (2026-06-12 outage: `trigger_now`
+#: spawned poll_all OUTSIDE APScheduler's max_instances=1 guard, so a manual
+#: poll-now ran CONCURRENTLY with the scheduled cycle — the duplicate
+#: 11:23:34/11:25:00 batches. Concurrent cycles upsert the same rows and can
+#: deadlock each other on row locks). One cycle at a time, ever.
+_poll_cycle_lock = asyncio.Lock()
+
+#: Scheduler heartbeat — exposed via sources-health so a DEAD scheduler is
+#: distinguishable from individually-failing sources at a glance. In-memory
+#: on purpose (it describes THIS process's scheduler).
+_heartbeat: dict = {
+    "process_started_at": datetime.now(UTC),
+    "last_cycle_started_at": None,
+    "last_cycle_finished_at": None,
+    "cycle_running": False,
+    "last_cycle_error": None,
+}
+
+
+def heartbeat() -> dict:
+    """Snapshot of the scheduler's liveness for the health endpoint."""
+    job = None
+    if _scheduler is not None:
+        job = _scheduler.get_job("poll_all")
+    next_run = getattr(job, "next_run_time", None)
+    return {
+        "scheduler_running": _scheduler is not None and bool(
+            getattr(_scheduler, "running", False)
+        ),
+        "process_started_at": _heartbeat["process_started_at"],
+        "last_cycle_started_at": _heartbeat["last_cycle_started_at"],
+        "last_cycle_finished_at": _heartbeat["last_cycle_finished_at"],
+        "cycle_running": _heartbeat["cycle_running"],
+        "last_cycle_error": _heartbeat["last_cycle_error"],
+        "next_cycle_at": next_run,
+    }
 
 
 async def proactis_discovery_job() -> None:
@@ -155,6 +207,61 @@ def _orphan_stale_running_runs(db) -> int:
         return 0
 
 
+def _source_run_still_active(source_id: int) -> bool:
+    """True when the source's NEWEST PollRun is `running` and recent enough
+    to be genuinely in flight (per-source single-flight across processes —
+    a deploy overlap runs two app instances briefly, and PollRun rows are
+    the shared state both can see)."""
+    with SessionLocal() as db:
+        newest = (
+            db.execute(
+                select(PollRun)
+                .where(PollRun.source_id == source_id)
+                .order_by(PollRun.started_at.desc())
+                .limit(1)
+            )
+            .scalars()
+            .first()
+        )
+    if newest is None or newest.status != "running":
+        return False
+    started = newest.started_at
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    return datetime.now(UTC) - started < _active_run_grace()
+
+
+def _mark_timed_out_run(source_id: int, source_code: str, timeout_s: float) -> None:
+    """A cancelled (timed-out) poll leaves its PollRun in `running`; flip it
+    to a self-explanatory error so sources-health tells the truth."""
+    try:
+        with SessionLocal() as db:
+            newest = (
+                db.execute(
+                    select(PollRun)
+                    .where(PollRun.source_id == source_id)
+                    .where(PollRun.status == "running")
+                    .order_by(PollRun.started_at.desc())
+                    .limit(1)
+                )
+                .scalars()
+                .first()
+            )
+            if newest is None:
+                return
+            newest.status = "error"
+            newest.error = (
+                f"poll timed out after {int(timeout_s)}s and was cancelled "
+                "(scheduler self-heal — the cycle moved on)"
+            )
+            newest.finished_at = datetime.now(UTC)
+            db.commit()
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "scheduler.timeout_mark_failed", source=source_code
+        )
+
+
 async def _poll_one_source(
     source_id: int, source_code: str, sem: asyncio.Semaphore
 ) -> None:
@@ -162,13 +269,18 @@ async def _poll_one_source(
 
     Runs as one task inside `poll_all`'s `asyncio.gather`. Each task opens
     its own `SessionLocal()` — SQLAlchemy Sessions are NOT safe to share
-    across concurrent tasks, so the cycle never threads one session through
-    the fan-out. The per-source `scheduler.poll_source_attempt` line is
-    emitted here (before any work) so the Log stream answers "did we even
-    try to poll X?" for EVERY source, every cycle — including the tail
-    sources (EU_SUPPLY/ATAMIS) the old serial loop never reached. Exceptions
-    are logged and swallowed so one source failing can't cancel its siblings
-    in the gather.
+    across concurrent tasks. The per-source `scheduler.poll_source_attempt`
+    line is emitted before any work so the Log stream answers "did we even
+    try to poll X?" for EVERY source, every cycle.
+
+    2026-06-12 outage hardening:
+    - per-source single-flight: a source whose previous run is still
+      genuinely active is SKIPPED, not double-polled (duplicate concurrent
+      polls of the same source caused row-lock contention);
+    - a hard timeout: a hung source is cancelled after
+      `poll_source_timeout_minutes`, its run marked errored, and the cycle
+      completes — a stuck source can never again wedge `poll_all` (which,
+      under max_instances=1, killed every future cycle).
     """
     adapter_in_registry = source_code in ADAPTERS
     logger.info(
@@ -183,16 +295,73 @@ async def _poll_one_source(
         return
     async with sem:
         try:
-            with SessionLocal() as db:
-                source = db.get(Source, source_id)
-                if source is None:
-                    return
-                await poll_source(db, source)
+            if _source_run_still_active(source_id):
+                logger.warning(
+                    "scheduler.poll_source_skipped_active",
+                    source=source_code,
+                    detail="previous run still in flight — single-flight skip",
+                )
+                return
+        except Exception:  # noqa: BLE001 — the check must never block polling
+            logger.exception(
+                "scheduler.active_check_failed", source=source_code
+            )
+        timeout_s = settings.poll_source_timeout_minutes * 60
+        try:
+            await asyncio.wait_for(
+                _poll_source_on_own_session(source_id), timeout=timeout_s
+            )
+        except TimeoutError:
+            logger.error(
+                "scheduler.poll_source_timed_out",
+                source=source_code,
+                timeout_seconds=timeout_s,
+            )
+            _mark_timed_out_run(source_id, source_code, timeout_s)
         except Exception:  # noqa: BLE001
             logger.exception("scheduler.source_failed", source=source_code)
 
 
+async def _poll_source_on_own_session(source_id: int) -> None:
+    with SessionLocal() as db:
+        source = db.get(Source, source_id)
+        if source is None:
+            return
+        await poll_source(db, source)
+
+
 async def poll_all() -> None:
+    """One poll cycle — SINGLE-FLIGHT, heartbeat-stamped, exception-proof.
+
+    The scheduled job and the manual `trigger_now` both land here; the
+    module-level lock guarantees one cycle at a time no matter who fired it
+    (2026-06-12 outage: a manual poll-now ran concurrently with the
+    scheduled cycle because trigger_now bypassed APScheduler's
+    max_instances=1). A second invocation is skipped with a log line, never
+    queued. The body never raises — the scheduler job survives any failure
+    and the next interval fires normally.
+    """
+    if _poll_cycle_lock.locked():
+        logger.warning(
+            "scheduler.poll_cycle_skipped_already_running",
+            started_at=_heartbeat["last_cycle_started_at"],
+        )
+        return
+    async with _poll_cycle_lock:
+        _heartbeat["last_cycle_started_at"] = datetime.now(UTC)
+        _heartbeat["cycle_running"] = True
+        _heartbeat["last_cycle_error"] = None
+        try:
+            await _run_poll_cycle()
+        except Exception as exc:  # noqa: BLE001 — the job must survive anything
+            _heartbeat["last_cycle_error"] = f"{type(exc).__name__}: {exc}"[:500]
+            logger.exception("scheduler.poll_cycle_failed")
+        finally:
+            _heartbeat["cycle_running"] = False
+            _heartbeat["last_cycle_finished_at"] = datetime.now(UTC)
+
+
+async def _run_poll_cycle() -> None:
     """Poll every enabled source CONCURRENTLY — one task + session per source.
 
     Self-heals scheduling at the top of every cycle (`ensure_sources()`):
@@ -200,17 +369,11 @@ async def poll_all() -> None:
     here, so it joins the very next cycle instead of waiting for a
     redeploy.
 
-    Phase-1 rev 4 (2026-06-12): the loop used to `await poll_source(...)`
-    for each source IN SERIES, so a high-volume source blocked every source
-    after it. The live Log stream proved one cycle spent over a minute still
-    inside FTS (streaming 160+ tenders) and never logged a
-    `poll_source_attempt` for the tail (EU_SUPPLY/PROACTIS/ATAMIS) — that is
-    the entire reason they read `never_polled`. Decoupling enrichment (rev 3)
-    took the AI call off the hot path but the ingestion VOLUME itself still
-    monopolised the cycle. Now each source fans out onto its own task via
-    `asyncio.gather`, bounded by a semaphore, so FTS churning thousands of
-    rows can't starve the others — every source records a poll run each
-    cycle regardless of FTS's size.
+    Phase-1 rev 4 (2026-06-12): each source fans out onto its own task via
+    `asyncio.gather`, bounded by a semaphore, so a high-volume source can't
+    starve the others. Each task carries its own hard timeout (see
+    `_poll_one_source`), so the gather — and therefore the cycle — is always
+    bounded.
     """
     # Self-heal: ensure every registered adapter has a Source row at the
     # start of every cycle. Idempotent and cheap; covers the boot-order
@@ -266,9 +429,16 @@ def start() -> None:
         poll_all,
         trigger=IntervalTrigger(minutes=settings.poll_interval_minutes),
         id="poll_all",
-        next_run_time=None,  # don't run immediately on startup; trigger via API or first interval
+        # First cycle shortly after boot (2026-06-12 outage: next_run_time=None
+        # meant a deploy waited a full interval before polling anything, which
+        # read as "two deploys and still no polls"). Single-flight +
+        # per-source timeouts make an early first cycle safe.
+        next_run_time=datetime.now(UTC) + timedelta(seconds=FIRST_CYCLE_DELAY_S),
         coalesce=True,
         max_instances=1,
+        # A cycle is hard-bounded by per-source timeouts; if the process was
+        # suspended past a trigger, run once when it wakes rather than never.
+        misfire_grace_time=300,
     )
     # Proactis discovery — runs on its own interval, only when enabled.
     # Browser-driven and slower than HTTP polling; runs in the same
@@ -341,6 +511,19 @@ def stop() -> None:
         _scheduler = None
 
 
-async def trigger_now() -> None:
-    """Run a poll cycle immediately. Useful for testing or API-driven triggers."""
-    asyncio.create_task(poll_all())
+async def trigger_now() -> bool:
+    """Fire a poll cycle immediately. Returns False (and does nothing) when a
+    cycle is already running — manual triggers share the same single-flight
+    lock as the scheduled job, so a poll-now can never again run concurrently
+    with a scheduled cycle (the 2026-06-12 duplicate-poll cause)."""
+    if _poll_cycle_lock.locked():
+        logger.warning("scheduler.trigger_now_skipped_already_running")
+        return False
+    task = asyncio.create_task(poll_all())
+    # Keep a reference so the task isn't garbage-collected mid-flight.
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return True
+
+
+_background_tasks: set = set()

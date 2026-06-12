@@ -209,17 +209,61 @@ async def test_one_host_failure_does_not_stop_the_sweep() -> None:
     assert len(tenders) == 5  # the healthy host still delivered
 
 
-def test_default_portal_sweep_excludes_broken_blue_light_host() -> None:
-    """bluelight.eu-supply.com was REMOVED from the DEFAULT sweep: the live
-    2026-06-12T11:26Z sources-health readout proved its
-    /ctm/Supplier/PublicTenders path 404s (that tenant has no public listing
-    at the standard CTM path). The default keeps the working tenant(s) so
-    EU-Supply keeps ingesting; a corrected Blue Light URL can be re-added by
-    the operator. The host-parameterised sweep tests above prove the adapter
-    still handles arbitrary hosts — this pins the default against a regression
-    that re-introduces the 404-ing host."""
+def test_default_portal_sweep_uses_corrected_blue_light_url() -> None:
+    """Blue Light's listing MOVED (live-probed 2026-06-12): the old
+    bluelight.eu-supply.com host 404s at the standard CTM path; its portal
+    page links to the central host with a buyer-group filter. The default
+    sweep carries the corrected FULL URL and never the broken host."""
     from tender_agent.config import Settings
 
     default_portals = Settings.model_fields["eu_supply_portals"].default_factory()
     assert "https://bluelight.eu-supply.com" not in default_portals
     assert "https://yortender.eu-supply.com" in default_portals
+    assert (
+        "https://uk.eu-supply.com/ctm/Supplier/PublicTenders?B=BLUELIGHT"
+        in default_portals
+    )
+
+
+async def test_full_url_portal_entry_is_fetched_as_is() -> None:
+    """A portal entry that is already a full listing URL (contains /ctm/) is
+    requested verbatim — query string preserved — and its rows' relative
+    links absolutise onto that entry's origin."""
+    captured: list[httpx.Request] = []
+    html = load_text_fixture(FIXTURE)
+    adapter = _adapter(
+        static_text_handler(html, content_type="text/html", captured=captured),
+        portals=["https://uk.eu-supply.com/ctm/Supplier/PublicTenders?B=BLUELIGHT"],
+    )
+
+    tenders = await collect(adapter, datetime(2025, 1, 1, tzinfo=UTC))
+
+    assert len(captured) == 1
+    request = captured[0]
+    assert request.url.host == "uk.eu-supply.com"
+    assert request.url.path == "/ctm/Supplier/PublicTenders"
+    assert request.url.params.get("B") == "BLUELIGHT"
+    # Relative detail links land on the central host's origin.
+    assert len(tenders) == 5
+    assert all(
+        t.source_url.startswith("https://uk.eu-supply.com/") for t in tenders
+    )
+
+
+async def test_404_records_listing_url_changed_diagnosis() -> None:
+    """A 404 on a CTM listing means the tenant moved its public listing (the
+    Blue Light case). The error must SAY that, so the next reader doesn't
+    re-diagnose from scratch."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="not here")
+
+    adapter = _adapter(handler, portals=["https://gone.eu-supply.com"])
+    tenders = await collect(adapter, datetime(2025, 1, 1, tzinfo=UTC))
+
+    assert tenders == []
+    assert adapter.had_errors is True
+    assert any(
+        "404" in m and "CHANGED" in m and "EU_SUPPLY_PORTALS" in m
+        for m in adapter.error_messages
+    )

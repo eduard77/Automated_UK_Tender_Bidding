@@ -290,6 +290,30 @@ def test_health_stale_when_newest_run_finished_long_ago(client, factory) -> None
     assert cf["diagnosis"] == "stale_not_polling"
 
 
+def test_health_includes_scheduler_heartbeat(client, factory) -> None:
+    """2026-06-12 outage: per-source diagnoses said `stale_not_polling` while
+    the actual fault was a DEAD scheduler. The payload now carries a
+    top-level scheduler heartbeat so the two are distinguishable at a
+    glance. (No scheduler runs under tests → running=False.)"""
+    resp = client.get("/admin/diagnostics/sources-health")
+    assert resp.status_code == 200
+    body = resp.json()
+
+    assert "scheduler" in body
+    beat = body["scheduler"]
+    assert set(beat) == {
+        "scheduler_running",
+        "process_started_at",
+        "last_cycle_started_at",
+        "last_cycle_finished_at",
+        "cycle_running",
+        "last_cycle_error",
+        "next_cycle_at",
+    }
+    assert beat["scheduler_running"] is False  # not started in tests
+    assert beat["process_started_at"] is not None
+
+
 def test_health_rejects_anonymous(factory) -> None:
     def override():
         db = factory()

@@ -783,6 +783,72 @@ carrying a sector (`by_source[].classified > 0`).
 run. NOT built here. After that, Phase 4 (first-class keyword/value/buyer
 filters).
 
+## Discovery outage (2026-06-12 ~18:37 readout): scheduler stall + CF 429 spiral + FTS parse failures — fixed
+
+### Root causes (plain English)
+
+**Scheduler stall:** `trigger_now` (POST /admin/poll-now) spawned poll cycles
+OUTSIDE APScheduler's `max_instances=1` guard, so a manual trigger ran
+CONCURRENTLY with the scheduled cycle (the duplicate 11:23:34/11:25:00
+batches). Concurrent cycles upsert the same tender rows on sync SQLAlchemy
+sessions that hold their transactions open across HTTP awaits — a row-lock
+wait has NO timeout by default, so a blocked commit wedges forever (CF's
+11:11 run stuck `running`). `poll_all` never returned; `max_instances=1`
+then skipped every future cycle. Deploys didn't visibly help because
+`next_run_time=None` deferred the first post-boot cycle a full 30-min
+interval. Fixed by: a global single-flight lock shared by the scheduled job
+AND poll-now; per-source single-flight (a source with a genuinely-active
+`running` run is skipped — also covers deploy-overlap across processes); a
+hard per-source timeout (hung poll cancelled, its run marked errored, cycle
+completes); Postgres `lock_timeout`/`idle_in_transaction_session_timeout` on
+the engine; first cycle ~90 s after boot; and the cycle body never raises.
+
+**CF 429 spiral:** the watermark only advanced on FULL success, so every
+retry re-fetched the whole 10-day backlog (16+ pages back-to-back) — itself
+re-triggering the 429; worse, the blanket tenacity policy blind-retried each
+429 four times. Fixed: CF honours Retry-After (exponential backoff when
+absent, bounded attempts, graceful abort), pages are paced, and the
+watermark advances INCREMENTALLY per confirmed page (confirm-then-advance
+tracker — never advances on a descending feed), persisted even on failed
+runs so each retry's window shrinks.
+
+**FTS parse failures:** multi-MB pages died on a JSONDecodeError deep in the
+body, losing ~1000 already-parsed records AND the watermark. Fixed: bodies
+are verified against Content-Length (truncation is named + retried as a
+transport fault, read timeout raised to 90 s), and an unparseable page is
+SALVAGED record-by-record — a malformed notice fails alone (the scan
+resynchronises past it), everything recoverable is ingested, the watermark
+advances for what succeeded, and the error string carries the parse
+position + salvage count.
+
+**EU-Supply 404 (live-probed):** bluelight.eu-supply.com is now only a
+gateway page; its listing moved to
+`https://uk.eu-supply.com/ctm/supplier/publictenders?B=BLUELIGHT` (verified
+returning the standard CTM table, police/fire buyers). The adapter accepts
+full listing URLs, the default sweep carries the corrected URL, and a 404
+on a listing now records a "listing URL likely CHANGED" diagnosis.
+
+**Containment + visibility:** S2W's month sweep aborts after 2 consecutive
+failures (a dead upstream can't burn minutes of retries per cycle;
+eTendersNI/S2W remain recorded upstream outages — not fixed, contained).
+The sources-health payload now carries a top-level **scheduler heartbeat**
+(running, last cycle started/finished, cycle_running, last error, next
+cycle) so a dead scheduler is distinguishable from stale sources at a
+glance.
+
+### Tests
+
+26 net-new offline tests: hung-source timeout + orphan marking + cycle
+completion, global single-flight, per-source active-skip (and stale-run
+non-skip), trigger_now skip, heartbeat (incl. endpoint payload), cycle-body
+exception containment, CF Retry-After honoured / persistent-429 graceful
+abort with progress kept / inter-page pacing / descending-feed freeze,
+progress-tracker units, truncation detection units, FTS salvage (bad record
+fails alone, truncated prefix + watermark advance), partial-watermark
+persistence + monotonicity, EU-Supply full-URL entry + 404 diagnosis + the
+corrected Blue Light default, S2W consecutive-failure abort. Full suite 988
+passed / 3 skipped (the known dev-DB flake only). Ruff clean.
+
 ## Phase 3a — rev 2 (2026-06-12): backfill incident — root cause found, fixed, hardened
 
 ### What happened (live evidence)

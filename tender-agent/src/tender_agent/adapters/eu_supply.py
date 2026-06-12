@@ -28,12 +28,13 @@ from __future__ import annotations
 import re
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from urllib.parse import urlparse
 
 import httpx
 import structlog
 from tenacity import (
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential_jitter,
 )
@@ -45,6 +46,15 @@ from tender_agent.schemas import NormalisedTender
 logger = structlog.get_logger(__name__)
 
 LISTING_PATH = "/ctm/Supplier/PublicTenders"
+
+
+def _retry_transport_or_5xx(exc: BaseException) -> bool:
+    """Retry transport faults and 5xx — but NOT 4xx client errors: a 404
+    means the listing URL changed (the Blue Light case, 2026-06-12) and
+    retrying it just burns the cycle's time."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500
+    return isinstance(exc, httpx.HTTPError | httpx.TimeoutException)
 
 _TBODY_RE = re.compile(r"<tbody[^>]*>(.*?)</tbody>", re.IGNORECASE | re.DOTALL)
 _ROW_RE = re.compile(r"<tr[^>]*>(.*?)</tr>", re.IGNORECASE | re.DOTALL)
@@ -126,7 +136,7 @@ class EUSupplyAdapter(SourceAdapter):
         )
 
     @retry(
-        retry=retry_if_exception_type((httpx.HTTPError, httpx.TimeoutException)),
+        retry=retry_if_exception(_retry_transport_or_5xx),
         wait=wait_exponential_jitter(initial=1, max=30),
         stop=stop_after_attempt(4),
         reraise=True,
@@ -146,11 +156,45 @@ class EUSupplyAdapter(SourceAdapter):
         # unused here — see the reconcile note in `_row_to_tender`.
         del since
 
-        for host in self._portals:
-            host = host.rstrip("/")
-            url = f"{host}{LISTING_PATH}"
+        for portal in self._portals:
+            portal = portal.rstrip("/")
+            # An entry is either a bare tenant host (standard CTM path
+            # appended) or a FULL listing URL — e.g. Blue Light, whose
+            # listing moved to the central host with a buyer-group filter
+            # (uk.eu-supply.com/ctm/supplier/publictenders?B=BLUELIGHT,
+            # live-probed 2026-06-12). Relative links absolutise onto the
+            # entry's origin either way.
+            if "/ctm/" in portal.lower():
+                url = portal
+                parsed = urlparse(portal)
+                host = f"{parsed.scheme}://{parsed.netloc}"
+            else:
+                host = portal
+                url = f"{portal}{LISTING_PATH}"
             try:
                 html = await self._get_text(url)
+            except httpx.HTTPStatusError as exc:
+                self.had_errors = True
+                if exc.response.status_code == 404:
+                    # A 404 on a CTM listing means the tenant MOVED its
+                    # public listing (Blue Light did exactly this) — say so,
+                    # so the next reader doesn't re-diagnose from scratch.
+                    self.record_error(
+                        f"{host}: 404 at the configured listing URL — the "
+                        "tenant's public-tenders path has likely CHANGED; "
+                        "re-discover it (check the tenant's portal homepage "
+                        "for the new listing link) and update "
+                        "EU_SUPPLY_PORTALS"
+                    )
+                    logger.error(
+                        "eu_supply.listing_url_changed", host=host, url=url
+                    )
+                else:
+                    self.record_error(f"{host}: {type(exc).__name__}: {exc}")
+                    logger.error(
+                        "eu_supply.fetch_failed", host=host, error=str(exc)
+                    )
+                continue
             except httpx.HTTPError as exc:
                 self.had_errors = True
                 self.record_error(f"{host}: {type(exc).__name__}: {exc}")
