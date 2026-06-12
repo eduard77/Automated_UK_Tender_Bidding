@@ -13,6 +13,9 @@ from tender_agent.adapters import ADAPTERS
 from tender_agent.config import settings
 from tender_agent.db import SessionLocal
 from tender_agent.models import PollRun, Source
+from tender_agent.services.classification.classifier import (
+    process_pending_classification,
+)
 from tender_agent.services.discovery.proactis_discovery import (
     run as run_proactis_discovery,
 )
@@ -63,15 +66,34 @@ async def enrichment_worker_job() -> None:
     cycle terminates in predictable time even when a backlog has
     built up. Exceptions are logged and swallowed so a bad cycle can't
     trip-line the job queue."""
-    if not settings.enrichment_worker_enabled:
-        return
-    try:
-        with SessionLocal() as db:
-            await process_pending_enrichment(
-                db, limit=settings.enrichment_worker_batch_size
-            )
-    except Exception:  # noqa: BLE001
-        logger.exception("scheduler.enrichment_worker_failed")
+    if settings.enrichment_worker_enabled:
+        try:
+            with SessionLocal() as db:
+                await process_pending_enrichment(
+                    db, limit=settings.enrichment_worker_batch_size
+                )
+        except Exception:  # noqa: BLE001
+            logger.exception("scheduler.enrichment_worker_failed")
+
+    # Sector classification — Phase 3a (2026-06-12). Runs ALONGSIDE enrichment
+    # on the same interval but independent of matching: EVERY tender gets a
+    # sector, not just matched ones. Pushed off the event loop
+    # (asyncio.to_thread) because the per-tender Haiku call is synchronous and
+    # must not stall the concurrent poll tasks (the Phase-1 rev-4 lesson).
+    if settings.classifier_enabled:
+        try:
+            await asyncio.to_thread(_run_classification_batch)
+        except Exception:  # noqa: BLE001
+            logger.exception("scheduler.classification_worker_failed")
+
+
+def _run_classification_batch() -> int:
+    """Classify a bounded batch of not-yet-current tenders on its own session.
+    Runs in a worker thread (see `enrichment_worker_job`)."""
+    with SessionLocal() as db:
+        return process_pending_classification(
+            db, limit=settings.classifier_worker_batch_size
+        )
 
 
 async def email_poll_job() -> None:
@@ -288,7 +310,9 @@ def start() -> None:
     # interval so the polling hot path is never blocked behind PDF
     # downloads + Anthropic extraction. Same coalesce / max_instances
     # safety as the other jobs.
-    if settings.enrichment_worker_enabled:
+    # The enrichment worker job ALSO carries the sector-classification pass
+    # (Phase 3a), so schedule it when EITHER is enabled.
+    if settings.enrichment_worker_enabled or settings.classifier_enabled:
         _scheduler.add_job(
             enrichment_worker_job,
             trigger=IntervalTrigger(
@@ -303,6 +327,8 @@ def start() -> None:
             "scheduler.enrichment_worker_scheduled",
             interval_minutes=settings.enrichment_worker_interval_minutes,
             batch_size=settings.enrichment_worker_batch_size,
+            classifier_enabled=settings.classifier_enabled,
+            classifier_batch_size=settings.classifier_worker_batch_size,
         )
     _scheduler.start()
     logger.info("scheduler.started", interval_minutes=settings.poll_interval_minutes)

@@ -97,6 +97,22 @@ class Tender(Base):
     cpv_codes: Mapped[list[str] | None] = mapped_column(ARRAY(String))
     keywords: Mapped[list[str] | None] = mapped_column(ARRAY(String))
 
+    # Sector classification (Phase 3a — the normalisation spine, 2026-06-12).
+    # AI-assigned at ingest by the enrichment worker from title+description, so
+    # every tender is filterable by sector even when CPV (above) is absent —
+    # CPV is demoted to a secondary/derived signal. primary_sector is indexed
+    # for fast dashboard filtering and the by-sector coverage readout.
+    primary_sector: Mapped[str | None] = mapped_column(String(64), index=True)
+    secondary_sectors: Mapped[list[str] | None] = mapped_column(JSON)
+    # Per-sector sub-category lists, e.g.
+    #   {"Construction & Built Environment": ["Refurbishment & renovation", ...]}
+    # Stored as a dict (not a construction-only column) so other sectors'
+    # sub-lists can be added later with NO schema change — only Construction
+    # is populated today.
+    subcategories: Mapped[dict | None] = mapped_column(JSON)
+    classified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    classifier_version: Mapped[str | None] = mapped_column(String(32), index=True)
+
     # Value
     value_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
     value_currency: Mapped[str | None] = mapped_column(String(8))
@@ -133,6 +149,15 @@ class Tender(Base):
     requirements: Mapped[TenderRequirements | None] = relationship(
         back_populates="tender", uselist=False, cascade="all, delete-orphan"
     )
+
+    @property
+    def construction_subcategories(self) -> list[str]:
+        """Convenience accessor for the Construction sub-category list (the
+        only sector with sub-categories today). Other sectors' sub-lists, when
+        added, get their own dict key in `subcategories` — no schema change."""
+        # Literal kept here (not imported from services.classification.taxonomy)
+        # to avoid a models -> services import cycle; it's a stable taxonomy value.
+        return (self.subcategories or {}).get("Construction & Built Environment", [])
 
 
 class TenderDocumentFile(Base):

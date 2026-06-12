@@ -174,6 +174,20 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-sonnet-4-5"
 
+    # Sector classification — the normalisation spine (Phase 3a, 2026-06-12).
+    # Every tender is AI-classified into a fixed sector taxonomy from its
+    # title + description, so the dashboard can filter by sector even when CPV
+    # is absent. Uses Haiku 4.5 (cheapest current model — ideal for
+    # classification; do NOT switch this to Opus/Sonnet). Runs alongside the
+    # decoupled enrichment worker, never inline in the poll.
+    classifier_enabled: bool = True
+    classifier_model: str = "claude-haiku-4-5-20251001"
+    # Newly-arrived unclassified tenders classified per worker cycle (per-call
+    # path). The one-time backlog goes through the cheaper Batch API instead.
+    classifier_worker_batch_size: int = 20
+    # Tenders per Batch-API submission in POST /admin/classify/backfill.
+    classifier_backfill_batch_size: int = 500
+
     # Web Push (VAPID). Generate a keypair with `npm run generate-vapid` in the
     # dashboard. Public key is also exposed via GET /push/vapid-public-key so the
     # dashboard doesn't need to bake it into its build. If unset, push endpoints

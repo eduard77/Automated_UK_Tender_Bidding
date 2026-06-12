@@ -11,7 +11,7 @@ previous phase being marked DONE.
 | 0     | Reusable dashboard bot                                      | **PASS** (CI) | 2026-06-11 | Unit-test gate green; live gate is the operator's runbook below.     |
 | 1     | Get the silent sources pulling (Atamis, EU-Supply, Sell2Wales) | **PASS — with-blocked-upstreams-recorded** | 2026-06-12 | Every source reached each cycle; ATAMIS/EU_SUPPLY now ingest. Remaining 2 (NI 500, S2W expired-cert) are proven upstream outages, recorded in accounts-needed.md. |
 | 2     | Fix run-15-class discovery errors                           | **PASS (CI)** | 2026-06-12 | The prod `run_for_profile` path lost the whole run on one bad advert (guard lived only on legacy `run()`). Unified per-advert + per-page resilience into a shared helper; offline tests prove a run with a bad advert/page completes ok + inserts. Live bot run optional. |
-| 3     | Cross-source CPV/field normalisation (the spine)            | not started   | —          | Likely NEEDS DECISION when reached.                                  |
+| 3     | Cross-source sector classification (the spine)              | **3a PASS (CI) · 3b pending** | 2026-06-12 | 3a (engine): AI sector classification at ingest (Haiku 4.5), backfill (Batch API), coverage readout. 3b (dashboard sector filter + setup wiring) is a separate run. |
 | 4     | Keyword/value/buyer filters as first-class                  | not started   | —          |                                                                      |
 | 5     | Per-tender state (interested / not-interested / applied)    | not started   | —          |                                                                      |
 | 6     | Guided setup page (word → CPV picker → save)                | not started   | —          | Partly NEEDS DECISION when reached (preset taxonomy).                |
@@ -696,3 +696,89 @@ the following harness run, and per the harness it is likely a **NEEDS
 DECISION** (stamp-searched-CPV-at-save vs fetch-from-detail vs
 accept-and-lean-on-CF/FTS). Not started in this run, per the
 one-phase-per-run gate.
+
+## Phase 3a — PASS (CI) (2026-06-12): cross-source sector classification — the normalisation spine (engine)
+
+### Verdict: Phase 3a PASS (CI). Phase 3b (dashboard sector filter + setup wiring) is a SEPARATE later run.
+
+### The decision (built to, not re-litigated)
+
+Normalise every tender across all sources by **AI-classifying it into a fixed
+sector/category scheme at ingest**, hung on the existing enrichment worker.
+CPV is demoted to a derived/secondary signal — most sources (Proactis, many
+CF/FTS buyers) don't supply clean CPV, but every tender has a title +
+description the model can read. Pull-everything, classify-everything.
+
+### What shipped (the engine)
+
+1. **Taxonomy** (`services/classification/taxonomy.py`) — the fixed 16 top-level
+   sectors + the 31 Construction sub-categories, a normalisation-tolerant
+   matcher (folds case / dash / whitespace but only ever stores canonical
+   values), the cached system prompt (Anthropic prompt caching — the taxonomy
+   is identical every call), and `CLASSIFIER_VERSION` for idempotent re-runs.
+2. **Classifier** (`classifier.py`) — `classify_text` (Haiku 4.5, low
+   temperature, strict JSON), validated against the value lists. Invalid /
+   garbled output → retry ONCE → fall back to "Other / Uncategorised" rather
+   than fail the tender. A construction sub-category is set ONLY when
+   Construction is primary or secondary. Token usage logged on every call
+   (`classification.tokens`). `classify_and_store` is idempotent (skips rows
+   already on the current version); `process_pending_classification` is the
+   worker pass over not-yet-current, non-duplicate tenders.
+3. **Data model** — five fields on `tenders` (migration 0018): `primary_sector`
+   (indexed), `secondary_sectors` (JSON list), `subcategories` (JSON dict
+   keyed by sector — a dict, NOT a construction-only column, so other sectors'
+   sub-lists can be added later with NO schema change), `classified_at`,
+   `classifier_version` (indexed). A `Tender.construction_subcategories`
+   convenience accessor reads the construction key.
+4. **Where it runs** — the enrichment-worker job now also runs a
+   classification pass each cycle (`asyncio.to_thread`, so the synchronous
+   Haiku call never stalls the concurrent poll — the Phase-1 rev-4 lesson),
+   independent of matching: EVERY tender gets a sector, not just matched ones.
+   Never inline in the poll. The job is now scheduled when enrichment OR
+   classification is enabled.
+5. **Backfill** (`backfill.py` + `POST /admin/classify/backfill`) — a one-time,
+   admin-triggerable job over the existing unclassified pool via the Anthropic
+   **Batch API** (≈50% cheaper). Bounded by `limit`, resumable + idempotent via
+   the `classifier_version` watermark (re-run drains the rest; never
+   re-submits current rows). Background fire-and-forget; a still-processing
+   batch reports `pending` and writes nothing.
+6. **Cost controls** — Haiku 4.5 only, cached taxonomy prompt, Batch API for
+   the backlog, token-usage logging. Expected ≈ sub-£0.001/tender; ~10k
+   backfill ≈ a few £; ongoing < £10/mo.
+
+### Gate (browser-only) — the coverage readout
+
+`GET /admin/diagnostics/classification-coverage` (new, read-only) returns the
+**count of tenders by primary_sector**, total classified vs unclassified, and
+per-source classified coverage. After merge + deploy + the backfill (or letting
+the worker run), the operator pastes this back as evidence that classification
+populated across ALL sources: a Construction count present, an Other count
+present, multiple sectors present, and PROACTIS / ATAMIS / EU_SUPPLY rows now
+carrying a sector (`by_source[].classified > 0`).
+
+### Tests (offline, mock the LLM)
+
+- `tests/test_classification_classifier.py` (13): taxonomy validation +
+  normalisation tolerance; only-allowed-values stored; construction
+  sub-category only when Construction in sectors (incl. as a secondary);
+  representative classifications (school refurb → Construction +
+  Refurbishment; IT/health → IT primary, Health secondary; catering →
+  Facilities); retry-once-then-succeed; invalid-twice → Other (tender not
+  failed); persistence + idempotency; the worker classifies only
+  not-yet-current, non-duplicate tenders.
+- `tests/test_classification_backfill.py` (5): backfill classifies the pool +
+  logs tokens; bounded by limit; idempotent + resumable (re-run = empty); a
+  still-processing batch reports `pending` and writes nothing; an errored
+  batch result skips only that tender.
+- `tests/test_classification_coverage.py` (2): the coverage readout counts by
+  sector + per-source; anonymous is 401.
+- Full suite: 938 passed, 3 skipped (migration 0018 applies cleanly). The one
+  failure is the pre-existing dev-DB live-data flake in
+  `test_portal_platform_matching`, unrelated. Ruff clean.
+
+### Next phase
+
+**Phase 3b — dashboard sector filter + setup wiring** (consume `primary_sector`
+/ `secondary_sectors` in the dashboard facet and the guided setup) is the next
+run. NOT built here. After that, Phase 4 (first-class keyword/value/buyer
+filters).
