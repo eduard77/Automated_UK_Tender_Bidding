@@ -6,7 +6,8 @@ reasons; new admin endpoints land here.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+import structlog
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -32,6 +33,7 @@ from tender_agent.services.discovery.proactis_filter_config import (
 from tender_agent.services.requirements_extractor import extract_requirements
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+logger = structlog.get_logger(__name__)
 
 
 @router.post(
@@ -90,6 +92,78 @@ def trigger_extract_requirements(
             detail="extractor failed — check logs for requirements.api_error / parse_failed",
         )
     return record
+
+
+# ---------------------------------------------------------------------------
+# Sector classification backfill (Phase 3a)
+# ---------------------------------------------------------------------------
+
+
+class ClassificationBackfillResponse(BaseModel):
+    """Ack for the one-time classification backfill. Fire-and-forget: the
+    Batch-API submission + collection happens in the background; the operator
+    watches `classification.backfill_*` logs and the
+    GET /admin/diagnostics/classification-coverage readout for the outcome."""
+
+    status: str  # "scheduled"
+    detail: str
+    limit: int
+
+
+@router.post(
+    "/classify/backfill",
+    status_code=202,
+    response_model=ClassificationBackfillResponse,
+)
+def trigger_classification_backfill(
+    background_tasks: BackgroundTasks,
+    limit: int | None = Query(
+        default=None,
+        ge=1,
+        description="Max tenders to submit this batch (default: "
+        "classifier_backfill_batch_size). Re-run to drain more — resumable "
+        "via the classifier_version watermark.",
+    ),
+) -> ClassificationBackfillResponse:
+    """Trigger a one-time classification backfill over the unclassified pool.
+
+    Submits up to `limit` not-yet-classified tenders through the Anthropic
+    Batch API (≈50% cheaper), polls the batch to completion in the background,
+    and writes each sector back onto its tender. Bounded + resumable +
+    idempotent: re-running picks up only tenders still off the current
+    classifier version, so it's safe to call repeatedly to drain a large
+    backlog.
+
+    503 if `ANTHROPIC_API_KEY` is not configured.
+    """
+    if not settings.anthropic_api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="anthropic_api_key not configured on the backend",
+        )
+    effective_limit = limit or settings.classifier_backfill_batch_size
+    background_tasks.add_task(_run_classification_backfill_safely, effective_limit)
+    return ClassificationBackfillResponse(
+        status="scheduled",
+        detail=(
+            f"Classification backfill of up to {effective_limit} tenders started "
+            "in the background (Batch API). Watch `classification.backfill_*` "
+            "logs and GET /admin/diagnostics/classification-coverage. Re-run to "
+            "drain more — it's resumable."
+        ),
+        limit=effective_limit,
+    )
+
+
+def _run_classification_backfill_safely(limit: int) -> None:
+    """Background wrapper — never lets an exception escape into FastAPI's
+    background-task runner; the backfill already logs structured events."""
+    try:
+        from tender_agent.services.classification.backfill import run_backfill
+
+        run_backfill(limit=limit)
+    except Exception:  # noqa: BLE001
+        logger.exception("classification.backfill_failed")
 
 
 # ---------------------------------------------------------------------------

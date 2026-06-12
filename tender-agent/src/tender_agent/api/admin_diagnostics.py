@@ -29,6 +29,7 @@ from tender_agent.diagnostics.cf_survey import (
     summarise,
 )
 from tender_agent.models import PollRun, Source, Tender
+from tender_agent.services.classification.taxonomy import CLASSIFIER_VERSION
 
 router = APIRouter(
     prefix="/admin/diagnostics",
@@ -294,4 +295,88 @@ def sources_health(db: Session = Depends(get_db)) -> SourcesHealthResponse:
         )
     return SourcesHealthResponse(
         generated_at=now.isoformat(), sources=out
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sector classification coverage — the Phase-3a gate readout
+# ---------------------------------------------------------------------------
+
+
+class SectorCount(BaseModel):
+    sector: str | None  # None = not yet classified
+    count: int
+
+
+class SourceClassificationCount(BaseModel):
+    source_code: str
+    total: int
+    classified: int
+
+
+class ClassificationCoverageResponse(BaseModel):
+    """How far sector classification has populated, across ALL sources.
+
+    The Phase-3a gate: paste this back to prove classification landed — a
+    Construction count, an Other count, multiple sectors present, and the
+    formerly-silent sources (PROACTIS / ATAMIS / EU_SUPPLY) now carrying a
+    sector in `by_source.classified`."""
+
+    classifier_version: str
+    total_tenders: int
+    classified: int
+    unclassified: int
+    by_primary_sector: list[SectorCount]
+    by_source: list[SourceClassificationCount]
+
+
+@router.get(
+    "/classification-coverage", response_model=ClassificationCoverageResponse
+)
+def classification_coverage(
+    db: Session = Depends(get_db),
+) -> ClassificationCoverageResponse:
+    """Count of tenders by primary_sector + per-source classified coverage.
+
+    READ-ONLY. Evidence for the Phase-3a gate that AI sector classification
+    populated across every source."""
+    total = int(db.execute(select(func.count(Tender.id))).scalar_one())
+    classified = int(
+        db.execute(
+            select(func.count(Tender.id)).where(Tender.primary_sector.isnot(None))
+        ).scalar_one()
+    )
+
+    sector_rows = db.execute(
+        select(Tender.primary_sector, func.count(Tender.id))
+        .group_by(Tender.primary_sector)
+        .order_by(func.count(Tender.id).desc())
+    ).all()
+    by_primary_sector = [
+        SectorCount(sector=row[0], count=int(row[1])) for row in sector_rows
+    ]
+
+    source_rows = db.execute(
+        select(
+            Tender.source_code,
+            func.count(Tender.id),
+            func.count(Tender.primary_sector),
+        )
+        .group_by(Tender.source_code)
+        .order_by(Tender.source_code)
+    ).all()
+    by_source = [
+        SourceClassificationCount(
+            source_code=row[0], total=int(row[1]), classified=int(row[2])
+        )
+        for row in source_rows
+    ]
+
+    return ClassificationCoverageResponse(
+        classifier_version=CLASSIFIER_VERSION,
+        total_tenders=total,
+        classified=classified,
+        unclassified=total - classified,
+        by_primary_sector=by_primary_sector,
+        by_source=by_source,
     )
