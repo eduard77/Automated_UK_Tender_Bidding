@@ -23,13 +23,26 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from fastapi.testclient import TestClient
 
+from tender_agent.api.admin_diagnostics import STALE_POLL_FACTOR
 from tender_agent.api.deps import current_account
+from tender_agent.config import settings
 from tender_agent.db import get_db
 from tender_agent.main import app
 from tender_agent.models import PollRun, Source, Tender
 from tests._billing_fixtures import make_engine_and_session
 
 NOW = datetime(2026, 6, 11, 12, 0, tzinfo=UTC)
+
+#: Freshness is judged by the endpoint against the real wall clock
+#: (``datetime.now(UTC)``), not a fixture constant: a clean run that finished
+#: more than ``poll_interval_minutes * STALE_POLL_FACTOR`` ago reads
+#: ``stale_not_polling``, not ``healthy``. Fixtures that must read "healthy"
+#: therefore anchor their newest run to the real clock and derive their
+#: offsets from this window — one interval back is comfortably fresh, one
+#: interval past the window is unambiguously stale — rather than a brittle
+#: hardcoded gap that the fixed ``NOW`` above no longer satisfies.
+POLL_INTERVAL = timedelta(minutes=settings.poll_interval_minutes)
+STALE_WINDOW = POLL_INTERVAL * STALE_POLL_FACTOR
 
 
 @pytest.fixture()
@@ -57,56 +70,87 @@ def client(factory):
 
 
 def _seed(factory) -> None:
+    now = datetime.now(UTC)
+    # One interval back is well inside the staleness window; one interval past
+    # the window is unambiguously stale. Both derive from the real "now" the
+    # endpoint diagnoses against, not the fixed NOW constant.
+    fresh = now - POLL_INTERVAL
+    stale = now - STALE_WINDOW - POLL_INTERVAL
     with factory() as db:
         healthy = Source(code="CF", name="Contracts Finder", base_url="x", enabled=True)
         failing = Source(code="S2W", name="Sell2Wales", base_url="x", enabled=True)
         zero = Source(code="EU_SUPPLY", name="EU-Supply", base_url="x", enabled=True)
         never = Source(code="ATAMIS", name="Atamis", base_url="x", enabled=True)
-        db.add_all([healthy, failing, zero, never])
+        idle = Source(
+            code="PCS", name="Public Contracts Scotland", base_url="x", enabled=True
+        )
+        db.add_all([healthy, failing, zero, never, idle])
         db.commit()
         db.add_all(
             [
-                # CF: clean run + a tender => healthy.
+                # CF: recent clean run + a tender => healthy.
                 PollRun(
                     source_id=healthy.id,
-                    started_at=NOW - timedelta(minutes=30),
-                    finished_at=NOW - timedelta(minutes=29),
+                    started_at=fresh - timedelta(minutes=1),
+                    finished_at=fresh,
                     status="ok",
                     fetched=3,
                     new_count=2,
                 ),
-                # S2W: errored run with the documented upstream message.
+                # S2W: errored newest run => fetch_failing (the error branch
+                # is decided on the newest run, ahead of any staleness check).
                 PollRun(
                     source_id=failing.id,
-                    started_at=NOW - timedelta(minutes=30),
-                    finished_at=NOW - timedelta(minutes=29),
+                    started_at=fresh - timedelta(minutes=1),
+                    finished_at=fresh,
                     status="error",
                     error="upstream HTTP requests failed (see adapter log events)",
                 ),
-                # EU_SUPPLY: clean run, zero rows — the watermark trap's shape.
+                # EU_SUPPLY: recent clean run, zero rows — the watermark trap's
+                # shape. Must be fresh, else staleness would mask the zero-rows
+                # diagnosis (stale is checked before the zero-rows branch).
                 PollRun(
                     source_id=zero.id,
-                    started_at=NOW - timedelta(minutes=30),
-                    finished_at=NOW - timedelta(minutes=29),
+                    started_at=fresh - timedelta(minutes=1),
+                    finished_at=fresh,
                     status="ok",
                     fetched=0,
+                ),
+                # PCS: clean run + a tender, but it finished long ago — rows are
+                # present yet the scheduler stopped firing => stale_not_polling.
+                PollRun(
+                    source_id=idle.id,
+                    started_at=stale - timedelta(minutes=1),
+                    finished_at=stale,
+                    status="ok",
+                    fetched=10,
                 ),
                 # ATAMIS: no PollRun at all.
             ]
         )
-        db.add(
-            Tender(
-                source_code="CF",
-                source_ref="cf-1",
-                title="t",
-                first_seen_at=NOW,
-                last_seen_at=NOW,
-            )
+        db.add_all(
+            [
+                Tender(
+                    source_code="CF",
+                    source_ref="cf-1",
+                    title="t",
+                    first_seen_at=now,
+                    last_seen_at=now,
+                ),
+                Tender(
+                    source_code="PCS",
+                    source_ref="pcs-1",
+                    title="t",
+                    first_seen_at=now,
+                    last_seen_at=now,
+                ),
+            ]
         )
         db.commit()
 
 
 def test_health_classifies_all_four_diagnosis_classes(client, factory) -> None:
+    # Also pins the fifth class (stale_not_polling, PCS) added in rev 3.
     _seed(factory)
     resp = client.get("/admin/diagnostics/sources-health")
     assert resp.status_code == 200
@@ -124,6 +168,11 @@ def test_health_classifies_all_four_diagnosis_classes(client, factory) -> None:
 
     assert by_code["EU_SUPPLY"]["diagnosis"] == "polling_but_zero_rows"
     assert by_code["EU_SUPPLY"]["tender_count"] == 0
+
+    # Newest run is clean but finished many intervals ago — not healthy.
+    assert by_code["PCS"]["diagnosis"] == "stale_not_polling"
+    assert by_code["PCS"]["tender_count"] == 1
+    assert by_code["PCS"]["latest_runs"][0]["status"] == "ok"
 
     assert by_code["ATAMIS"]["diagnosis"] == "never_polled"
     assert by_code["ATAMIS"]["latest_runs"] == []
@@ -157,7 +206,12 @@ def test_health_newest_ok_run_beats_older_errored_run(client, factory) -> None:
     older run still has an error string, the source must NOT be
     reported `fetch_failing`. The 2026-06-11 12:52Z PROACTIS readout
     tripped this exact case under the old `any(r.error for r in runs)`
-    rule."""
+    rule.
+
+    The newest run is anchored to the real clock (within the staleness
+    window) so the expected result is plainly `healthy` — the point is
+    "newest-ok beats older-errored", not staleness."""
+    now = datetime.now(UTC)
     with factory() as db:
         src = Source(code="PROACTIS", name="Proactis", base_url="x", enabled=True)
         db.add(src)
@@ -167,16 +221,17 @@ def test_health_newest_ok_run_beats_older_errored_run(client, factory) -> None:
                 # Older errored run.
                 PollRun(
                     source_id=src.id,
-                    started_at=NOW - timedelta(minutes=60),
-                    finished_at=NOW - timedelta(minutes=58),
+                    started_at=now - POLL_INTERVAL * 2,
+                    finished_at=now - POLL_INTERVAL * 2 + timedelta(minutes=2),
                     status="error",
                     error="BridgeError: ERR_ABORTED on advertId=...",
                 ),
-                # Newest clean run.
+                # Newest clean run — finished one interval ago, well inside the
+                # staleness window, so the source reads healthy not stale.
                 PollRun(
                     source_id=src.id,
-                    started_at=NOW - timedelta(minutes=10),
-                    finished_at=NOW - timedelta(minutes=9),
+                    started_at=now - POLL_INTERVAL,
+                    finished_at=now - POLL_INTERVAL + timedelta(minutes=1),
                     status="ok",
                     fetched=200,
                     new_count=61,
@@ -188,8 +243,8 @@ def test_health_newest_ok_run_beats_older_errored_run(client, factory) -> None:
                 source_code="PROACTIS",
                 source_ref="p-1",
                 title="t",
-                first_seen_at=NOW,
-                last_seen_at=NOW,
+                first_seen_at=now,
+                last_seen_at=now,
             )
         )
         db.commit()
@@ -204,16 +259,13 @@ def test_health_stale_when_newest_run_finished_long_ago(client, factory) -> None
     firing. The 2026-06-11 12:52Z readout had CF/FTS/PCS reading
     healthy with newest-run timestamps from 2026-06-02 (nine days
     earlier across a 30-min interval)."""
-    from tender_agent.api.admin_diagnostics import STALE_POLL_FACTOR
-    from tender_agent.config import settings
-
-    interval = settings.poll_interval_minutes
-    stale_after = timedelta(minutes=interval * STALE_POLL_FACTOR)
+    now = datetime.now(UTC)
     with factory() as db:
         src = Source(code="CF", name="Contracts Finder", base_url="x", enabled=True)
         db.add(src)
         db.commit()
-        finished = NOW - stale_after - timedelta(minutes=10)
+        # One interval past the staleness window, against the real clock.
+        finished = now - STALE_WINDOW - POLL_INTERVAL
         db.add(
             PollRun(
                 source_id=src.id,
@@ -228,8 +280,8 @@ def test_health_stale_when_newest_run_finished_long_ago(client, factory) -> None
                 source_code="CF",
                 source_ref="cf-1",
                 title="t",
-                first_seen_at=NOW,
-                last_seen_at=NOW,
+                first_seen_at=now,
+                last_seen_at=now,
             )
         )
         db.commit()
