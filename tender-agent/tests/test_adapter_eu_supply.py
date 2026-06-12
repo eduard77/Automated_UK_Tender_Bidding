@@ -209,13 +209,17 @@ async def test_one_host_failure_does_not_stop_the_sweep() -> None:
     assert len(tenders) == 5  # the healthy host still delivered
 
 
-def test_default_portal_sweep_includes_blue_light() -> None:
-    """bluelight.eu-supply.com (the police/emergency-services "Blue Light"
-    tenant) is in the DEFAULT sweep. Pure config — the host-parameterised
-    sweep test above proves the adapter handles the host; this pins the
-    default so a config regression is caught."""
+def test_default_portal_sweep_excludes_broken_blue_light_host() -> None:
+    """bluelight.eu-supply.com was REMOVED from the DEFAULT sweep: the live
+    2026-06-12T11:26Z sources-health readout proved its
+    /ctm/Supplier/PublicTenders path 404s (that tenant has no public listing
+    at the standard CTM path). The default keeps the working tenant(s) so
+    EU-Supply keeps ingesting; a corrected Blue Light URL can be re-added by
+    the operator. The host-parameterised sweep tests above prove the adapter
+    still handles arbitrary hosts — this pins the default against a regression
+    that re-introduces the 404-ing host."""
     from tender_agent.config import Settings
 
     default_portals = Settings.model_fields["eu_supply_portals"].default_factory()
-    assert "https://bluelight.eu-supply.com" in default_portals
+    assert "https://bluelight.eu-supply.com" not in default_portals
     assert "https://yortender.eu-supply.com" in default_portals

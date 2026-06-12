@@ -128,3 +128,57 @@ async def test_handles_malformed_entry_gracefully() -> None:
     # The malformed release has a distinctive title; we never see it.
     titles = [t.title for t in tenders]
     assert not any("Malformed: no ocid" in title for title in titles)
+
+
+async def test_malformed_feed_response_does_not_fail_run() -> None:
+    """Phase-1 resilience (2026-06-12): a malformed / truncated feed response
+    (HTTP 200 but the body isn't valid JSON) is caught and skipped — the run
+    COMPLETES instead of erroring the whole source. `had_errors` stays False so
+    one transient bad batch can't flip FTS to fetch_failing."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # 200 OK but the body is not parseable JSON -> response.json() raises.
+        return httpx.Response(
+            200,
+            content=b"{ this is not valid json ",
+            headers={"Content-Type": "application/json"},
+        )
+
+    adapter = build_adapter(FTSAdapter, handler)
+    tenders = await collect(adapter, CUTOFF)
+
+    assert tenders == []  # nothing yielded from the unparseable page
+    assert adapter.had_errors is False  # but the run is NOT marked failed
+
+
+async def test_malformed_feed_on_later_page_keeps_earlier_records() -> None:
+    """A bad batch MID-STREAM: page 1 returns good releases plus a `next`
+    cursor, page 2 returns malformed JSON. The page-1 tenders survive and the
+    run completes (had_errors False) — the bad batch is skipped, not fatal."""
+    page1 = load_json_fixture(FIXTURE)
+    page1 = {
+        **page1,
+        "links": {
+            "next": "https://www.find-tender.service.gov.uk/api/1.0/"
+            "ocdsReleasePackages?cursor=page2"
+        },
+    }
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(200, json=page1)
+        # Second page is a truncated/garbled response.
+        return httpx.Response(
+            200,
+            content=b'{"releases": [ {',
+            headers={"Content-Type": "application/json"},
+        )
+
+    adapter = build_adapter(FTSAdapter, handler)
+    tenders = await collect(adapter, CUTOFF)
+
+    assert calls["n"] == 2  # it did follow the cursor to page 2
+    assert len(tenders) == 5  # page 1's good releases stand
+    assert adapter.had_errors is False  # page 2's bad batch didn't fail the run
