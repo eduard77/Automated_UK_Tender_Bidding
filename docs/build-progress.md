@@ -279,3 +279,147 @@ the real error strings in hand, the next harness run either flips
 Phase 1 to PASS (run the bot gate `tests/e2e/specs/phase-1.yaml` if the
 operator can reach the live URL; the CI unit-test gate is the automated
 fallback) or implements the precise next fix.
+
+## Phase 1 — IN PROGRESS rev 3 (2026-06-11): the real cause was starvation, not registration
+
+### Verdict: Phase 1 IN PROGRESS — rev 3 (browser-only gate)
+
+### What the readout (and the new Log stream) proved
+
+The 2026-06-11 12:52Z `sources-health` readout AND the operator's pasted
+`scheduler.poll_all_starting` log line together overturn the rev-2
+working hypothesis. The Log stream now reports:
+
+- `scheduler.poll_all_starting`: `source_codes` includes
+  `EU_SUPPLY, PROACTIS, ATAMIS`; `registered_adapters` includes
+  `EU_SUPPLY, ATAMIS`. So they were **registered all along** — the
+  rev-2 self-heal was good housekeeping but did not solve the silence.
+- Inside one cycle, `FTS` emits a long unbroken series of
+  `requirements.extracted` events, one per tender (tender ids 7853,
+  7854, 7855 …), each ~10–15 seconds: the per-tender Anthropic call
+  that `_enrich_matched_tender` ran IN-LINE during the poll.
+- Trace goes quiet; ~3 minutes later a NEW `poll_all_starting` begins
+  at the top — the cycle never reached EU_SUPPLY, PROACTIS, or ATAMIS
+  at the tail of the list.
+
+**The cause is starvation, not registration.** Sources at the head of
+the list (FTS) burn the whole poll interval on synchronous
+per-tender extraction; sources at the tail never get a turn.
+
+This also recasts two rev-2 findings:
+
+- The "scheduler appears not to be firing" surface read of
+  9-day-old runs in CF/FTS/PCS healthy rows: the scheduler IS firing,
+  but each cycle's tail never executes — so older runs persist as the
+  newest record for the late sources, and the diagnosis read "healthy"
+  for early sources because their per-cycle work did complete.
+- PROACTIS's `fetch_failing` diagnosis despite the newest run being
+  `ok` (one older errored run + the `any(r.error for r in runs)`
+  predicate was wrong).
+
+### What this PR ships (rev 3 on top of #122 + #123)
+
+1. **Enrichment decoupled from polling.** New module
+   `services/enrichment_worker.py`. `poll_source` no longer downloads
+   documents or extracts requirements in-line: it only fetches +
+   upserts tenders, records FilterMatches, and dispatches push
+   notifications immediately. The slow work — `download_documents_for_
+   tender` + `extract_requirements` — moves to `enrich_tender` in the
+   worker. Side effect: operators are notified of a new match the
+   moment it's recorded, no longer queued behind the AI call.
+2. **Implicit-queue worker.** `process_pending_enrichment(db, *, limit)`
+   selects tenders that have at least one `FilterMatch` and no
+   `TenderRequirements` row (non-duplicate, FIFO by tender id),
+   bounded by `enrichment_worker_batch_size`. The unique
+   `TenderRequirements.tender_id` constraint makes the worker
+   idempotent under concurrent poll cycles — no schema change.
+3. **New scheduler job `enrichment_worker_job`** on its own
+   `IntervalTrigger` (default 5 minutes), same `coalesce=True` +
+   `max_instances=1` safety as the other jobs. Three new settings
+   (`enrichment_worker_enabled` / `_interval_minutes` /
+   `_batch_size`) gate the behaviour.
+4. **Better diagnosis** in `GET /admin/diagnostics/sources-health`:
+   - The `fetch_failing` branch now decides on the newest run only —
+     not `any(r.error for r in runs)` — so an older orphaned-then-
+     errored run never trips fetch_failing when the newest is `ok`
+     (PROACTIS, this readout).
+   - New `stale_not_polling` class: a clean newest run that finished
+     more than `poll_interval_minutes × 4` ago means the scheduler
+     itself isn't firing for that source, NOT that it's healthy
+     (CF/FTS/PCS, 2026-06-02 timestamps, this readout).
+5. **What stays untouched on purpose.** The manual `POST /admin/
+   extract-requirements/{tender_id}` endpoint is unchanged (operator
+   re-run path still works). Adapter watermark/reconcile semantics,
+   `record_error()` adapter wiring, `_orphan_stale_running_runs()`,
+   per-iteration `scheduler.poll_source_attempt` logging, the
+   PROACTIS per-advert guard — all stay as #122 + #123 shipped them.
+   The TLS error from `portal_classifier.fetch_failed` on
+   `parsystems.co.uk` is out of scope for Phase 1 — noted, log-only.
+
+### Tests (offline, no Postgres)
+
+- `tests/test_enrichment_worker.py` (8 tests):
+  - Hot-path drift guard: `ingestion` module no longer exposes
+    `extract_requirements`, `download_documents_for_tender`, or
+    `_enrich_matched_tender` (re-importing them would re-introduce
+    starvation).
+  - Queue: only matched-and-unenriched tenders are picked;
+    already-enriched tenders are skipped; non-matched tenders are
+    skipped; duplicates are excluded; FIFO by id; limit respected.
+  - Worker: empty queue returns 0; a backlog returns batch-size
+    processed; `enrich_tender` runs both halves and continues to
+    extraction even when download raises.
+- `tests/test_sources_health.py` extended (5 tests total):
+  - Newest-`ok`-run-overrides-older-errored-run case (PROACTIS).
+  - `stale_not_polling` case (CF, 9-day-old "healthy" reading).
+- Existing `test_scheduler_self_heal.py` and `test_ingestion_status.py`
+  still pass (the rev-2 contracts are preserved).
+- Ruff clean.
+
+### Phase 1 verdict — still IN PROGRESS, gate is the next browser readout
+
+The fix is structural and large enough that it deserves its own live
+verification cycle before Phase 1 closes. After merge + auto-deploy +
+one poll cycle (or `POST /admin/poll-now`), the next browser readout
+of `GET /admin/diagnostics/sources-health` should change dramatically
+within minutes:
+
+- **EU_SUPPLY and ATAMIS leave `never_polled`** (they get reached now
+  that the FTS cycle no longer eats the whole interval). They
+  either show `healthy`, `polling_but_zero_rows`, or `fetch_failing`
+  with a specific error string from the rev-2 `record_error` wiring.
+- **CF / FTS / PCS no longer read "healthy" while 9 days old.** If
+  the scheduler is firing they get fresh runs; if not, they read
+  `stale_not_polling` and the cause is somewhere else (separate
+  diagnosis, not this PR's concern).
+- **S2W and NI** show the specific upstream error string (or stay
+  generic, which would mean their adapters don't yet thread
+  `record_error` — verify against #123's adapter calls).
+- **PROACTIS** no longer reads `fetch_failing` when its newest run is
+  clean.
+
+If after this the late sources are reached AND S2W/NI surface a
+genuine upstream outage (their server returns 500 / 403), then
+Phase 1 closes as **PASS — with-blocked-upstreams-recorded** and the
+S2W/NI pending rows in `docs/accounts-needed.md` get promoted to
+real BLOCKED-UPSTREAM entries. Until that readout lands the harness
+verdict stays **IN PROGRESS**.
+
+### Honest correction from rev 2
+
+Rev 2 leaned on `scheduler self-heal + real-error surface` as the
+likely fix for `never_polled`. The real-error surface part (`record_
+error` + `error_messages`) was right and stays in. The self-heal part
+turned out to be belt-and-braces — useful but not the cause.
+EU_SUPPLY and ATAMIS were registered and enabled the entire time.
+What stopped them being polled was a starved iteration loop. Saying
+this out loud because the harness asks for honest progress, not the
+nicest story.
+
+### Next single action
+
+Operator: merge → wait one poll cycle (or fire `POST /admin/poll-now`)
+→ wait a further 5 minutes so the enrichment worker has a chance to
+fire its first batch → open `GET /admin/diagnostics/sources-health`
+→ paste the JSON. The new readout decides between Phase 1 PASS and
+the next narrow fix.
