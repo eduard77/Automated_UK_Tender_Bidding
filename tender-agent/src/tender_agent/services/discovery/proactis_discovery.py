@@ -239,50 +239,13 @@ async def run(
             result.rows_seen += 1
         result.pages_walked = _last_walked_pages
 
-        # --- read detail + upsert ------------------------------------------
-        # Phase-1 evidence (2026-06-11) showed run #15 errored mid-loop on
-        # a single ``Supplier/Advert/View?advertId=...`` ERR_ABORTED, losing
-        # 200+ later rows. Per-advert navigation failures must NOT kill the
-        # whole run — log them, count them, continue. The deeper Phase-2
-        # work (richer retry / backoff) lands separately.
-        details_skipped: list[str] = []
-        with db_factory() as db:
-            for row in listing_rows:
-                if config.skip_detail_for_known and _already_seen(db, row.advert_id):
-                    # Touch last_seen_at via the same upsert path; we just
-                    # don't hit the detail page.
-                    continue
-                try:
-                    detail = await _read_detail(bridge, row)
-                except BridgeError as exc:
-                    details_skipped.append(row.advert_id)
-                    logger.warning(
-                        "discovery.proactis.detail_read_failed",
-                        advert_id=row.advert_id,
-                        error=str(exc),
-                    )
-                    continue
-                if not detail.is_complete_for_dedup():
-                    logger.warning(
-                        "discovery.proactis.detail_missing_dn",
-                        advert_id=detail.advert_id,
-                    )
-                action, deduped = _upsert_from_discovered(db, detail)
-                if action == "new":
-                    result.opportunities_inserted += 1
-                elif action == "updated":
-                    result.opportunities_updated += 1
-                else:
-                    result.opportunities_unchanged += 1
-                if deduped:
-                    result.opportunities_deduped += 1
-                db.commit()
-        if details_skipped:
-            logger.info(
-                "discovery.proactis.details_skipped_summary",
-                count=len(details_skipped),
-                first_advert_ids=details_skipped[:5],
-            )
+        # --- read detail + upsert (resilient) ------------------------------
+        # Per-advert failures must NOT kill the run — one bad
+        # ``Supplier/Advert/View?advertId=…`` ERR_ABORTED used to lose 200+
+        # later rows. The shared helper logs/counts/skips and continues.
+        await _ingest_listing_details(
+            bridge, listing_rows, config, result, db_factory
+        )
 
     except NeedsLoginError:
         result.status = "needs_login"
@@ -1143,11 +1106,23 @@ async def _walk_listing(bridge: BridgeClient, config: ProactisFilterConfig):
 
     for page_index in range(config.max_pages):
         _last_walked_pages = page_index + 1
-        rendered = await bridge.rendered_html(
-            PROACTIS_BRIDGE_SLUG,
-            wait_for_selector=PROACTIS_SELECTORS["opp_results_table"],
-            timeout_ms=LISTING_RENDER_TIMEOUT_MS,
-        )
+        try:
+            rendered = await bridge.rendered_html(
+                PROACTIS_BRIDGE_SLUG,
+                wait_for_selector=PROACTIS_SELECTORS["opp_results_table"],
+                timeout_ms=LISTING_RENDER_TIMEOUT_MS,
+            )
+        except BridgeError as exc:
+            # One bad page render must not abort the whole walk (Phase 2:
+            # don't lose a run on one bad page). Stop here and let the rows
+            # already yielded be ingested; the next cycle re-walks from page 1
+            # and dedup absorbs the overlap.
+            logger.warning(
+                "discovery.proactis.page_render_failed",
+                page=_last_walked_pages,
+                error=str(exc),
+            )
+            break
         rows = _parse_listing_rows(rendered.html)
         # Dedupe within the run — pagination glitches that show the same
         # page twice shouldn't double-count.
@@ -1418,6 +1393,82 @@ def _already_seen(db: Session, advert_id: str) -> bool:
     return existing is not None
 
 
+async def _ingest_listing_details(
+    bridge: BridgeClient,
+    listing_rows: list[DiscoveredOpportunity],
+    config: ProactisFilterConfig,
+    result: DiscoveryRunResult,
+    db_factory,
+) -> None:
+    """Read each listing row's detail page and upsert it — RESILIENTLY.
+
+    Shared by both `run()` and `run_for_profile()` so the per-advert
+    resilience can never again live on only one path. Phase-1 evidence
+    (run #15, 2026-06-11) showed a single ``Supplier/Advert/View?advertId=…``
+    ERR_ABORTED mid-loop abort the whole run and lose 200+ later rows; the
+    rev-2 guard was added to `run()` but NOT to the profile-driven
+    `run_for_profile()` that actually runs in production — so the live
+    `discovery.proactis.profile_failed` kept firing on one bad advert.
+    Unifying the loop here fixes both paths and prevents the divergence
+    recurring (Phase 2, 2026-06-12).
+
+    A per-advert detail-read failure (BridgeError) OR a per-row upsert/commit
+    failure is logged, counted, and SKIPPED — never fatal. Each row is
+    committed individually so partial progress survives, mirroring
+    `poll_source`.
+    """
+    details_skipped: list[str] = []
+    with db_factory() as db:
+        for row in listing_rows:
+            if config.skip_detail_for_known and _already_seen(db, row.advert_id):
+                # Already ingested; skip the detail fetch this cycle.
+                continue
+            try:
+                detail = await _read_detail(bridge, row)
+            except BridgeError as exc:
+                details_skipped.append(row.advert_id)
+                logger.warning(
+                    "discovery.proactis.detail_read_failed",
+                    advert_id=row.advert_id,
+                    error=str(exc),
+                )
+                continue
+            if not detail.is_complete_for_dedup():
+                logger.warning(
+                    "discovery.proactis.detail_missing_dn",
+                    advert_id=detail.advert_id,
+                )
+            try:
+                action, deduped = _upsert_from_discovered(db, detail)
+                db.commit()
+            except Exception as exc:  # noqa: BLE001 — one bad row mustn't kill the run
+                with __import__("contextlib").suppress(Exception):
+                    db.rollback()
+                details_skipped.append(row.advert_id)
+                logger.warning(
+                    "discovery.proactis.detail_upsert_failed",
+                    advert_id=row.advert_id,
+                    error=str(exc),
+                )
+                continue
+            # Count only AFTER the row is committed, so a rolled-back row never
+            # inflates the run summary.
+            if action == "new":
+                result.opportunities_inserted += 1
+            elif action == "updated":
+                result.opportunities_updated += 1
+            else:
+                result.opportunities_unchanged += 1
+            if deduped:
+                result.opportunities_deduped += 1
+    if details_skipped:
+        logger.info(
+            "discovery.proactis.details_skipped_summary",
+            count=len(details_skipped),
+            first_advert_ids=details_skipped[:5],
+        )
+
+
 # ---------------------------------------------------------------------------
 # Source row + PollRun bookkeeping
 # ---------------------------------------------------------------------------
@@ -1677,29 +1728,14 @@ async def run_for_profile(
                 not_found=list(result.portals_not_found),
             )
 
-        with db_factory() as db:
-            for row in listing_rows:
-                if (
-                    config.skip_detail_for_known
-                    and _already_seen(db, row.advert_id)
-                ):
-                    continue
-                detail = await _read_detail(bridge, row)
-                if not detail.is_complete_for_dedup():
-                    logger.warning(
-                        "discovery.proactis.detail_missing_dn",
-                        advert_id=detail.advert_id,
-                    )
-                action, deduped = _upsert_from_discovered(db, detail)
-                if action == "new":
-                    result.opportunities_inserted += 1
-                elif action == "updated":
-                    result.opportunities_updated += 1
-                else:
-                    result.opportunities_unchanged += 1
-                if deduped:
-                    result.opportunities_deduped += 1
-                db.commit()
+        # Resilient per-advert detail read + upsert — one bad advert (e.g. an
+        # ERR_ABORTED on a single View page) is skipped, never fatal. This is
+        # the path that emitted `profile_failed` in production: it previously
+        # had NO per-advert guard (only run() did), so one bad detail page
+        # aborted the whole run. Shared helper keeps the two paths in lockstep.
+        await _ingest_listing_details(
+            bridge, listing_rows, config, result, db_factory
+        )
     except NeedsLoginError:
         result.status = "needs_login"
     except Exception as exc:  # noqa: BLE001
