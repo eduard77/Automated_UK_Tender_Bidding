@@ -493,6 +493,128 @@ async def test_run_for_profile_loops_portals_and_dedupes_rows(
     assert result.pages_walked == 2  # one page per portal
 
 
+# ---------------------------------------------------------------------------
+# Phase 2 (2026-06-12): discovery resilience — one bad advert / one bad page
+# must NOT lose the whole run. The per-advert guard used to live only on
+# run(); run_for_profile (the production path) lost everything on one bad
+# advert. Both paths now share `_ingest_listing_details`.
+# ---------------------------------------------------------------------------
+
+
+async def test_run_for_profile_skips_bad_advert_and_completes_ok(
+    stub_db_factory, monkeypatch
+) -> None:
+    """The core Phase-2 regression. run_for_profile is the path that emitted
+    `discovery.proactis.profile_failed`: an unguarded `_read_detail` raised
+    straight to the outer except → status=error, losing every later row. Now
+    a single bad advert is logged + skipped; the good rows still ingest and
+    the run completes status=ok."""
+    from tender_agent.config import settings
+
+    monkeypatch.setattr(settings, "proactis_discovery_portals", [])
+
+    bridge = _fake_bridge_authenticated()
+    bridge.rendered_html = AsyncMock(
+        return_value=MagicMock(
+            html=_portal_listing(["0001", "0002", "0003"]),
+            wait_satisfied=True,
+            current_url="",
+        )
+    )
+    bridge.element_exists = AsyncMock(return_value=False)
+
+    async def fake_read_detail(_bridge, row):
+        if row.advert_id.endswith("0002"):
+            raise pd.BridgeError("ERR_ABORTED on advertId=...0002")
+        row.dn_reference = f"DN{row.advert_id[-4:]}"
+        return row
+
+    with (
+        patch.object(pd, "_read_detail", side_effect=fake_read_detail),
+        patch.object(
+            pd, "_upsert_from_discovered", return_value=("new", False)
+        ) as upsert,
+    ):
+        result = await pd.run_for_profile(
+            credentials=MagicMock(),
+            profile=MagicMock(
+                id=1, cpv_codes=[], cpv_prefixes=[], regions=[], keywords_any=[]
+            ),
+            bridge=bridge,
+            db_factory=stub_db_factory,
+        )
+
+    assert result.status == "ok"  # NOT "error" — one bad advert isn't fatal
+    assert result.rows_seen == 3
+    assert upsert.call_count == 2  # 0002 skipped; 0001 + 0003 ingested
+    assert result.opportunities_inserted == 2
+
+
+async def test_run_skips_bad_advert_and_completes_ok(stub_db_factory) -> None:
+    """The legacy run() path keeps the same per-advert resilience via the
+    shared helper (a guard regression here would un-fix run #15)."""
+    bridge = _fake_bridge_authenticated()
+    bridge.rendered_html = AsyncMock(
+        return_value=MagicMock(
+            html=_portal_listing(["0001", "0002", "0003"]),
+            wait_satisfied=True,
+            current_url="",
+        )
+    )
+    bridge.element_exists = AsyncMock(return_value=False)
+
+    async def fake_read_detail(_bridge, row):
+        if row.advert_id.endswith("0002"):
+            raise pd.BridgeError("ERR_ABORTED on advertId=...0002")
+        row.dn_reference = f"DN{row.advert_id[-4:]}"
+        return row
+
+    with (
+        patch.object(pd, "_read_detail", side_effect=fake_read_detail),
+        patch.object(
+            pd, "_upsert_from_discovered", return_value=("new", False)
+        ) as upsert,
+    ):
+        result = await pd.run(
+            config=ProactisFilterConfig(max_pages=1),
+            bridge=bridge,
+            db_factory=stub_db_factory,
+        )
+
+    assert result.status == "ok"
+    assert result.rows_seen == 3
+    assert upsert.call_count == 2
+    assert result.opportunities_inserted == 2
+
+
+async def test_walk_listing_survives_bad_page_render() -> None:
+    """A single page whose render raises BridgeError stops the walk
+    gracefully (the rows already walked are kept) instead of bubbling up and
+    aborting the run — Phase 2: don't lose a run on one bad page."""
+    bridge = _fake_bridge_authenticated()
+    calls = {"i": 0}
+
+    async def rendered_side_effect(*_a, **_kw):
+        calls["i"] += 1
+        if calls["i"] == 1:
+            return MagicMock(
+                html=_LISTING_PAGE_1, wait_satisfied=True, current_url=""
+            )
+        raise pd.BridgeError("page render ERR_ABORTED")
+
+    bridge.rendered_html = AsyncMock(side_effect=rendered_side_effect)
+    bridge.element_exists = AsyncMock(return_value=True)  # claims a Next page
+    bridge.click = AsyncMock(return_value=None)
+
+    rows = []
+    async for r in pd._walk_listing(bridge, ProactisFilterConfig(max_pages=10)):
+        rows.append(r)
+
+    # Page 1's two rows survived; the page-2 render failure stopped the walk
+    # without raising.
+    assert [r.advert_id[-4:] for r in rows] == ["0001", "0002"]
+
+
 async def test_run_for_profile_without_portals_walks_once(
     stub_db_factory, monkeypatch
 ) -> None:

@@ -1,0 +1,35 @@
+# Phase 2 gate -- "Proactis discovery is resilient": a full Proactis run
+# completes with status ok and inserts rows, even when one advert detail page
+# or one listing page fails mid-run.
+#
+# Two halves to this gate:
+#   1. AUTOMATED (offline, CI): tests/test_proactis_discovery.py proves a run
+#      with a bad advert (_read_detail raises) or a bad page (rendered_html
+#      raises) completes status=ok and still ingests the good rows. That is
+#      the real "don't lose a whole run on one bad page" assertion.
+#   2. LIVE (operator, residential IP): this dashboard spec confirms the
+#      inserted rows are visible, and the operator reads
+#      GET /admin/diagnostics/sources-health to confirm the PROACTIS PollRun
+#      is status=ok with new_count > 0 (not an `error` run that died mid-loop).
+#
+# Run after a logged-in Proactis discovery cycle:
+#   python -m tests.e2e.dashboard_bot tests/e2e/specs/phase-2.yaml
+
+- name: Phase-2/proactis-rows-exist
+  rationale: >-
+    Proactis discovery (the logged-in, profile-driven run_for_profile path)
+    used to abort the whole run on a single advert ERR_ABORTED, losing 200+
+    later rows -- the per-advert guard lived only on the legacy run() path.
+    Phase 2 unifies both paths through a resilient shared detail loop and
+    makes the listing walk survive one bad page render. Source=PROACTIS must
+    return at least 1 card; if rows are missing, read sources-health -- the
+    PROACTIS row's status + error string says whether the run died (it should
+    now read ok) or login is needed (stale_not_polling is expected when the
+    manual logged-in discovery has not run recently).
+  expected_outcome: PASS
+  filter:
+    sources: [PROACTIS]
+  search:
+    min_results: 1
+    must_include_sources: [PROACTIS]
+  tags: [phase-2, proactis]

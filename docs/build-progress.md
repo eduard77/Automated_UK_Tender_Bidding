@@ -10,7 +10,7 @@ previous phase being marked DONE.
 | ----- | ----------------------------------------------------------- | ------------- | ---------- | -------------------------------------------------------------------- |
 | 0     | Reusable dashboard bot                                      | **PASS** (CI) | 2026-06-11 | Unit-test gate green; live gate is the operator's runbook below.     |
 | 1     | Get the silent sources pulling (Atamis, EU-Supply, Sell2Wales) | **PASS — with-blocked-upstreams-recorded** | 2026-06-12 | Every source reached each cycle; ATAMIS/EU_SUPPLY now ingest. Remaining 2 (NI 500, S2W expired-cert) are proven upstream outages, recorded in accounts-needed.md. |
-| 2     | Fix run-15-class discovery errors                           | not started   | —          |                                                                      |
+| 2     | Fix run-15-class discovery errors                           | **PASS (CI)** | 2026-06-12 | The prod `run_for_profile` path lost the whole run on one bad advert (guard lived only on legacy `run()`). Unified per-advert + per-page resilience into a shared helper; offline tests prove a run with a bad advert/page completes ok + inserts. Live bot run optional. |
 | 3     | Cross-source CPV/field normalisation (the spine)            | not started   | —          | Likely NEEDS DECISION when reached.                                  |
 | 4     | Keyword/value/buyer filters as first-class                  | not started   | —          |                                                                      |
 | 5     | Per-tender state (interested / not-interested / applied)    | not started   | —          |                                                                      |
@@ -616,3 +616,83 @@ Every source is reached each cycle; six ingest; the remaining two are
 recorded upstream outages. **Phase 2 (fix run-15-class Proactis discovery
 errors) is the next phase to attempt on the following harness run** — not
 started in this run per the one-phase-per-run gate.
+
+## Phase 2 — PASS (CI) (2026-06-12): Proactis discovery resilience — one bad advert/page no longer loses the run
+
+### Verdict: Phase 2 PASS (CI resilience gate green; live operator confirmation optional)
+
+### Diagnosis (before fixing — evidence, not guess)
+
+The handover's run-15 symptom: Proactis discovery emitted
+`discovery.proactis.profile_failed` mid-run, erroring after it had already
+inserted rows and losing the rest. Reading the two discovery entrypoints
+side by side found the exact cause:
+
+- **`run()`** (the legacy public-listing path) already wraps the per-advert
+  `_read_detail` in `try/except BridgeError` — a single
+  `Supplier/Advert/View?advertId=…` ERR_ABORTED is logged, counted
+  (`details_skipped`), and skipped; the run continues. (rev-2, #123.)
+- **`run_for_profile()`** (the logged-in, profile-driven path that is what
+  actually runs in production, and the one that logs `profile_failed`) had
+  **no such guard**. Its detail loop called `await _read_detail(...)` bare,
+  so one bad advert propagated straight to the outer `except Exception` →
+  `status="error"` → every later row lost.
+
+So the rev-2 resilience was a **phantom fix for production**: it landed on
+the path the tests exercised but not the path the scheduler runs. The
+listing walk had a matching gap — `_walk_listing`'s per-page
+`rendered_html` was unguarded, so one bad page render aborted the walk too.
+
+### What this PR ships
+
+1. **Unified resilient detail loop.** Extracted `_ingest_listing_details()`,
+   now called by BOTH `run()` and `run_for_profile()`. A per-advert
+   detail-read failure (`BridgeError`) OR a per-row upsert/commit failure is
+   logged, counted, and skipped — never fatal. Each row commits individually
+   (partial progress survives), and counters only move after a successful
+   commit so a rolled-back row can't inflate the summary. Sharing the loop
+   means the guard can never diverge between the two paths again.
+2. **Resilient listing walk.** `_walk_listing` now catches a per-page
+   `rendered_html` BridgeError, logs `discovery.proactis.page_render_failed`,
+   and stops the walk gracefully — the rows already walked are ingested and
+   the next cycle re-walks from page 1 (dedup absorbs the overlap). One bad
+   page no longer aborts the run.
+
+A run with a bad advert/page now **completes `status=ok` and inserts the
+good rows** — the Phase 2 acceptance contract.
+
+### Tests (offline, no Postgres)
+
+- `tests/test_proactis_discovery.py` (3 new):
+  - `test_run_for_profile_skips_bad_advert_and_completes_ok` — the core
+    regression: a bad `_read_detail` on the production path no longer aborts
+    the run (status ok, the other rows ingest, the bad advert is skipped).
+  - `test_run_skips_bad_advert_and_completes_ok` — the legacy `run()` path
+    keeps the same resilience via the shared helper.
+  - `test_walk_listing_survives_bad_page_render` — a bad page render stops
+    the walk gracefully, keeping the rows already walked.
+- Existing 15 discovery tests (portal loop, dedup, parse, upsert routing)
+  still pass — the refactor preserves behaviour.
+- Full suite: 919 passed, 3 skipped. The one failure is the pre-existing
+  dev-DB live-data flake `test_portal_platform_matching::test_every_
+  platform_matches_at_least_three_sightings` ("proactis matched only 2
+  sightings"), unrelated. Ruff clean.
+
+### Bot check
+
+`tests/e2e/specs/phase-2.yaml` added: `Source=PROACTIS` returns ≥1 card
+(the dashboard-observable proxy that discovery inserted rows). The
+resilience itself — a full run completing `ok` despite a bad advert/page —
+is proven by the offline tests above (the dashboard can't observe a run's
+status). Live confirmation is the operator running a logged-in Proactis
+discovery cycle and reading the PROACTIS row in
+`GET /admin/diagnostics/sources-health` (status `ok`, `new_count > 0`,
+not an `error` run that died mid-loop).
+
+### Next phase
+
+**Phase 3 — Cross-source CPV/field normalisation (THE SPINE)** is next on
+the following harness run, and per the harness it is likely a **NEEDS
+DECISION** (stamp-searched-CPV-at-save vs fetch-from-detail vs
+accept-and-lean-on-CF/FTS). Not started in this run, per the
+one-phase-per-run gate.
