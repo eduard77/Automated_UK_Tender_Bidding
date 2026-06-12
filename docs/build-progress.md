@@ -782,3 +782,90 @@ carrying a sector (`by_source[].classified > 0`).
 / `secondary_sectors` in the dashboard facet and the guided setup) is the next
 run. NOT built here. After that, Phase 4 (first-class keyword/value/buyer
 filters).
+
+## Phase 3a — rev 2 (2026-06-12): backfill incident — root cause found, fixed, hardened
+
+### What happened (live evidence)
+
+First backfill (limit 500) succeeded. A limit-10000 run logged
+`classification.backfill_failed` after ~40 minutes — with the exception only
+in `exc_info`, which the Azure log stream doesn't render, so the cause was
+invisible. Every subsequent run then failed **within seconds**, at any limit.
+
+### Root cause (proven defects vs the unconfirmed exact error)
+
+**Proven from the code:** `run_backfill` had no exception handling anywhere
+and submitted ONE 10,000-request batch. The create succeeded (a ~40-min
+failure can't be a create rejection); the unguarded run then died on a raise
+during the long polling/collection window — and **abandoned the batch on
+Anthropic's side** with no tracking and no recovery, while every new run
+re-selected the SAME tenders and created blindly. DB-side residue was ruled
+out by reading: nothing is written before results return; the watermark
+stamps only on success.
+
+**Deliberately left as hypothesis (adversarial review correction):** the
+exact API error behind the instant create failures. An abandoned in-flight
+batch is one candidate — but documented Batch API queue limits (100k
+requests in queue even at the lowest tier) mean queue occupancy ALONE should
+not reject a 500-request create, so the narrative is NOT asserted as fact.
+The new structured fields capture the true `error_type`/`error` on the very
+next failing run (phase="submit"), and two discriminating checks exist:
+(1) the abandoned-batch theory predicts self-resolution within ≤24 h (the
+batch-processing window); (2) a `limit=1` trigger now prints the real
+server/client error. A second candidate — a poisoned tender aborting JSON
+serialisation of the whole create payload — is closed outright by the new
+UTF-8 sanitiser.
+
+### The fix (rev 2, no schema change)
+
+1. **Visibility** — every `classification.backfill_*` event now carries the
+   exception type + message as PLAIN structured fields plus context (phase:
+   recover/adopt/select/submit/poll/collect, chunk, selected/submitted/
+   classified counts, batch id). The admin background wrapper does the same.
+2. **Self-heal on start** — the run lists recent batches first: a
+   still-in-flight batch is **adopted** (polled + collected instead of
+   creating a competing one — recovers the paid 10k), and recently-ended
+   batches of OURS (custom_id `tender-<id>`, checked once the batch ends)
+   are collected — INCLUDING partially-collected ones from a mid-collect
+   crash (re-collection is idempotent via per-row skip-current and unbilled;
+   an in-process memo stops re-streams repeating). A foreign adopted batch
+   is skipped after the ownership peek. Abandoned API state also
+   self-expires (processing ≤24 h, results 29 days) — no permanently-stuck
+   state, nothing to clean in our DB.
+3. **Chunked submission, no double-buying** — a large limit is split into
+   sequential chunks of `classifier_backfill_chunk_size` (default 500; far
+   under the Batch API caps of 100k requests / 256 MB). At most one of our
+   batches is ever in flight; per-row commit means progress is never lost;
+   rows that fail once in a run are never re-bought by its later chunks
+   (they stay on the watermark for a later run / the worker); a
+   stream-failure mid-collect keeps the partial counters; a chunk that
+   yields literally nothing stops the loop. One-run-at-a-time: the admin
+   trigger returns 409 while a backfill is already running.
+4. **Poison-proofing** — `build_user_text` sanitises unencodable characters
+   (lone surrogates from scraped HTML) so one bad tender can't abort a whole
+   batch create at JSON-serialisation time.
+
+### Adversarial review (ultracode)
+
+A 24-agent review of the diff (root-cause skeptic, correctness, requirements
+audit, test-coverage critic; every finding adversarially verified) raised 20
+findings, confirmed 15. The critical one corrected the root-cause NARRATIVE
+(queue-occupancy contradicted by documented limits — now stated as
+hypothesis with discriminating checks); the correctness lens added the
+in-run no-double-buy set, the partial-collect recovery (always-collect ours
+instead of judging by the first row), the foreign-batch ownership peek on
+the adopt path, partial-counter survival, the worker-overlap continue fix,
+and the admin 409 lock; the test critic drove a realistic fake (create →
+`in_progress`, auto-paginating list(), stream knobs) and 13 further tests.
+
+### Tests
+
+24 net-new offline tests across the incident regression (adopt + harvest +
+exactly one create), chunking (polled per chunk), per-chunk/partial commit
+survival, every failure phase (select/submit/poll/collect/adopt) structured
++ recoverable next run, no-double-buy, worker-overlap continue,
+canceling-status adoption, foreign in-flight/ended batches left alone,
+recovery scan bounds (window cutoff + auto-pagination limit), poisoned-row
+containment, the admin wrapper's plain error fields, the 409 lock, and the
+UTF-8 sanitiser. Full suite 962 passed / 3 skipped (the known dev-DB flake
+only). Ruff clean.

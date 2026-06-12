@@ -167,6 +167,14 @@ def system_prompt_blocks() -> list[dict]:
     ]
 
 
+def _utf8_safe(text: str) -> str:
+    """Replace characters that cannot survive UTF-8 encoding (lone surrogates
+    from badly-scraped HTML). One poisoned tender must not be able to abort a
+    whole batch submission at JSON-serialisation time — the payload of a
+    Batch-API create carries hundreds of tenders."""
+    return text.encode("utf-8", errors="replace").decode("utf-8")
+
+
 def build_user_text(
     title: str | None, description: str | None, buyer_name: str | None
 ) -> str:
@@ -178,4 +186,4 @@ def build_user_text(
     if desc:
         # Bound the description so one giant tender can't blow the token budget.
         parts.append(f"Description: {desc[:4000]}")
-    return "\n".join(parts)
+    return _utf8_safe("\n".join(parts))

@@ -6,6 +6,9 @@ reasons; new admin endpoints land here.
 """
 from __future__ import annotations
 
+import contextlib
+import threading
+
 import structlog
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -103,11 +106,20 @@ class ClassificationBackfillResponse(BaseModel):
     """Ack for the one-time classification backfill. Fire-and-forget: the
     Batch-API submission + collection happens in the background; the operator
     watches `classification.backfill_*` logs and the
-    GET /admin/diagnostics/classification-coverage readout for the outcome."""
+    GET /admin/diagnostics/classification-coverage readout for the outcome.
+    Returns 409 while a previous backfill run is still in progress."""
 
     status: str  # "scheduled"
     detail: str
     limit: int
+
+
+#: Only one backfill run at a time. A chunked 10k run can take hours, so an
+#: accidental second trigger would otherwise select overlapping pending rows
+#: and double-buy them (collect's skip-current prevents data corruption but
+#: not double payment) and put two of our batches in flight at once.
+#: Process-local is sufficient: the container runs a single uvicorn worker.
+_backfill_lock = threading.Lock()
 
 
 @router.post(
@@ -128,28 +140,47 @@ def trigger_classification_backfill(
     """Trigger a one-time classification backfill over the unclassified pool.
 
     Submits up to `limit` not-yet-classified tenders through the Anthropic
-    Batch API (≈50% cheaper), polls the batch to completion in the background,
-    and writes each sector back onto its tender. Bounded + resumable +
-    idempotent: re-running picks up only tenders still off the current
-    classifier version, so it's safe to call repeatedly to drain a large
-    backlog.
+    Batch API (≈50% cheaper) in sequential chunks, polls each chunk to
+    completion in the background, and writes each sector back onto its
+    tender. Bounded + resumable + idempotent: re-running picks up only
+    tenders still off the current classifier version, so it's safe to call
+    repeatedly to drain a large backlog. On start it self-heals state a
+    previously-failed run left behind (adopts a still-in-flight batch,
+    collects ended-but-uncollected ones).
 
-    503 if `ANTHROPIC_API_KEY` is not configured.
+    503 if `ANTHROPIC_API_KEY` is not configured. 409 if a backfill run is
+    already in progress (re-trigger after it completes).
     """
     if not settings.anthropic_api_key:
         raise HTTPException(
             status_code=503,
             detail="anthropic_api_key not configured on the backend",
         )
+    # Acquired HERE (not in the background task) so two quick POSTs can't
+    # both schedule before either run starts. Released in the task's finally.
+    if not _backfill_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail="classification backfill already running — watch "
+            "`classification.backfill_*` logs; re-trigger after it completes",
+        )
     effective_limit = limit or settings.classifier_backfill_batch_size
-    background_tasks.add_task(_run_classification_backfill_safely, effective_limit)
+    try:
+        background_tasks.add_task(
+            _run_classification_backfill_safely, effective_limit
+        )
+    except BaseException:
+        _backfill_lock.release()
+        raise
     return ClassificationBackfillResponse(
         status="scheduled",
         detail=(
             f"Classification backfill of up to {effective_limit} tenders started "
-            "in the background (Batch API). Watch `classification.backfill_*` "
-            "logs and GET /admin/diagnostics/classification-coverage. Re-run to "
-            "drain more — it's resumable."
+            "in the background (Batch API, chunked). Watch "
+            "`classification.backfill_*` logs and "
+            "GET /admin/diagnostics/classification-coverage. Re-run to drain "
+            "more — it's resumable. A second trigger while one is running "
+            "returns 409."
         ),
         limit=effective_limit,
     )
@@ -157,13 +188,28 @@ def trigger_classification_backfill(
 
 def _run_classification_backfill_safely(limit: int) -> None:
     """Background wrapper — never lets an exception escape into FastAPI's
-    background-task runner; the backfill already logs structured events."""
+    background-task runner. `run_backfill` guards every phase internally and
+    logs structured `classification.backfill_*` events itself; this outer
+    catch is belt-and-braces, and (2026-06-12 incident) it must carry the
+    exception type/message as PLAIN fields — `exc_info` alone is not rendered
+    by the Azure log stream, which left the first 10k failure undiagnosable."""
     try:
         from tender_agent.services.classification.backfill import run_backfill
 
         run_backfill(limit=limit)
-    except Exception:  # noqa: BLE001
-        logger.exception("classification.backfill_failed")
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "classification.backfill_failed",
+            phase="background_task",
+            error_type=type(exc).__name__,
+            error=str(exc)[:500],
+            limit=limit,
+        )
+    finally:
+        # Paired with the acquire in trigger_classification_backfill. The
+        # suppress keeps direct test invocations (which never acquired) safe.
+        with contextlib.suppress(RuntimeError):
+            _backfill_lock.release()
 
 
 # ---------------------------------------------------------------------------
