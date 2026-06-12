@@ -48,6 +48,13 @@ class Settings(BaseSettings):
     poll_interval_minutes: int = 30
     lookback_days_initial: int = 7
 
+    # Hard ceiling for ONE source's poll within a cycle (2026-06-12 outage:
+    # a poll cycle hung forever — a stuck task meant `poll_all` never
+    # returned, and APScheduler's max_instances=1 then skipped every future
+    # cycle, killing discovery for hours). A source that exceeds this is
+    # cancelled, its run marked errored, and the cycle moves on.
+    poll_source_timeout_minutes: int = 15
+
     # Per-source poll concurrency (Phase-1 rev 4, 2026-06-12). The poll cycle
     # fans each source out onto its own task + DB session and runs them
     # concurrently, so a high-volume source (FTS streams thousands of rows)
@@ -87,19 +94,22 @@ class Settings(BaseSettings):
     # (used for the Source row); `eu_supply_portals` is the full host list the
     # adapter sweeps. Add tenants here as the operator needs them.
     eu_supply_api_base: str = "https://yortender.eu-supply.com"
-    # bluelight.eu-supply.com ("Blue Light", police/emergency services) was
-    # added to the default sweep from the portal survey but could not be
-    # live-verified from CI. The 2026-06-12T11:26Z live sources-health readout
-    # proved its /ctm/Supplier/PublicTenders path returns 404 — that tenant
-    # doesn't expose the public listing at the standard CTM path (or the host
-    # is wrong). REMOVED from the default sweep so it stops erroring every
-    # cycle; the working tenant(s) keep ingesting (25 tenders in that readout).
-    # We don't guess a replacement URL — re-add a corrected Blue Light tenant
-    # host here if the operator determines one. (The survey also mentioned
-    # uk.eu-supply.com; not added, for the same unverified reason.)
+    # Entries are either a bare tenant host (the adapter appends
+    # /ctm/Supplier/PublicTenders) or a FULL listing URL (used as-is) for
+    # tenants whose listing doesn't live at the standard path.
+    #
+    # Blue Light (police/emergency services): bluelight.eu-supply.com's
+    # /ctm/Supplier/PublicTenders 404s — live-probed 2026-06-12: that host is
+    # now only a gateway page whose "New Tender Opportunities" link points to
+    # the CENTRAL host with a buyer-group filter,
+    # https://uk.eu-supply.com/ctm/supplier/publictenders?B=BLUELIGHT
+    # (verified returning the standard CTM table, police/fire buyers).
+    # Cross-host duplicates are safe: the Quote/tender id is EU-Supply's
+    # platform-global id, so the (source_code, source_ref) upsert dedupes.
     eu_supply_portals: list[str] = Field(
         default_factory=lambda: [
             "https://yortender.eu-supply.com",
+            "https://uk.eu-supply.com/ctm/Supplier/PublicTenders?B=BLUELIGHT",
         ]
     )
 
@@ -157,6 +167,11 @@ class Settings(BaseSettings):
     local_fetch_runner: bool = False
 
     http_timeout_seconds: int = 30
+    # Per-read timeout for large response bodies (FTS pages run to multiple
+    # MB; the 2026-06-12 outage showed mid-body JSON parse failures on them).
+    # Applied as httpx's read timeout while connect/write/pool keep
+    # http_timeout_seconds.
+    http_read_timeout_seconds: int = 90
     http_user_agent: str = "tender-agent/0.1 (compliance-research)"
 
     # --- Credentials store (cloud-safe) --------------------------------------

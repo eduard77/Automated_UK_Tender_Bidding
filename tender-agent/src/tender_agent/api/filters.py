@@ -99,6 +99,11 @@ def delete_filter(filter_id: int, db: Session = Depends(get_db)) -> None:
 
 @router.post("/admin/poll-now", status_code=202)
 async def poll_now() -> dict:
-    """Trigger an immediate poll cycle across all enabled sources."""
-    await scheduler.trigger_now()
-    return {"status": "queued"}
+    """Trigger an immediate poll cycle across all enabled sources.
+
+    Single-flight: when a cycle is already running the trigger is SKIPPED
+    (status "skipped_already_running") instead of starting a concurrent
+    duplicate — concurrent cycles double-polled sources and contributed to
+    the 2026-06-12 discovery outage."""
+    started = await scheduler.trigger_now()
+    return {"status": "queued" if started else "skipped_already_running"}

@@ -28,6 +28,37 @@ def _single_month(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(s2w_module, "_months_between", lambda _s, _e: [(4, 2026)])
 
 
+async def test_consecutive_failures_abort_the_month_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Containment for a hard-down upstream (the 2026-06 expired-certificate
+    outage): once CONSECUTIVE_FAILURE_LIMIT month fetches fail in a row, the
+    sweep aborts instead of burning the full retry budget on every remaining
+    month — a dead S2W must not slow the rest of the poll cycle."""
+    monkeypatch.setattr(
+        s2w_module,
+        "_months_between",
+        lambda _s, _e: [(m, 2026) for m in range(1, 6)],  # 5 months
+    )
+    adapter = build_adapter(
+        Sell2WalesAdapter, static_json_handler({"releases": []})
+    )
+    calls = {"n": 0}
+
+    async def failing_get_json(_url, params=None):
+        calls["n"] += 1
+        raise httpx.ConnectError("certificate verify failed: expired")
+
+    adapter._get_json = failing_get_json  # bypass tenacity for test speed
+
+    tenders = await collect(adapter, CUTOFF)
+
+    assert tenders == []
+    assert adapter.had_errors is True
+    assert calls["n"] == Sell2WalesAdapter.CONSECUTIVE_FAILURE_LIMIT  # not 5
+    assert len(adapter.error_messages) == Sell2WalesAdapter.CONSECUTIVE_FAILURE_LIMIT
+
+
 async def test_fetch_since_yields_normalised_tenders() -> None:
     payload = load_json_fixture(FIXTURE)
     adapter = build_adapter(Sell2WalesAdapter, static_json_handler(payload))

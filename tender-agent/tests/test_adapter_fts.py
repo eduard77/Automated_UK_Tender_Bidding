@@ -130,14 +130,14 @@ async def test_handles_malformed_entry_gracefully() -> None:
     assert not any("Malformed: no ocid" in title for title in titles)
 
 
-async def test_malformed_feed_response_does_not_fail_run() -> None:
-    """Phase-1 resilience (2026-06-12): a malformed / truncated feed response
-    (HTTP 200 but the body isn't valid JSON) is caught and skipped — the run
-    COMPLETES instead of erroring the whole source. `had_errors` stays False so
-    one transient bad batch can't flip FTS to fetch_failing."""
+async def test_malformed_feed_response_is_salvaged_and_reported() -> None:
+    """2026-06-12 outage hardening: an unparseable page no longer kills the
+    run silently OR invisibly — whatever releases CAN be salvaged are
+    yielded, and the run is marked errored with a diagnosis naming the parse
+    position and salvage count."""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        # 200 OK but the body is not parseable JSON -> response.json() raises.
+        # 200 OK but the body is not parseable JSON.
         return httpx.Response(
             200,
             content=b"{ this is not valid json ",
@@ -147,14 +147,15 @@ async def test_malformed_feed_response_does_not_fail_run() -> None:
     adapter = build_adapter(FTSAdapter, handler)
     tenders = await collect(adapter, CUTOFF)
 
-    assert tenders == []  # nothing yielded from the unparseable page
-    assert adapter.had_errors is False  # but the run is NOT marked failed
+    assert tenders == []  # nothing salvageable from this body
+    assert adapter.had_errors is True
+    assert any("salvaged 0" in m for m in adapter.error_messages)
 
 
 async def test_malformed_feed_on_later_page_keeps_earlier_records() -> None:
     """A bad batch MID-STREAM: page 1 returns good releases plus a `next`
-    cursor, page 2 returns malformed JSON. The page-1 tenders survive and the
-    run completes (had_errors False) — the bad batch is skipped, not fatal."""
+    cursor, page 2 returns garbled JSON. The page-1 tenders survive, the run
+    completes, and the failure is recorded with the salvage diagnosis."""
     page1 = load_json_fixture(FIXTURE)
     page1 = {
         **page1,
@@ -181,4 +182,90 @@ async def test_malformed_feed_on_later_page_keeps_earlier_records() -> None:
 
     assert calls["n"] == 2  # it did follow the cursor to page 2
     assert len(tenders) == 5  # page 1's good releases stand
-    assert adapter.had_errors is False  # page 2's bad batch didn't fail the run
+    assert adapter.had_errors is True  # the bad page is visible, not silent
+    assert any("malformed JSON" in m for m in adapter.error_messages)
+
+
+def _raw_release(ocid: str, date: str) -> str:
+    return (
+        f'{{"ocid": "{ocid}", "id": "{ocid}-1", "date": "{date}", '
+        f'"tag": ["tender"], "tender": {{"title": "T {ocid}", '
+        f'"status": "active"}}}}'
+    )
+
+
+async def test_bad_record_fails_alone_records_around_it_survive() -> None:
+    """One malformed notice mid-array: the records BEFORE and AFTER it are
+    salvaged (the scan resynchronises past the bad bytes); only the bad
+    record is lost, and the diagnosis says so."""
+    body = (
+        '{"releases": ['
+        + _raw_release("ocds-fts-good1", "2026-06-01T10:00:00Z")
+        + ', {"ocid": "ocds-fts-bad", "date": }, '  # malformed record
+        + _raw_release("ocds-fts-good2", "2026-06-02T10:00:00Z")
+        + "]}"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=body.encode(), headers={"Content-Type": "application/json"}
+        )
+
+    adapter = build_adapter(FTSAdapter, handler)
+    tenders = await collect(adapter, CUTOFF)
+
+    refs = {t.source_ref for t in tenders}
+    assert "ocds-fts-good1" in refs
+    assert "ocds-fts-good2" in refs  # the record AFTER the bad one survived
+    assert "ocds-fts-bad" not in refs
+    assert adapter.had_errors is True
+    assert any("salvaged 2" in m for m in adapter.error_messages)
+
+
+async def test_truncated_payload_salvages_prefix_and_advances_watermark() -> None:
+    """The incident shape: a multi-MB body cut mid-stream. The complete
+    releases before the cut are salvaged and — because earlier pages confirm
+    the feed ascends — the watermark advances for what succeeded."""
+    import json as jsonlib
+
+    page1 = {
+        "releases": [
+            jsonlib.loads(_raw_release("ocds-fts-p1", "2026-06-01T10:00:00Z"))
+        ],
+        "links": {
+            "next": "https://www.find-tender.service.gov.uk/api/1.0/"
+            "ocdsReleasePackages?cursor=page2"
+        },
+    }
+    # Page 2: two complete releases, then the body is CUT mid-record.
+    page2_full = (
+        '{"releases": ['
+        + _raw_release("ocds-fts-p2a", "2026-06-03T10:00:00Z")
+        + ", "
+        + _raw_release("ocds-fts-p2b", "2026-06-04T10:00:00Z")
+        + ", "
+        + _raw_release("ocds-fts-p2c", "2026-06-05T10:00:00Z")
+    )
+    page2_truncated = page2_full[: page2_full.rfind("{")]  # cut mid-stream
+
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(200, json=page1)
+        return httpx.Response(
+            200,
+            content=page2_truncated.encode(),
+            headers={"Content-Type": "application/json"},
+        )
+
+    adapter = build_adapter(FTSAdapter, handler)
+    tenders = await collect(adapter, CUTOFF)
+
+    refs = {t.source_ref for t in tenders}
+    assert {"ocds-fts-p1", "ocds-fts-p2a", "ocds-fts-p2b"} <= refs
+    assert adapter.had_errors is True
+    # Page 2's salvaged records confirmed page 1 ascends — the watermark
+    # covers page 1, so the next run does not replay it.
+    assert adapter.progress_watermark == datetime(2026, 6, 1, 10, 0, tzinfo=UTC)

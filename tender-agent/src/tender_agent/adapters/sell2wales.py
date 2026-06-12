@@ -35,12 +35,21 @@ class Sell2WalesAdapter(SourceAdapter):
     name = "Sell2Wales"
     base_url = settings.sell2wales_api_base
 
+    #: Stop the month sweep after this many CONSECUTIVE failed month fetches.
+    #: When the upstream is hard-down (the 2026-06 expired-certificate
+    #: outage), every month's request fails after the full tenacity retry
+    #: budget — sweeping all remaining months multiplies dead retry time and
+    #: slows the rest of the poll cycle for nothing. Two consecutive failures
+    #: prove the outage; abort the run (errors already recorded).
+    CONSECUTIVE_FAILURE_LIMIT = 2
+
     async def fetch_since(self, since: datetime) -> AsyncIterator[NormalisedTender]:
         if since.tzinfo is None:
             since = since.replace(tzinfo=UTC)
         now = datetime.now(UTC)
         url = f"{self.base_url}/Notices"
 
+        consecutive_failures = 0
         for month, year in _months_between(since, now):
             params = {
                 "dateFrom": f"{month:02d}-{year:04d}",
@@ -61,7 +70,17 @@ class Sell2WalesAdapter(SourceAdapter):
                     url=url,
                     month=params["dateFrom"],
                 )
+                consecutive_failures += 1
+                if consecutive_failures >= self.CONSECUTIVE_FAILURE_LIMIT:
+                    logger.error(
+                        "s2w.upstream_down_abort",
+                        consecutive_failures=consecutive_failures,
+                        detail="upstream hard-down — aborting the month sweep "
+                        "instead of burning retries on every remaining month",
+                    )
+                    break
                 continue
+            consecutive_failures = 0
 
             releases = payload.get("releases", []) or payload.get("notices", [])
             for release in releases:

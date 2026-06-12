@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
-from datetime import datetime
+from datetime import datetime  # noqa: TC003 — used at runtime by the tracker
 
 import httpx
 import structlog
@@ -28,6 +28,57 @@ from tender_agent.schemas import NormalisedTender
 logger = structlog.get_logger(__name__)
 
 
+class TruncatedResponseError(httpx.TransportError):
+    """The response body was shorter than its declared Content-Length —
+    the payload was cut mid-stream (proxy/idle-timeout truncation). Subclasses
+    httpx.TransportError so the standard retry policy treats it as a
+    transient network fault."""
+
+
+class PageProgressTracker:
+    """Confirm-then-advance watermark over a paged feed.
+
+    The poll watermark normally only advances on a fully-clean run, so a
+    source failing on page N re-fetches the ENTIRE window every retry (the
+    CF 429 spiral, 2026-06-12: each retry re-pulled a 10-day backlog of 16+
+    pages, which itself re-triggered the 429). This tracker lets an adapter
+    persist partial progress safely:
+
+    - `page_done(page_min, page_max)` is called after each page's records
+      have been fully consumed by the ingester.
+    - Page k's max timestamp becomes the watermark only once page k+1
+      PROVES the feed ascends (its min >= page k's max). A descending or
+      unordered feed therefore never advances mid-run — advancing on a
+      newest-first feed would silently skip every older unfetched page.
+    - The final page is never confirmed, so a resume re-fetches at most one
+      page of overlap; the upsert change-hash makes that idempotent.
+    """
+
+    def __init__(self) -> None:
+        self._pending_max: datetime | None = None
+        self._frozen = False
+        self.watermark: datetime | None = None
+
+    def page_done(
+        self, page_min: datetime | None, page_max: datetime | None
+    ) -> None:
+        if self._frozen:
+            return
+        if self._pending_max is not None and page_min is not None:
+            if page_min >= self._pending_max:
+                # Ascension confirmed — the previous page is safely behind us.
+                self.watermark = self._pending_max
+            else:
+                # Newest-first or unordered feed: freeze. Never advance on a
+                # feed where later pages hold OLDER records.
+                self._frozen = True
+                return
+        if page_max is not None and (
+            self._pending_max is None or page_max > self._pending_max
+        ):
+            self._pending_max = page_max
+
+
 class SourceAdapter(ABC):
     """Subclass per tender source."""
 
@@ -38,7 +89,12 @@ class SourceAdapter(ABC):
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
-            timeout=settings.http_timeout_seconds,
+            # Generous per-read budget for multi-MB page bodies (FTS); the
+            # tighter default still bounds connect/write/pool.
+            timeout=httpx.Timeout(
+                settings.http_timeout_seconds,
+                read=settings.http_read_timeout_seconds,
+            ),
             headers={"User-Agent": settings.http_user_agent, "Accept": "application/json"},
             follow_redirects=True,
         )
@@ -54,6 +110,26 @@ class SourceAdapter(ABC):
         # endpoint then displays verbatim. Bounded length so a flapping
         # source can't blow the row.
         self.error_messages: list[str] = []
+        # Partial-progress watermark (2026-06-12). Paging adapters set this
+        # (via PageProgressTracker) as pages complete; `poll_source` persists
+        # it on a FAILED run so retries resume from the last confirmed page
+        # instead of re-fetching the whole window. None = no safe progress.
+        self.progress_watermark: datetime | None = None
+
+    @staticmethod
+    def check_body_complete(response: httpx.Response) -> None:
+        """Raise TruncatedResponseError when the body is shorter than its
+        declared Content-Length (only checkable on identity encoding — for
+        compressed bodies the header counts compressed bytes)."""
+        encoding = (response.headers.get("Content-Encoding") or "identity").lower()
+        declared = response.headers.get("Content-Length")
+        if encoding not in ("", "identity") or not (declared and declared.isdigit()):
+            return
+        actual = len(response.content)
+        if actual < int(declared):
+            raise TruncatedResponseError(
+                f"response truncated: got {actual} of {declared} declared bytes"
+            )
 
     def record_error(self, message: str, limit: int = 5) -> None:
         """Append a short upstream-error description for the PollRun row.
