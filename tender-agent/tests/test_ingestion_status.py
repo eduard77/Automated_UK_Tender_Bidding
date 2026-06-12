@@ -48,6 +48,25 @@ class _CleanEmptyAdapter(SourceAdapter):
             yield  # type: ignore[unreachable]
 
 
+class _SpecificErrorAdapter(SourceAdapter):
+    """Simulates S2W/NI: upstream fails and the adapter records the SPECIFIC
+    cause (status / exception) via record_error, not just had_errors."""
+
+    code = "FAKE"
+    name = "Fake adapter"
+    base_url = "https://example.invalid"
+
+    async def fetch_since(
+        self, since: datetime
+    ) -> AsyncIterator[NormalisedTender]:
+        self.had_errors = True
+        self.record_error(
+            "06-2026: HTTPStatusError: 500 Server Error for url .../v1/Notices"
+        )
+        if False:  # pragma: no cover
+            yield  # type: ignore[unreachable]
+
+
 def _fake_source() -> MagicMock:
     source = MagicMock()
     source.id = 42
@@ -72,6 +91,30 @@ async def test_poll_source_marks_status_error_when_adapter_had_errors() -> None:
     assert run.fetched == 0
     assert run.error is not None
     # last_polled_at must NOT be advanced when the source failed.
+    assert source.last_polled_at is None
+
+
+@pytest.mark.asyncio
+async def test_poll_source_surfaces_specific_adapter_error_not_generic() -> None:
+    """When an adapter records a SPECIFIC upstream cause via record_error
+    (the S2W/NI path), poll_source must surface that on PollRun.error —
+    NOT the legacy generic "upstream HTTP requests failed" string. This is
+    what lets the sources-health readout tell 403 vs 500 vs DNS apart."""
+    source = _fake_source()
+    db = MagicMock()
+
+    with patch.dict(
+        "tender_agent.services.ingestion.ADAPTERS",
+        {"FAKE": _SpecificErrorAdapter},
+        clear=False,
+    ):
+        run = await poll_source(db, source)
+
+    assert run.status == "error"
+    assert "HTTPStatusError" in (run.error or "")
+    assert "500" in (run.error or "")
+    assert "upstream HTTP requests failed" not in (run.error or "")
+    # A failed source must NOT advance its watermark.
     assert source.last_polled_at is None
 
 
