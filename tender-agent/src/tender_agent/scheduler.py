@@ -133,16 +133,62 @@ def _orphan_stale_running_runs(db) -> int:
         return 0
 
 
+async def _poll_one_source(
+    source_id: int, source_code: str, sem: asyncio.Semaphore
+) -> None:
+    """Poll a single source on its OWN DB session, under the concurrency cap.
+
+    Runs as one task inside `poll_all`'s `asyncio.gather`. Each task opens
+    its own `SessionLocal()` — SQLAlchemy Sessions are NOT safe to share
+    across concurrent tasks, so the cycle never threads one session through
+    the fan-out. The per-source `scheduler.poll_source_attempt` line is
+    emitted here (before any work) so the Log stream answers "did we even
+    try to poll X?" for EVERY source, every cycle — including the tail
+    sources (EU_SUPPLY/ATAMIS) the old serial loop never reached. Exceptions
+    are logged and swallowed so one source failing can't cancel its siblings
+    in the gather.
+    """
+    adapter_in_registry = source_code in ADAPTERS
+    logger.info(
+        "scheduler.poll_source_attempt",
+        source=source_code,
+        has_adapter=adapter_in_registry,
+    )
+    if not adapter_in_registry:
+        # Source rows for browser-driven flows (PROACTIS) live on their own
+        # job; skip them here without raising so the gather always covers
+        # the HTTP adapters.
+        return
+    async with sem:
+        try:
+            with SessionLocal() as db:
+                source = db.get(Source, source_id)
+                if source is None:
+                    return
+                await poll_source(db, source)
+        except Exception:  # noqa: BLE001
+            logger.exception("scheduler.source_failed", source=source_code)
+
+
 async def poll_all() -> None:
-    """Poll every enabled source sequentially.
+    """Poll every enabled source CONCURRENTLY — one task + session per source.
 
     Self-heals scheduling at the top of every cycle (`ensure_sources()`):
     a new adapter wired in after the previous boot gets its Source row
     here, so it joins the very next cycle instead of waiting for a
-    redeploy. The per-iteration `scheduler.poll_source_attempt` log line
-    makes the "did we even try to poll X?" question answerable from the
-    Azure Log stream — without it, a source skipped by the iteration was
-    indistinguishable from one whose poll finished cleanly with zero rows.
+    redeploy.
+
+    Phase-1 rev 4 (2026-06-12): the loop used to `await poll_source(...)`
+    for each source IN SERIES, so a high-volume source blocked every source
+    after it. The live Log stream proved one cycle spent over a minute still
+    inside FTS (streaming 160+ tenders) and never logged a
+    `poll_source_attempt` for the tail (EU_SUPPLY/PROACTIS/ATAMIS) — that is
+    the entire reason they read `never_polled`. Decoupling enrichment (rev 3)
+    took the AI call off the hot path but the ingestion VOLUME itself still
+    monopolised the cycle. Now each source fans out onto its own task via
+    `asyncio.gather`, bounded by a semaphore, so FTS churning thousands of
+    rows can't starve the others — every source records a poll run each
+    cycle regardless of FTS's size.
     """
     # Self-heal: ensure every registered adapter has a Source row at the
     # start of every cycle. Idempotent and cheap; covers the boot-order
@@ -171,23 +217,21 @@ async def poll_all() -> None:
             source_count=len(sources),
             source_codes=[s.code for s in sources],
             registered_adapters=registered,
+            max_concurrency=settings.poll_max_concurrency,
         )
-        for source in sources:
-            adapter_in_registry = source.code in ADAPTERS
-            logger.info(
-                "scheduler.poll_source_attempt",
-                source=source.code,
-                has_adapter=adapter_in_registry,
-            )
-            if not adapter_in_registry:
-                # Source rows for browser-driven flows (PROACTIS) live on
-                # their own job; skip them here without raising, so the
-                # iteration always reaches the HTTP adapters below.
-                continue
-            try:
-                await poll_source(db, source)
-            except Exception:  # noqa: BLE001
-                logger.exception("scheduler.source_failed", source=source.code)
+        # Detach the per-source identity from the session before fan-out:
+        # each task re-loads its Source on its own session below.
+        work = [(s.id, s.code) for s in sources]
+
+    # Fan out: poll all sources concurrently, each on its own task + session,
+    # bounded by the concurrency cap. return_exceptions keeps one task's
+    # unexpected failure from cancelling the rest (each task also guards
+    # itself internally).
+    sem = asyncio.Semaphore(max(1, settings.poll_max_concurrency))
+    await asyncio.gather(
+        *(_poll_one_source(sid, code, sem) for sid, code in work),
+        return_exceptions=True,
+    )
 
 
 def start() -> None:

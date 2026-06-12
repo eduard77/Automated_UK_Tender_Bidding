@@ -9,7 +9,7 @@ previous phase being marked DONE.
 | Phase | Title                                                       | Verdict       | Date       | Notes                                                                |
 | ----- | ----------------------------------------------------------- | ------------- | ---------- | -------------------------------------------------------------------- |
 | 0     | Reusable dashboard bot                                      | **PASS** (CI) | 2026-06-11 | Unit-test gate green; live gate is the operator's runbook below.     |
-| 1     | Get the silent sources pulling (Atamis, EU-Supply, Sell2Wales) | **IN PROGRESS (rev 2)** | 2026-06-11 | Watermark + scheduler self-heal + iteration logging + real-error surface + per-advert guard; gate awaits next health readout. |
+| 1     | Get the silent sources pulling (Atamis, EU-Supply, Sell2Wales) | **IN PROGRESS (rev 4)** | 2026-06-12 | rev 4: concurrent per-source poll so a high-volume source (FTS) can't starve the tail; gate awaits next health readout. |
 | 2     | Fix run-15-class discovery errors                           | not started   | —          |                                                                      |
 | 3     | Cross-source CPV/field normalisation (the spine)            | not started   | —          | Likely NEEDS DECISION when reached.                                  |
 | 4     | Keyword/value/buyer filters as first-class                  | not started   | —          |                                                                      |
@@ -423,3 +423,120 @@ Operator: merge → wait one poll cycle (or fire `POST /admin/poll-now`)
 fire its first batch → open `GET /admin/diagnostics/sources-health`
 → paste the JSON. The new readout decides between Phase 1 PASS and
 the next narrow fix.
+
+## Phase 1 — IN PROGRESS rev 4 (2026-06-12): serial poll still starves the tail — make it concurrent
+
+### Verdict: Phase 1 IN PROGRESS — rev 4 (browser-only gate)
+
+### What the Log stream proved (this cycle, LOG-PROVEN)
+
+The rev-3 enrichment decoupling shipped and works — every tender now logs
+`ingest.enrichment_deferred`, so the slow Anthropic call is off the poll
+path. But the goal is still unmet and the Log stream shows exactly why:
+
+- `scheduler.poll_all_starting` source order: `SAMPLE_SEED, FTS, CF, PCS,
+  S2W, NI, EU_SUPPLY, PROACTIS, ATAMIS`.
+- A `poll_source_attempt` fires for SAMPLE_SEED, then FTS — and then for
+  **over a minute and counting** the stream is nothing but FTS tender
+  ingestion (`tender_id 8017 → 8176+`, 160+ rows, all FTS,
+  `ingest.enrichment_deferred` each).
+- **No `poll_source_attempt` appears for CF/PCS/S2W/NI/EU_SUPPLY/
+  PROACTIS/ATAMIS** — the cycle is still inside FTS.
+
+**Conclusion (confirmed, not hypothesised): the poll was SERIAL.**
+`poll_all` `await`ed each source's `poll_source` to full completion before
+starting the next, so FTS — which has thousands of tenders — consumed the
+whole cycle and every source after it was never reached. Decoupling
+enrichment (rev 3) was necessary but not sufficient: the ingestion VOLUME
+itself is the blocker now, not the AI call.
+
+### What this PR ships (rev 4 on top of #122 + #123 + #124 + #125)
+
+1. **Concurrent per-source poll.** `poll_all` no longer walks sources in a
+   serial `for` loop. It fans each source out onto its own task via
+   `asyncio.gather` (new helper `_poll_one_source`), so a high-volume
+   source can't block the others. Contract satisfied: in a single
+   scheduler interval EVERY registered source now gets a `poll_source_
+   attempt` and records a poll run, regardless of how many tenders FTS
+   has — the `poll_source_attempt` line for every source is emitted at
+   task start, before any ingestion work.
+2. **Session-per-task.** Each concurrent source opens its OWN
+   `SessionLocal()` and re-loads its `Source` by id — the cycle never
+   threads one SQLAlchemy Session across concurrent tasks (Sessions are
+   not concurrency-safe). The shared session is used only for the serial
+   pre-amble (orphan cleanup + the source list).
+3. **Bounded + isolated.** A `poll_max_concurrency` setting (default 6)
+   caps concurrent sources, bounding DB connections (engine pool 5 + 10
+   overflow) while comfortably exceeding the ~8 HTTP sources. `gather(...,
+   return_exceptions=True)` plus a per-task try/except means one source
+   raising is logged (`scheduler.source_failed`) and can't cancel its
+   siblings. Set the cap to 1 to fall back to serial polling.
+4. **Everything from earlier revs preserved.** The enrichment worker,
+   watermark/reconcile, `_orphan_stale_running_runs`, real-error
+   surfacing (`record_error`), per-iteration `poll_source_attempt`
+   logging, the `stale_not_polling` diagnosis, and the PROACTIS-skip
+   (browser-driven discovery is its own job) all stay exactly as shipped.
+   No inline enrichment was reintroduced.
+
+### On S2W / NI specific errors (the "also confirm" item)
+
+The specific-upstream-error path is already intact from rev 2: both the
+Sell2Wales adapter (`record_error(f"{dateFrom}: {type(exc).__name__}:
+{exc}")`) and the eTendersNI adapter (`record_error(f"fetch failed:
+{type(exc).__name__}: {exc}")`) record the precise cause whenever they set
+`had_errors`, and `poll_source` surfaces `error_messages` on
+`PollRun.error` — only falling back to the generic
+"upstream HTTP requests failed" when an adapter set `had_errors` with no
+recorded message. The generic string in the live readout was a symptom of
+the SERIAL bug, not a missing error path: S2W/NI sit at positions 5–6 in
+the order and the cycle never reached them, so their displayed run was
+stale. A new regression test
+(`test_poll_source_surfaces_specific_adapter_error_not_generic`) pins that
+a recorded specific error wins over the generic fallback. Once the
+concurrent cycle actually reaches S2W/NI, their readout will show the real
+403/500/DNS string; per "no guessed fixes" no upstream is promoted to a
+`BLOCKED-UPSTREAM` row in `docs/accounts-needed.md` until that evidence
+lands.
+
+### Tests (offline, no Postgres)
+
+- `tests/test_scheduler_concurrent_poll.py` (3 tests):
+  - **The core regression:** a high-volume source (FTS) whose poll only
+    finishes AFTER the tail sources have been polled — under the old
+    serial loop `poll_all` would never return; under the fan-out the tail
+    runs, releases FTS, and the cycle finishes. (Asserts FTS + EU_SUPPLY +
+    ATAMIS all polled.)
+  - One source raising is logged (`scheduler.source_failed`) and does not
+    stop its siblings.
+  - Each source polls on a DISTINCT session (no cross-task session
+    sharing).
+- `tests/test_ingestion_status.py` extended: the specific-error-wins test
+  above.
+- Existing `tests/test_scheduler_self_heal.py` (5) still green — the
+  ensure-sources-first, per-source `poll_source_attempt`, PROACTIS-skip,
+  and orphan-cleanup contracts are all preserved under the new fan-out.
+- Full suite: 914 passed, 3 skipped. The one failure is the pre-existing
+  dev-DB live-data flake `test_portal_platform_matching::test_every_
+  platform_matches_at_least_three_sightings` ("proactis matched only 2
+  sightings"), unrelated to this change.
+- Ruff clean.
+
+### Phase 1 verdict — still IN PROGRESS, gate is the next browser readout
+
+After merge + auto-deploy + `POST /admin/poll-now` + a few minutes, the
+backend Log stream should show `poll_source_attempt` for EU_SUPPLY and
+ATAMIS (they are reached now), and `GET /admin/diagnostics/sources-health`
+should show them leaving `never_polled` — either ingesting, or recording a
+real error string. If every source is then reached AND S2W/NI prove to be
+genuine upstream outages (real 403/500/DNS), Phase 1 may close as
+**PASS — with-blocked-upstreams-recorded** (promote the S2W/NI rows in
+`docs/accounts-needed.md` at that point). Until that readout lands the
+harness verdict stays **IN PROGRESS**.
+
+### Next single action
+
+Operator: merge → fire `POST /admin/poll-now` → wait a few minutes →
+read the Log stream for `poll_source_attempt` on EU_SUPPLY + ATAMIS, then
+open `GET /admin/diagnostics/sources-health` and paste the JSON. The CI
+dashboard-bot is the automated gate; the residential-IP live bot run is
+optional.

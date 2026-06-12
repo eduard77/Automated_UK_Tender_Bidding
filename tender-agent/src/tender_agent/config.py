@@ -48,6 +48,17 @@ class Settings(BaseSettings):
     poll_interval_minutes: int = 30
     lookback_days_initial: int = 7
 
+    # Per-source poll concurrency (Phase-1 rev 4, 2026-06-12). The poll cycle
+    # fans each source out onto its own task + DB session and runs them
+    # concurrently, so a high-volume source (FTS streams thousands of rows)
+    # can no longer block the tail (EU_SUPPLY/ATAMIS) the way the old serial
+    # loop did — the live Log stream proved one cycle spent >1 minute still
+    # inside FTS and never reached the tail. This caps how many sources poll
+    # at once; it bounds concurrent DB connections (engine pool default
+    # 5 + 10 overflow) and well exceeds the ~8 HTTP sources, so every source
+    # gets a turn within the cycle. Set to 1 to fall back to serial polling.
+    poll_max_concurrency: int = 6
+
     # Enrichment worker (Phase-1 rev 3, 2026-06-11). Decouples slow per-tender
     # work (PDF download + Anthropic requirements extraction) from the polling
     # hot path. Without this, an early-list source with many filter-matched
