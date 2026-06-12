@@ -187,6 +187,14 @@ class Settings(BaseSettings):
     classifier_worker_batch_size: int = 20
     # Tenders per Batch-API submission in POST /admin/classify/backfill.
     classifier_backfill_batch_size: int = 500
+    # Max tenders per SINGLE Batch-API create inside a backfill run. A large
+    # `limit` is split into sequential chunks of this size (2026-06-12
+    # incident: one unguarded 10,000-request batch failed mid-run and was
+    # abandoned with no recovery — chunking contains the blast radius to one
+    # chunk's wait and commits progress per chunk). 500 is the size
+    # production proved, far under the Batch API caps (100k requests /
+    # 256 MB per batch).
+    classifier_backfill_chunk_size: int = 500
 
     # Web Push (VAPID). Generate a keypair with `npm run generate-vapid` in the
     # dashboard. Public key is also exposed via GET /push/vapid-public-key so the

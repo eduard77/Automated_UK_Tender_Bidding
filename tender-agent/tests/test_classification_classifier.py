@@ -94,6 +94,18 @@ def test_parse_only_stores_allowed_values() -> None:
     assert result.construction_subcategories == ["Refurbishment & renovation"]
 
 
+def test_build_user_text_survives_unencodable_characters() -> None:
+    """A lone surrogate from badly-scraped HTML must not be able to abort a
+    whole batch submission at JSON-serialisation time — build_user_text
+    always returns a UTF-8-encodable string."""
+    from tender_agent.services.classification.taxonomy import build_user_text
+
+    poisoned = "Roof repairs \ud83d at the depot \udcff"
+    text = build_user_text(poisoned, "desc \ud800 with surrogate", "Buyer \udfff")
+    text.encode("utf-8")  # must not raise
+    assert "Roof repairs" in text
+
+
 def test_parse_invalid_primary_returns_none() -> None:
     assert parse_classification('{"primary_sector": "Nope"}') is None
     assert parse_classification("not json at all") is None
