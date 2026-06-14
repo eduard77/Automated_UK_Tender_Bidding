@@ -8,7 +8,10 @@ classes the endpoint maps the harness's failure modes onto:
   never_polled            — Source row exists, no PollRun ever (scheduler /
                             registration class)
   fetch_failing           — newest run errored (the error string then says
-                            403 vs 500 vs DNS)
+                            403 vs 500 vs DNS) AND made no forward progress
+  catching_up             — newest run errored/timed-out but its resume
+                            watermark ADVANCED vs the previous run — a long
+                            backlog drain converging, not a fault (2026-06-14)
   polling_but_zero_rows   — clean runs, zero tenders (the watermark-trap /
                             format class)
   stale_not_polling       — newest run is clean but finished many poll
@@ -294,6 +297,103 @@ def test_health_stale_when_newest_run_finished_long_ago(client, factory) -> None
     body = client.get("/admin/diagnostics/sources-health").json()
     cf = next(s for s in body["sources"] if s["code"] == "CF")
     assert cf["diagnosis"] == "stale_not_polling"
+
+
+def test_health_catching_up_when_watermark_advances(client, factory) -> None:
+    """2026-06-14 CF/FTS backlog: a run that times out at 900s but ADVANCED
+    its resume watermark past the previous run is draining a backlog, not
+    failing. It must read `catching_up`, not `fetch_failing`, so a long
+    catch-up doesn't look like an outage. Based on watermark movement across
+    runs, not run status alone."""
+    now = datetime.now(UTC)
+    with factory() as db:
+        src = Source(code="CF", name="Contracts Finder", base_url="x", enabled=True)
+        db.add(src)
+        db.commit()
+        db.add_all(
+            [
+                # Older timed-out run reached 2026-06-06.
+                PollRun(
+                    source_id=src.id,
+                    started_at=now - POLL_INTERVAL * 2,
+                    finished_at=now - POLL_INTERVAL * 2 + timedelta(minutes=15),
+                    status="error",
+                    error="poll timed out after 900s and was cancelled",
+                    watermark_at=datetime(2026, 6, 6, tzinfo=UTC),
+                ),
+                # Newest timed-out run reached 2026-06-09 — forward progress.
+                PollRun(
+                    source_id=src.id,
+                    started_at=now - POLL_INTERVAL,
+                    finished_at=now - POLL_INTERVAL + timedelta(minutes=15),
+                    status="error",
+                    error="poll timed out after 900s and was cancelled",
+                    watermark_at=datetime(2026, 6, 9, tzinfo=UTC),
+                ),
+            ]
+        )
+        db.add(
+            Tender(
+                source_code="CF",
+                source_ref="cf-1",
+                title="t",
+                first_seen_at=now,
+                last_seen_at=now,
+            )
+        )
+        db.commit()
+    body = client.get("/admin/diagnostics/sources-health").json()
+    cf = next(s for s in body["sources"] if s["code"] == "CF")
+    assert cf["diagnosis"] == "catching_up"
+    # The resume point is surfaced so the operator can watch it climb.
+    assert cf["latest_runs"][0]["watermark_at"] is not None
+
+
+def test_health_fetch_failing_when_watermark_does_not_advance(client, factory) -> None:
+    """The genuine-failure case the catching_up signal must NOT mask: a run
+    that errors WITHOUT advancing its resume watermark (same value as the
+    previous run, or none at all) is stuck — `fetch_failing`, not
+    `catching_up`."""
+    now = datetime.now(UTC)
+    stuck_at = datetime(2026, 6, 2, tzinfo=UTC)
+    with factory() as db:
+        src = Source(code="CF", name="Contracts Finder", base_url="x", enabled=True)
+        db.add(src)
+        db.commit()
+        db.add_all(
+            [
+                PollRun(
+                    source_id=src.id,
+                    started_at=now - POLL_INTERVAL * 2,
+                    finished_at=now - POLL_INTERVAL * 2 + timedelta(minutes=15),
+                    status="error",
+                    error="poll timed out after 900s and was cancelled",
+                    watermark_at=stuck_at,
+                ),
+                # Newest run made NO forward progress — same watermark.
+                PollRun(
+                    source_id=src.id,
+                    started_at=now - POLL_INTERVAL,
+                    finished_at=now - POLL_INTERVAL + timedelta(minutes=15),
+                    status="error",
+                    error="poll timed out after 900s and was cancelled",
+                    watermark_at=stuck_at,
+                ),
+            ]
+        )
+        db.add(
+            Tender(
+                source_code="CF",
+                source_ref="cf-1",
+                title="t",
+                first_seen_at=now,
+                last_seen_at=now,
+            )
+        )
+        db.commit()
+    body = client.get("/admin/diagnostics/sources-health").json()
+    cf = next(s for s in body["sources"] if s["code"] == "CF")
+    assert cf["diagnosis"] == "fetch_failing"
 
 
 def test_health_browser_source_stale_run_reads_as_note_not_fault(client, factory) -> None:

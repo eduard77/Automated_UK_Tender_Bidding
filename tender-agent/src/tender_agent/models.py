@@ -408,6 +408,12 @@ class PollRun(Base):
     new_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     updated_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     error: Mapped[str | None] = mapped_column(Text)
+    # Resume point this run reached — the adapter's confirmed-page watermark,
+    # persisted INCREMENTALLY as pages confirm (2026-06-14 backlog catch-up).
+    # Survives a 900s-timeout cancellation, and the sources-health diagnosis
+    # compares it across consecutive runs to tell catching_up from
+    # fetch_failing. NULL for runs that confirmed no page (or pre-migration).
+    watermark_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     source: Mapped[Source] = relationship(back_populates="runs")
 

@@ -138,6 +138,45 @@ async def poll_source(db: Session, source: Source) -> PollRun:
 
     try:
         adapter = adapter_cls()
+
+        def _persist_progress() -> None:
+            """Advance the durable resume point from the adapter's
+            confirmed-page watermark and COMMIT it now — called as each page
+            confirms.
+
+            This is what makes a backlog catch-up resumable. The 900s
+            per-source poll timeout cancels poll_source with a
+            ``CancelledError`` — a BaseException, so it bypasses the
+            ``except Exception`` below AND the final finalisation/commit.
+            Unless progress is already committed when the cancel lands, the
+            whole sweep is discarded and the next run restarts from the
+            backlog start: the CF/FTS 900s non-advancing loop. Committing the
+            watermark per confirmed page means a cancelled mid-sweep run keeps
+            everything fetched so far and the next run resumes from here.
+            Monotonic — never moves the watermark backwards."""
+            if adapter is None:
+                return
+            progress = getattr(adapter, "progress_watermark", None)
+            if progress is None:
+                return
+            current = source.last_polled_at
+            if current is not None and current.tzinfo is None:
+                current = current.replace(tzinfo=UTC)
+            if current is not None and progress <= current:
+                return
+            source.last_polled_at = progress
+            run.watermark_at = progress
+            run.fetched = fetched
+            run.new_count = new_count
+            run.updated_count = updated_count
+            db.commit()
+            logger.info(
+                "ingest.watermark_advance",
+                source=source.code,
+                watermark=progress.isoformat(),
+                fetched=fetched,
+            )
+
         async with adapter:
             async for normalised in adapter.fetch_since(since):
                 fetched += 1
@@ -178,8 +217,18 @@ async def poll_source(db: Session, source: Source) -> PollRun:
                         tender_id=tender.id,
                         match_count=len(matched_profile_ids),
                     )
+                # Resume point: advance + commit the watermark as pages
+                # confirm, so a 900s-timeout cancellation keeps forward
+                # progress and the next run resumes here, not from the backlog
+                # start (the CF/FTS non-advancing loop, 2026-06-14).
+                _persist_progress()
             had_errors = bool(getattr(adapter, "had_errors", False))
             adapter_errors = list(getattr(adapter, "error_messages", []) or [])
+        # A graceful end (clean completion OR an adapter-reported error such as
+        # the CF 429 abort / FTS salvage) — capture the final confirmed page's
+        # progress too. (A timeout CANCELLATION never reaches here; its
+        # progress was already committed incrementally above.)
+        _persist_progress()
         if had_errors:
             run.status = "error"
             # NEW (Phase-1 continuation, 2026-06-11): surface the REAL
@@ -191,32 +240,18 @@ async def poll_source(db: Session, source: Source) -> PollRun:
             else:
                 error = "upstream HTTP requests failed (see adapter log events)"
         else:
+            # Reached present day — the resume point IS now.
             source.last_polled_at = datetime.now(UTC)
+            run.watermark_at = source.last_polled_at
             run.status = "ok"
     except Exception as exc:  # noqa: BLE001
         error = f"{type(exc).__name__}: {exc}"
         run.status = "error"
         logger.exception("ingest.failed", source=source.code)
         db.rollback()
-
-    # Partial-progress watermark (2026-06-12, the CF 429 spiral): a FAILED
-    # run used to leave `last_polled_at` untouched, so every retry re-fetched
-    # the entire window — re-triggering the very rate limit that failed it.
-    # Paging adapters now report the timestamp safely covered by CONFIRMED
-    # pages; persist it so retries shrink. Monotonic: never moves backwards.
-    if run.status == "error" and adapter is not None:
-        progress = getattr(adapter, "progress_watermark", None)
-        if progress is not None:
-            current = source.last_polled_at
-            if current is not None and current.tzinfo is None:
-                current = current.replace(tzinfo=UTC)
-            if current is None or progress > current:
-                source.last_polled_at = progress
-                logger.info(
-                    "ingest.partial_watermark_advance",
-                    source=source.code,
-                    watermark=progress.isoformat(),
-                )
+        # The incremental commits above already persisted the resume point
+        # durably (rollback only discards the in-flight record), so a graceful
+        # failure keeps its progress without any extra work here.
 
     run.fetched = fetched
     run.new_count = new_count

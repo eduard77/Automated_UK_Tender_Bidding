@@ -902,6 +902,64 @@ confirmed watermark; sources-health reads a stale browser source as
 `test_portal_platform_matching` dev-DB live-data flake only). Ruff clean. No
 schema changes.
 
+## Discovery outage follow-up (2026-06-14 15:20 readout): CF/FTS 900s non-advancing loop — made backlog catch-up resumable
+
+CF and FTS each manage occasional full runs but the immediately following runs
+time out at exactly 900s having fetched 0 — repeatedly. FTS's `last_polled_at`
+was STILL stuck at 2026-06-02. Both carry ~12 days of backlog; a full
+catch-up sweep doesn't fit in the 900s per-source poll timeout.
+
+### Why progress wasn't persisting on timeout (plain English)
+
+The 900s timeout is `asyncio.wait_for` in the scheduler, which cancels the
+poll task with a `CancelledError`. In Python that's a **BaseException**, not an
+`Exception` — so it sails straight past `poll_source`'s `except Exception` AND
+its end-of-function watermark-persistence/commit block (the #131 incremental
+watermark only ran on a *graceful* finish, never on a cancellation). The
+records fetched so far were committed per-record, but `source.last_polled_at`
+was only advanced at the END, which the cancel skipped. So every cycle: fetch
+~6200 rows, get cancelled at 900s, **discard the watermark**, and the next run
+restarts from the same backlog start and times out again — an infinite,
+non-advancing loop. (CF "fetched 0" on those runs because `run.fetched` was
+also only written at the end.)
+
+### Fix — persist the resume point INCREMENTALLY, so a cancel can't discard it
+
+`poll_source` now advances + COMMITS the resume watermark (and `run.fetched` /
+`run.watermark_at`) the moment each page confirms, inside the loop — not at the
+end. A cancellation lands during the adapter's next HTTP await, *after* the
+last page's progress is already durably committed, so a cancelled mid-sweep run
+keeps everything fetched so far and the next run resumes from there. Strict
+forward progress per run via the existing confirm-then-advance tracker (a
+descending/unordered feed still never advances, so no unfetched page is
+skipped). The 900s timeout self-heal is untouched — we did NOT raise it;
+resumability is the fix (backlog can always exceed any fixed window). Verified
+for both CF (HTTP date watermark) and FTS, including FTS's page-14
+salvage-and-continue: the salvaged records commit and the resume point advances
+past the bad page before the sweep continues, so a later timeout resumes after
+it, never before.
+
+### Diagnosis clarity
+
+`poll_runs.watermark_at` (additive, nullable — migration 0019) records the
+resume point each run reached. sources-health gains a **`catching_up`**
+diagnosis: a run that errored/timed-out but whose watermark ADVANCED past the
+previous run's is a backlog drain converging, not a fault — distinct from
+`fetch_failing` (a run that errored AND made no forward progress: same
+watermark run-to-run, or none). Based on watermark movement, not run status
+alone. The per-run `watermark_at` is surfaced in the payload so the operator
+can watch it climb to present, at which point runs complete `ok`.
+
+### Tests
+
+5 net-new offline tests: a mid-sweep `asyncio.wait_for` cancellation persists
+progress and the next run resumes FORWARD (parametrised CF + FTS — no
+restart-from-zero loop); FTS salvage commits its records and advances the
+resume point before continuing, surviving a later timeout; `catching_up` when
+the watermark advances across runs; `fetch_failing` when it doesn't. Full
+suite 999 passed / 4 skipped under a fresh DB (migration 0019 applied) and the
+newest Starlette. Ruff clean. Additive migration only.
+
 ## Phase 3a — rev 2 (2026-06-12): backfill incident — root cause found, fixed, hardened
 
 ### What happened (live evidence)

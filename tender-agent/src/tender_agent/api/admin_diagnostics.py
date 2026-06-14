@@ -144,6 +144,9 @@ class PollRunRead(BaseModel):
     new_count: int
     updated_count: int
     error: str | None
+    # Resume point this run reached (the confirmed-page watermark). Lets the
+    # operator SEE a backlog drain climbing toward present across cycles.
+    watermark_at: str | None = None
 
 
 class SourceHealthRead(BaseModel):
@@ -152,7 +155,9 @@ class SourceHealthRead(BaseModel):
     `diagnosis` is a coarse machine-made hint mapping the observed state
     onto the harness's failure classes: "never_polled" (scheduler /
     registration), "fetch_failing" (upstream errors — the error string
-    says whether it's a 403 datacenter block, a 500, or DNS), "polling_
+    says whether it's a 403 datacenter block, a 500, or DNS), "catching_up"
+    (newest run errored/timed-out but its resume watermark ADVANCED — a long
+    backlog drain converging, NOT a fault), "polling_
     but_zero_rows" (fetch fine, nothing yielded — filter/format problem),
     "stale_not_polling" (an HTTP source whose newest clean run is many poll
     intervals old — the scheduler isn't firing), "needs_login" (a
@@ -209,6 +214,29 @@ def _coerce_aware(value: datetime | None) -> datetime | None:
     return value
 
 
+def _is_catching_up(runs: list[PollRun]) -> bool:
+    """True when the newest (errored/timed-out) run is still making FORWARD
+    progress through a backlog — its resume watermark advanced past the
+    previous run's.
+
+    This is the signal that a 900s-timeout on CF/FTS is a long backlog DRAIN,
+    not a fault: each 15-min cycle cancels mid-sweep but keeps + advances its
+    resume point (poll_source persists `watermark_at` per confirmed page), so
+    successive runs climb toward present and eventually complete `ok`. A
+    genuinely stuck/failing source confirms no page (watermark_at NULL) or
+    never advances it (same value run-to-run) — that stays `fetch_failing`."""
+    newest_wm = _coerce_aware(getattr(runs[0], "watermark_at", None))
+    if newest_wm is None:
+        return False
+    prev_wm = (
+        _coerce_aware(getattr(runs[1], "watermark_at", None))
+        if len(runs) > 1
+        else None
+    )
+    # First run that made progress, or a strictly-advanced resume point.
+    return prev_wm is None or newest_wm > prev_wm
+
+
 def _diagnose(
     tender_count: int,
     runs: list[PollRun],
@@ -248,7 +276,9 @@ def _diagnose(
         return "never_polled"
     newest = runs[0]
     if newest.status == "error":
-        return "fetch_failing"
+        # A timed-out catch-up run that ADVANCED its resume point is draining
+        # a backlog, not failing — don't read it as a fault (2026-06-14).
+        return "catching_up" if _is_catching_up(runs) else "fetch_failing"
     # Browser-driven discovery (run_for_profile / proactis_discovery_job)
     # finalises a run as "needs_login" when the bridge isn't authenticated;
     # surface that as the actionable state rather than a generic class.
@@ -321,6 +351,9 @@ def sources_health(db: Session = Depends(get_db)) -> SourcesHealthResponse:
                         new_count=r.new_count,
                         updated_count=r.updated_count,
                         error=r.error,
+                        watermark_at=(
+                            r.watermark_at.isoformat() if r.watermark_at else None
+                        ),
                     )
                     for r in runs
                 ],
