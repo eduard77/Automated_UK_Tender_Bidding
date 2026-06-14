@@ -213,20 +213,45 @@ def test_get_package_returns_null_when_none(client_with_fake_agent, db) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _iter_route_paths(routes) -> list[str]:
+    """Every leaf route path on the app, recursing into included routers.
+
+    Starlette >= 1.3 / FastAPI >= 0.137 stopped FLATTENING an
+    ``include_router()``'d router into ``app.routes``: the router now appears
+    as a single opaque wrapper object (``_IncludedRouter``) instead of its
+    child ``APIRoute``s being spliced directly into ``app.routes``. The
+    wrapper exposes neither ``.path`` nor ``.routes`` — only
+    ``.original_router`` (whose ``.routes`` carry the real, prefixed paths).
+    A flat scan of ``app.routes`` therefore finds NONE of the submission
+    paths on the new version — a false negative that has nothing to do with
+    whether a submit endpoint exists (the submission router still carries
+    exactly its draft+read routes). Recurse through ``.routes`` (old
+    flattening / Mounts) AND ``.original_router.routes`` (the new wrapper) so
+    the assertion holds on both representations."""
+    paths: list[str] = []
+    for route in routes:
+        path = getattr(route, "path", None)
+        if isinstance(path, str) and path:
+            paths.append(path)
+        nested = getattr(route, "routes", None)
+        if nested is None:
+            original = getattr(route, "original_router", None)
+            nested = getattr(original, "routes", None) if original is not None else None
+        if nested:
+            paths.extend(_iter_route_paths(nested))
+    return paths
+
+
 def test_no_submit_endpoint_exists() -> None:
     """The submission router exposes only draft + read paths. There is
     no endpoint that submits, confirms, or sends — that's a portal-level
     action behind a different, human-gated rail."""
-    submission_paths = []
-    for route in app.routes:
-        path = str(getattr(route, "path", ""))
-        if "submission-package" in path:
-            submission_paths.append((path, getattr(route, "methods", set())))
+    submission_paths = [
+        p for p in _iter_route_paths(app.routes) if "submission-package" in p
+    ]
     assert submission_paths, "expected submission routes registered"
-    # No 'submit' verb anywhere in the path.
-    for path, _ in submission_paths:
-        assert "submit" not in path.lower() or "submission-package" in path
-        # 'submission-package' is the path; no separate 'submit' suffix.
+    # No submit/confirm/send verb anywhere on the submission rail.
+    for path in submission_paths:
         assert not path.endswith("/submit")
         assert "/confirm" not in path
         assert "/send" not in path

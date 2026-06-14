@@ -849,6 +849,59 @@ persistence + monotonicity, EU-Supply full-URL entry + 404 diagnosis + the
 corrected Blue Light default, S2W consecutive-failure abort. Full suite 988
 passed / 3 skipped (the known dev-DB flake only). Ruff clean.
 
+## Discovery outage follow-ups (2026-06-14 13:38 readout): FTS frozen at June 2 + Proactis "stale" — fixed
+
+Two residual items after the 2026-06-12 fix deployed and the scheduler/CF/EU-
+Supply/ATAMIS/PCS went healthy.
+
+**FTS frozen at a June-2 watermark — could FTS continue past the bad page, or
+did it need the date-window fallback? It continues DIRECTLY via the recovered
+cursor.** Every poll failed identically: `page 14: malformed JSON at char
+665438 of 1053875 — salvaged 68 releases (1 skipped regions)`. The #131
+salvage rescued the records but then `break`-ed, so the sweep never advanced
+past page 14 and the watermark never moved off 2026-06-02. The bad page is
+permanent (one persistently-malformed notice upstream). The key fact: the
+body was COMPLETE (the parse died at char 665438 of 1,053,875 — garbled
+mid-array, not truncated at the end), so the package-level `links.next`
+cursor, which sits at the tail OUTSIDE the `releases` array, survives.
+`salvage_next_link` recovers it and the sweep CONTINUES past the bad page
+(`fts.salvaged_continued method=cursor`). A date-window restart
+(`updatedFrom` keyed off the newest salvaged record) is the fallback for the
+case where the cursor itself is in the corrupted bytes — it re-derives a
+fresh cursor chain without the broken cursor, requires strict date progress
+(so it can't loop on the same blockage), and is bounded. A salvaged page
+that's genuinely last ends the sweep cleanly; a page we truly can't advance
+past logs `fts.salvaged_blocked`. Either way the watermark reflects the pages
+actually confirmed, so the next poll resumes from real progress instead of
+restarting from June 2.
+
+**Proactis "stale_not_polling" — excluded by design or accident? By design.**
+Proactis is browser-driven via the bridge: it is deliberately NOT in the
+`ADAPTERS` registry, runs on its own login-gated cycle (`run_for_profile`,
+operator-triggered; the auto `proactis_discovery_job` is gated by
+`proactis_discovery_enabled`, default off), and `_poll_one_source` explicitly
+skips it. So it was never part of the HTTP poll loop — nothing was dropped.
+The diagnostics simply judged its freshness against the HTTP poll interval, a
+category error. Fix is on the diagnosis side: a browser-driven source (code
+not in `ADAPTERS`) whose newest clean run is old now reads
+`manual_browser_discovery` (a note, not a fault) instead of
+`stale_not_polling`, and a run left waiting for a human login reads
+`needs_login`. It is NOT wired into the HTTP cycle — the HTTP `poll_source`
+path cannot drive a browser flow.
+
+### Tests
+
+6 net-new offline tests: `salvage_next_link` unit (recovers cursor from a
+mid-array-garbled body; None when links/next absent); FTS continues past a
+bad page via the recovered cursor and advances the watermark; FTS date-window
+fallback when the cursor is corrupted (re-requests with `updatedFrom`); FTS
+salvaged-but-cannot-continue stops cleanly (no infinite loop) and keeps the
+confirmed watermark; sources-health reads a stale browser source as
+`manual_browser_discovery`; sources-health reads a `needs_login` run as
+`needs_login`. Full suite 994 passed / 3 skipped (the known
+`test_portal_platform_matching` dev-DB live-data flake only). Ruff clean. No
+schema changes.
+
 ## Phase 3a — rev 2 (2026-06-12): backfill incident — root cause found, fixed, hardened
 
 ### What happened (live evidence)
