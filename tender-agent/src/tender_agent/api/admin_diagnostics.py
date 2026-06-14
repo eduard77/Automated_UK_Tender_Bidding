@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from tender_agent.adapters import ADAPTERS
 from tender_agent.api.deps import require_account
 from tender_agent.config import settings
 from tender_agent.db import get_db
@@ -153,7 +154,13 @@ class SourceHealthRead(BaseModel):
     registration), "fetch_failing" (upstream errors — the error string
     says whether it's a 403 datacenter block, a 500, or DNS), "polling_
     but_zero_rows" (fetch fine, nothing yielded — filter/format problem),
-    or "healthy"."""
+    "stale_not_polling" (an HTTP source whose newest clean run is many poll
+    intervals old — the scheduler isn't firing), "needs_login" (a
+    browser-driven source whose newest run ended waiting for a human login),
+    "manual_browser_discovery" (a browser-driven source — PROACTIS — that
+    runs on its OWN login-gated, operator/scheduled browser cycle, NOT the
+    HTTP poll loop; an older last-run is expected, NOT a dead scheduler), or
+    "healthy"."""
 
     code: str
     name: str
@@ -208,6 +215,7 @@ def _diagnose(
     enabled: bool,
     *,
     now: datetime,
+    http_polled: bool = True,
 ) -> str:
     """Map per-source observed state onto the harness failure classes.
 
@@ -218,10 +226,21 @@ def _diagnose(
     PROACTIS reading fetch_failing despite its newest run being status
     "ok" — an older orphaned-then-errored run was the trip).
 
-    `stale_not_polling` is new: a "healthy" source whose newest run is
-    multiple poll intervals old means the scheduler itself isn't
-    firing, not that the source is healthy. The CF/FTS/PCS case in the
+    `stale_not_polling` is new (2026-06-11 rev 3): a "healthy" source whose
+    newest run is multiple poll intervals old means the scheduler itself
+    isn't firing, not that the source is healthy. The CF/FTS/PCS case in the
     same readout had nine-day-old runs reading "healthy".
+
+    `http_polled` distinguishes the HTTP poll-loop sources (the ADAPTERS
+    registry) from browser-driven ones (PROACTIS — login-gated, run on its
+    own browser cycle via scheduler.proactis_discovery_job / run_for_profile,
+    deliberately NOT part of the HTTP poll loop; see _poll_one_source which
+    skips it). The HTTP staleness rule is a category error for a browser
+    source: an older last-run is EXPECTED, not a dead scheduler. So a stale
+    browser source reads `manual_browser_discovery` (a note, not a fault),
+    and a browser run left waiting for a human login reads `needs_login`
+    (2026-06-14: PROACTIS showed `stale_not_polling` — a false alarm — while
+    every HTTP source polled normally).
     """
     if not enabled:
         return "disabled"
@@ -230,13 +249,18 @@ def _diagnose(
     newest = runs[0]
     if newest.status == "error":
         return "fetch_failing"
+    # Browser-driven discovery (run_for_profile / proactis_discovery_job)
+    # finalises a run as "needs_login" when the bridge isn't authenticated;
+    # surface that as the actionable state rather than a generic class.
+    if newest.status == "needs_login":
+        return "needs_login"
     finished_at = _coerce_aware(newest.finished_at)
     if finished_at is not None:
         stale_after = timedelta(
             minutes=settings.poll_interval_minutes * STALE_POLL_FACTOR
         )
         if now - finished_at > stale_after:
-            return "stale_not_polling"
+            return "stale_not_polling" if http_polled else "manual_browser_discovery"
     if tender_count == 0:
         return "polling_but_zero_rows"
     return "healthy"
@@ -305,6 +329,9 @@ def sources_health(db: Session = Depends(get_db)) -> SourcesHealthResponse:
                     list(runs),
                     bool(source.enabled),
                     now=now,
+                    # Browser-driven sources (PROACTIS) aren't in ADAPTERS;
+                    # the HTTP staleness rule doesn't apply to them.
+                    http_polled=source.code in ADAPTERS,
                 ),
             )
         )

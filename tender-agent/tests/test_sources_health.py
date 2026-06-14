@@ -14,6 +14,12 @@ classes the endpoint maps the harness's failure modes onto:
   stale_not_polling       — newest run is clean but finished many poll
                             intervals ago (added 2026-06-11 rev 3 after a
                             "healthy"-but-9-days-old readout)
+  needs_login             — browser-driven source whose newest run ended
+                            waiting for a human login (PROACTIS)
+  manual_browser_discovery — browser-driven source (PROACTIS) on its OWN
+                            login-gated browser cycle, NOT the HTTP poll
+                            loop; an older last-run is expected, not a fault
+                            (added 2026-06-14)
   healthy                 — recent clean runs, rows present
 """
 from __future__ import annotations
@@ -288,6 +294,68 @@ def test_health_stale_when_newest_run_finished_long_ago(client, factory) -> None
     body = client.get("/admin/diagnostics/sources-health").json()
     cf = next(s for s in body["sources"] if s["code"] == "CF")
     assert cf["diagnosis"] == "stale_not_polling"
+
+
+def test_health_browser_source_stale_run_reads_as_note_not_fault(client, factory) -> None:
+    """2026-06-14: PROACTIS is browser-driven (login-gated, run on its OWN
+    cycle via run_for_profile / proactis_discovery_job), NOT part of the HTTP
+    poll loop — so it isn't in ADAPTERS. Judging its freshness against the
+    HTTP poll interval is a category error: an older last-run is EXPECTED.
+    A stale clean run must therefore read `manual_browser_discovery` (a note)
+    rather than `stale_not_polling` (which implies a dead scheduler)."""
+    now = datetime.now(UTC)
+    finished = now - STALE_WINDOW - POLL_INTERVAL  # well past the HTTP window
+    with factory() as db:
+        src = Source(code="PROACTIS", name="Proactis", base_url="x", enabled=True)
+        db.add(src)
+        db.commit()
+        db.add(
+            PollRun(
+                source_id=src.id,
+                started_at=finished - timedelta(minutes=2),
+                finished_at=finished,
+                status="ok",
+                fetched=200,
+                new_count=61,
+            )
+        )
+        db.add(
+            Tender(
+                source_code="PROACTIS",
+                source_ref="p-1",
+                title="t",
+                first_seen_at=now,
+                last_seen_at=now,
+            )
+        )
+        db.commit()
+    body = client.get("/admin/diagnostics/sources-health").json()
+    proactis = next(s for s in body["sources"] if s["code"] == "PROACTIS")
+    assert proactis["diagnosis"] == "manual_browser_discovery"
+
+
+def test_health_browser_source_needs_login_run(client, factory) -> None:
+    """A browser-driven discovery run finalises as `needs_login` when the
+    bridge isn't authenticated. The endpoint surfaces that as the actionable
+    state, not a generic class — the operator knows to log in at the bridge."""
+    now = datetime.now(UTC)
+    with factory() as db:
+        src = Source(code="PROACTIS", name="Proactis", base_url="x", enabled=True)
+        db.add(src)
+        db.commit()
+        db.add(
+            PollRun(
+                source_id=src.id,
+                started_at=now - POLL_INTERVAL,
+                finished_at=now - POLL_INTERVAL + timedelta(minutes=1),
+                status="needs_login",
+                fetched=0,
+            )
+        )
+        db.commit()
+    body = client.get("/admin/diagnostics/sources-health").json()
+    proactis = next(s for s in body["sources"] if s["code"] == "PROACTIS")
+    assert proactis["diagnosis"] == "needs_login"
 
 
 def test_health_includes_scheduler_heartbeat(client, factory) -> None:

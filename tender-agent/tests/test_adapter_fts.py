@@ -269,3 +269,144 @@ async def test_truncated_payload_salvages_prefix_and_advances_watermark() -> Non
     # Page 2's salvaged records confirmed page 1 ascends — the watermark
     # covers page 1, so the next run does not replay it.
     assert adapter.progress_watermark == datetime(2026, 6, 1, 10, 0, tzinfo=UTC)
+
+
+_FTS_PKG = "https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages"
+
+
+def test_salvage_next_link_recovers_cursor_from_garbled_body() -> None:
+    """The package `links.next` lives OUTSIDE the releases array (at the
+    tail), so a body garbled MID-array still yields a recoverable cursor —
+    the basis for continuing past a permanently-bad page."""
+    from tender_agent.adapters.fts import salvage_next_link
+
+    body = (
+        '{"releases": ['
+        + _raw_release("ocds-fts-a", "2026-06-03T10:00:00Z")
+        + ', {"ocid": "bad", "date": }, '  # garbled mid-array
+        + _raw_release("ocds-fts-b", "2026-06-04T10:00:00Z")
+        + '], "links": {"next": "' + _FTS_PKG + '?cursor=NEXT"}}'
+    )
+    assert salvage_next_link(body) == _FTS_PKG + "?cursor=NEXT"
+    # No links / no next → None (caller falls back to date-window).
+    assert salvage_next_link('{"releases": [ {') is None
+    assert salvage_next_link('{"releases": [], "links": {}}') is None
+
+
+async def test_salvaged_page_continues_via_recovered_cursor() -> None:
+    """2026-06-14 page-14 blockage: a salvaged page is NO LONGER the end of
+    the sweep. The bad page's body is complete (garbled mid-array), so its
+    `links.next` survives at the tail — the adapter recovers it and CONTINUES
+    to the pages AFTER the bad one (the records the old `break` could never
+    reach). The watermark advances to reflect the real progress."""
+    page1 = (
+        '{"releases": ['
+        + _raw_release("ocds-fts-p1", "2026-06-01T10:00:00Z")
+        + '], "links": {"next": "' + _FTS_PKG + '?cursor=p2"}}'
+    )
+    # Page 2: good records around a malformed one, INTACT links.next at tail.
+    page2 = (
+        '{"releases": ['
+        + _raw_release("ocds-fts-p2a", "2026-06-03T10:00:00Z")
+        + ', {"ocid": "ocds-fts-bad", "date": }, '
+        + _raw_release("ocds-fts-p2b", "2026-06-04T10:00:00Z")
+        + '], "links": {"next": "' + _FTS_PKG + '?cursor=p3"}}'
+    )
+    page3 = (
+        '{"releases": ['
+        + _raw_release("ocds-fts-p3", "2026-06-05T10:00:00Z")
+        + '], "links": {}}'
+    )
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        cursor = request.url.params.get("cursor")
+        body = {"p2": page2, "p3": page3}.get(cursor, page1)
+        return httpx.Response(
+            200, content=body.encode(), headers={"Content-Type": "application/json"}
+        )
+
+    adapter = build_adapter(FTSAdapter, handler)
+    tenders = await collect(adapter, CUTOFF)
+
+    refs = {t.source_ref for t in tenders}
+    assert {"ocds-fts-p1", "ocds-fts-p2a", "ocds-fts-p2b", "ocds-fts-p3"} <= refs
+    assert "ocds-fts-bad" not in refs  # the one bad notice still fails alone
+    assert calls["n"] == 3  # FOLLOWED the recovered cursor past the bad page
+    assert adapter.had_errors is True
+    assert any("CONTINUING" in m for m in adapter.error_messages)
+    # p3 confirmed p2's max; the watermark moved well past the bad page.
+    assert adapter.progress_watermark == datetime(2026, 6, 4, 10, 0, tzinfo=UTC)
+
+
+async def test_salvaged_page_falls_back_to_date_window_when_cursor_corrupted() -> None:
+    """When the bad page's `links.next` cursor is ITSELF in the corrupted
+    bytes (unparseable) but the body shows a `next` link exists, the adapter
+    restarts a fresh cursor chain from a date window (`updatedFrom` keyed off
+    the newest salvaged record) — no dependence on the broken cursor."""
+    # Call 1: a good record, then `links.next` cut mid-string (unparseable,
+    # but the `"next"` key is present → there IS a further page).
+    call1 = (
+        '{"releases": ['
+        + _raw_release("ocds-fts-w1", "2026-06-03T10:00:00Z")
+        + '], "links": {"next": "' + _FTS_PKG + '?cursor=brok'
+    )
+    # Call 2 (the date-window restart): a clean page with a newer record.
+    call2 = (
+        '{"releases": ['
+        + _raw_release("ocds-fts-w2", "2026-06-04T10:00:00Z")
+        + '], "links": {}}'
+    )
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        body = call2 if request.url.params.get("updatedFrom") == "2026-06-03T10:00:00Z" else call1
+        return httpx.Response(
+            200, content=body.encode(), headers={"Content-Type": "application/json"}
+        )
+
+    adapter = build_adapter(FTSAdapter, handler)
+    tenders = await collect(adapter, CUTOFF)
+
+    refs = {t.source_ref for t in tenders}
+    assert {"ocds-fts-w1", "ocds-fts-w2"} <= refs
+    assert len(captured) == 2
+    # The second request re-entered from a date window past the salvaged max.
+    assert captured[1].url.params.get("updatedFrom") == "2026-06-03T10:00:00Z"
+    assert adapter.had_errors is True
+    assert any("RESTARTING" in m for m in adapter.error_messages)
+    assert adapter.progress_watermark == datetime(2026, 6, 3, 10, 0, tzinfo=UTC)
+
+
+async def test_salvaged_page_blocked_when_cannot_advance() -> None:
+    """A bad page that we genuinely cannot get past — the body shows a `next`
+    link but its cursor is unparseable AND a date-window restart makes no
+    progress (the same blockage every time). The sweep stops cleanly (no
+    infinite loop), the confirmed watermark stands, and the diagnosis says so
+    ('salvaged but cannot continue')."""
+    body = (
+        '{"releases": ['
+        + _raw_release("ocds-fts-stuck", "2026-06-03T10:00:00Z")
+        + '], "links": {"next": "' + _FTS_PKG + '?cursor=brok'
+    )
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(
+            200, content=body.encode(), headers={"Content-Type": "application/json"}
+        )
+
+    adapter = build_adapter(FTSAdapter, handler)
+    tenders = await collect(adapter, CUTOFF)
+
+    refs = {t.source_ref for t in tenders}
+    assert "ocds-fts-stuck" in refs
+    # One date-window restart, then the lack of date progress stops it — it
+    # does NOT spin forever.
+    assert calls["n"] == 2
+    assert adapter.had_errors is True
+    assert any("cannot advance" in m for m in adapter.error_messages)
+    assert adapter.progress_watermark == datetime(2026, 6, 3, 10, 0, tzinfo=UTC)
