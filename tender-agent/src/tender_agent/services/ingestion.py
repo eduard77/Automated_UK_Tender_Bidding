@@ -139,11 +139,18 @@ async def poll_source(db: Session, source: Source) -> PollRun:
 
     try:
         adapter = adapter_cls()
+        # Hand the saved cursor to the adapter as its resume point. A
+        # cursor-paginated adapter (CF, FTS) resumes its fetch FROM here
+        # instead of rebuilding an `updatedFrom` window; others ignore it.
+        # This is what drains the backlog forward regardless of feed sort
+        # direction (2026-06-15): the cursor is available per page even when
+        # the date-watermark freezes on a newest-first feed.
+        adapter.resume_cursor = source.resume_cursor
 
         def _persist_progress() -> None:
-            """Advance the durable resume point from the adapter's
-            confirmed-page watermark and COMMIT it now — called as each page
-            confirms.
+            """Advance the durable resume point — the date watermark AND the
+            pagination cursor — from the adapter and COMMIT it now, called as
+            each page confirms.
 
             This is what makes a backlog catch-up resumable. The 900s
             per-source poll timeout cancels poll_source with a
@@ -151,30 +158,48 @@ async def poll_source(db: Session, source: Source) -> PollRun:
             ``except Exception`` below AND the final finalisation/commit.
             Unless progress is already committed when the cancel lands, the
             whole sweep is discarded and the next run restarts from the
-            backlog start: the CF/FTS 900s non-advancing loop. Committing the
-            watermark per confirmed page means a cancelled mid-sweep run keeps
-            everything fetched so far and the next run resumes from here.
-            Monotonic — never moves the watermark backwards."""
+            backlog start: the CF/FTS 900s non-advancing loop.
+
+            Two resume signals are persisted:
+
+            - ``last_polled_at`` / ``watermark_at`` — the date watermark
+              (PageProgressTracker). Monotonic; the SAFE fresh-window floor.
+              It FREEZES on a newest-first feed (advancing would skip older
+              unfetched pages), so on its own it left the loop non-advancing.
+            - ``resume_cursor`` — the OCDS ``links.next`` of the next
+              unconsumed page. Available for EVERY page regardless of feed
+              direction, so it advances even while the watermark is frozen.
+              The next run resumes its fetch from this cursor (page N+1), not
+              page 1 — the backlog genuinely drains forward across cycles.
+            """
             if adapter is None:
                 return
+            changed = False
             progress = getattr(adapter, "progress_watermark", None)
-            if progress is None:
+            if progress is not None:
+                current = source.last_polled_at
+                if current is not None and current.tzinfo is None:
+                    current = current.replace(tzinfo=UTC)
+                if current is None or progress > current:
+                    source.last_polled_at = progress
+                    run.watermark_at = progress
+                    changed = True
+            cursor = getattr(adapter, "resume_cursor", None)
+            if cursor != source.resume_cursor:
+                source.resume_cursor = cursor
+                run.resume_cursor = cursor
+                changed = True
+            if not changed:
                 return
-            current = source.last_polled_at
-            if current is not None and current.tzinfo is None:
-                current = current.replace(tzinfo=UTC)
-            if current is not None and progress <= current:
-                return
-            source.last_polled_at = progress
-            run.watermark_at = progress
             run.fetched = fetched
             run.new_count = new_count
             run.updated_count = updated_count
             db.commit()
             logger.info(
-                "ingest.watermark_advance",
+                "ingest.progress_advance",
                 source=source.code,
-                watermark=progress.isoformat(),
+                watermark=progress.isoformat() if progress else None,
+                has_resume_cursor=cursor is not None,
                 fetched=fetched,
             )
 
@@ -260,9 +285,14 @@ async def poll_source(db: Session, source: Source) -> PollRun:
             else:
                 error = "upstream HTTP requests failed (see adapter log events)"
         else:
-            # Reached present day — the resume point IS now.
+            # Reached present day — the resume point IS now, and the cursor
+            # chain is fully drained, so clear it: the next run starts a fresh
+            # `updatedFrom` window from here instead of re-following a stale
+            # end-of-feed cursor.
             source.last_polled_at = datetime.now(UTC)
             run.watermark_at = source.last_polled_at
+            source.resume_cursor = None
+            run.resume_cursor = None
             run.status = "ok"
     except Exception as exc:  # noqa: BLE001
         error = f"{type(exc).__name__}: {exc}"

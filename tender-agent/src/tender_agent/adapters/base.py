@@ -157,6 +157,20 @@ class SourceAdapter(ABC):
         # it on a FAILED run so retries resume from the last confirmed page
         # instead of re-fetching the whole window. None = no safe progress.
         self.progress_watermark: datetime | None = None
+        # Cursor-based resume point (2026-06-15). Dual role on the
+        # cursor-paginated adapters (CF, FTS):
+        #   INPUT  — poll_source sets it to the source's saved cursor BEFORE
+        #            iterating; a non-None value means "resume the fetch from
+        #            this next-page URL, not from an `updatedFrom` window".
+        #   OUTPUT — the adapter OVERWRITES it per confirmed page with that
+        #            page's `links.next` (the next unconsumed page), set just
+        #            before the next page's network await so a 900s-timeout
+        #            cancellation persists it. None once the feed is drained.
+        # Unlike progress_watermark this is available for EVERY page regardless
+        # of feed sort direction, so the backlog drains forward even when the
+        # date-watermark freezes on a newest-first feed. Adapters that don't
+        # paginate by cursor leave it None and ignore the input.
+        self.resume_cursor: str | None = None
 
     @staticmethod
     def check_body_complete(response: httpx.Response) -> None:

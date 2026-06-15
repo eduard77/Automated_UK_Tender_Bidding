@@ -147,6 +147,10 @@ class PollRunRead(BaseModel):
     # Resume point this run reached (the confirmed-page watermark). Lets the
     # operator SEE a backlog drain climbing toward present across cycles.
     watermark_at: str | None = None
+    # True when this run left a pagination cursor (a backlog drain still in
+    # flight). On a newest-first feed this is the progress signal the frozen
+    # watermark_at can't give — a changed cursor run-to-run reads catching_up.
+    has_resume_cursor: bool = False
 
 
 class SourceHealthRead(BaseModel):
@@ -221,20 +225,32 @@ def _is_catching_up(runs: list[PollRun]) -> bool:
 
     This is the signal that a 900s-timeout on CF/FTS is a long backlog DRAIN,
     not a fault: each 15-min cycle cancels mid-sweep but keeps + advances its
-    resume point (poll_source persists `watermark_at` per confirmed page), so
-    successive runs climb toward present and eventually complete `ok`. A
-    genuinely stuck/failing source confirms no page (watermark_at NULL) or
-    never advances it (same value run-to-run) — that stays `fetch_failing`."""
+    resume point, so successive runs climb toward present and eventually
+    complete `ok`. A genuinely stuck/failing source confirms no page and never
+    advances either resume signal run-to-run — that stays `fetch_failing`.
+
+    Two resume signals count as forward progress:
+
+    - the date watermark (``watermark_at``) advancing — the ascending /
+      oldest-first feed case; and
+    - the pagination cursor (``resume_cursor``) changing run-to-run — the
+      NEWEST-first feed case, where the date watermark correctly FREEZES (it
+      would skip older unfetched pages) so on its own it read fetch_failing
+      forever (the 2026-06-15 4th-pass loop). The cursor walks the backlog
+      forward each cycle even while the watermark holds."""
+    # (1) date watermark advanced (oldest-first feed).
     newest_wm = _coerce_aware(getattr(runs[0], "watermark_at", None))
-    if newest_wm is None:
-        return False
     prev_wm = (
         _coerce_aware(getattr(runs[1], "watermark_at", None))
         if len(runs) > 1
         else None
     )
-    # First run that made progress, or a strictly-advanced resume point.
-    return prev_wm is None or newest_wm > prev_wm
+    if newest_wm is not None and (prev_wm is None or newest_wm > prev_wm):
+        return True
+    # (2) pagination cursor advanced (newest-first feed — watermark frozen).
+    newest_cur = getattr(runs[0], "resume_cursor", None)
+    prev_cur = getattr(runs[1], "resume_cursor", None) if len(runs) > 1 else None
+    return newest_cur is not None and newest_cur != prev_cur
 
 
 def _diagnose(
@@ -354,6 +370,8 @@ def sources_health(db: Session = Depends(get_db)) -> SourcesHealthResponse:
                         watermark_at=(
                             r.watermark_at.isoformat() if r.watermark_at else None
                         ),
+                        has_resume_cursor=getattr(r, "resume_cursor", None)
+                        is not None,
                     )
                     for r in runs
                 ],

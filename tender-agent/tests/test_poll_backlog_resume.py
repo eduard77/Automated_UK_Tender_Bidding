@@ -437,3 +437,327 @@ async def test_persistence_path_runs_under_cancellederror_specifically() -> None
     # cancellation-persist ran during the CancelledError, exactly the path the
     # ``except Exception`` block cannot catch.
     assert persisted == [T1]
+
+
+# ---------------------------------------------------------------------------
+# CURSOR-based resume (2026-06-15, 4th pass on the CF/FTS non-advancing loop).
+#
+# #134 made the date-watermark direction-aware: correct, but on a NEWEST-first
+# feed it FREEZES (advancing would skip older unfetched pages), so a cancelled
+# mid-sweep run kept no resume point and the next run re-walked from page 1 —
+# the persistent `watermark_at: null while records stream` signature the
+# 2026-06-15 diagnosis saw. The fix #134 named: resume by the OCDS `links.next`
+# cursor, which is available per page REGARDLESS of feed direction. These tests
+# drive the REAL CF/FTS adapters over a mock-transported cursor chain and prove
+# the cursor — not the frozen date-watermark — is what drains the backlog.
+# ---------------------------------------------------------------------------
+
+# A 4-page NEWEST-first feed: page 1 carries the newest records, page 4 the
+# oldest. The PageProgressTracker FREEZES on this ordering, so last_polled_at
+# never advances — the cursor is the only thing that moves the drain forward.
+_CHAIN = ["CHAIN-P2", "CHAIN-P3", "CHAIN-P4"]
+
+
+def _chain_page(records: list[tuple[str, str]], next_marker: str | None) -> bytes:
+    page: dict = {"releases": [_ocds_release(o, d) for o, d in records]}
+    if next_marker is not None:
+        page["links"] = {"next": f"https://resume.invalid/{next_marker}"}
+    return json.dumps(page).encode()
+
+
+# marker-in-URL → page bytes. The fresh page-1 request (to the adapter's own
+# base URL) matches no marker, so it falls through to the "" default below.
+_NEWEST_FIRST_PAGES = {
+    "": _chain_page(
+        [("p1a", "2026-06-14T10:00:00Z"), ("p1b", "2026-06-13T10:00:00Z")],
+        "CHAIN-P2",
+    ),
+    "CHAIN-P2": _chain_page(
+        [("p2a", "2026-06-11T10:00:00Z"), ("p2b", "2026-06-10T10:00:00Z")],
+        "CHAIN-P3",
+    ),
+    "CHAIN-P3": _chain_page(
+        [("p3a", "2026-06-08T10:00:00Z"), ("p3b", "2026-06-07T10:00:00Z")],
+        "CHAIN-P4",
+    ),
+    # Last page (oldest), no `links.next` — the end of the feed.
+    "CHAIN-P4": _chain_page(
+        [("p4a", "2026-06-05T10:00:00Z"), ("p4b", "2026-06-04T10:00:00Z")],
+        None,
+    ),
+}
+
+
+class _CursorChainTransport(httpx.AsyncBaseTransport):
+    """Serves a cursor chain from a marker→bytes map, recording every fetched
+    URL. BLOCKS (awaits forever, after signalling `reached`) on a request whose
+    URL contains `block_marker` — the page-boundary await where the 900s
+    cancellation lands. `block_marker=None` serves the whole chain."""
+
+    def __init__(
+        self,
+        pages: dict[str, bytes],
+        block_marker: str | None,
+        reached: asyncio.Event,
+        fetched: list[str],
+    ) -> None:
+        self._pages = pages
+        self._block = block_marker
+        self._reached = reached
+        self._fetched = fetched
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        self._fetched.append(url)
+        if self._block and self._block in url:
+            self._reached.set()
+            await asyncio.sleep(3600)  # cancellation injected here
+        for marker, body in self._pages.items():
+            if marker and marker in url:
+                return httpx.Response(
+                    200, content=body, headers={"Content-Type": "application/json"}
+                )
+        return httpx.Response(
+            200,
+            content=self._pages[""],
+            headers={"Content-Type": "application/json"},
+        )
+
+
+def _chain_adapter_factory(
+    code: str,
+    pages: dict[str, bytes],
+    block_marker: str | None,
+    reached: asyncio.Event,
+    fetched: list[str],
+):
+    base = ContractsFinderAdapter if code == "CF" else FTSAdapter
+
+    class _RealOverChain(base):  # type: ignore[valid-type,misc]
+        def __init__(self) -> None:
+            super().__init__(
+                client=httpx.AsyncClient(
+                    transport=_CursorChainTransport(
+                        pages, block_marker, reached, fetched
+                    )
+                )
+            )
+            self._sleep = _instant_sleep  # type: ignore[assignment]
+
+    return _RealOverChain
+
+
+@pytest.mark.parametrize("code", ["CF", "FTS"])
+@pytest.mark.asyncio
+async def test_cancel_saves_next_cursor_and_next_run_resumes_from_it(code) -> None:
+    """Inject the 900s cancellation in the page-2 fetch after page 1 commits:
+    the SAVED resume cursor equals page 1's `links.next` (NOT null), and the
+    next run starts its fetch FROM that cursor (page 2), not page 1. The feed
+    is NEWEST-first, so the date-watermark stays frozen (null) throughout —
+    proving the cursor, not the date, carried the resume. CF and FTS both."""
+    _engine, factory = make_engine_and_session()
+    with factory() as db:
+        src = Source(code=code, name=code, base_url="x", enabled=True)
+        db.add(src)
+        db.commit()
+        src_id = src.id
+
+    # Run 1: serve page 1, block on the page-2 fetch, cancel there.
+    reached = asyncio.Event()
+    fetched1: list[str] = []
+    cls1 = _chain_adapter_factory(
+        code, _NEWEST_FIRST_PAGES, "CHAIN-P2", reached, fetched1
+    )
+    with (
+        patch.dict(ADAPTERS_PATH, {code: cls1}, clear=False),
+        _PATCH_UPSERT,
+        _PATCH_PORTALS,
+        factory() as db,
+    ):
+        source = db.get(Source, src_id)
+        task = asyncio.create_task(poll_source(db, source))
+        await asyncio.wait_for(reached.wait(), timeout=5.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    with factory() as db:
+        source = db.get(Source, src_id)
+        # The saved resume cursor is page 1's next cursor — NOT null.
+        assert source.resume_cursor == "https://resume.invalid/CHAIN-P2"
+        # The date-watermark FROZE (newest-first feed): on its own the loop
+        # would not advance — the cursor is what survived.
+        assert source.last_polled_at is None
+        # Page 1's two records committed.
+        refs = set(
+            db.execute(
+                select(Tender.source_ref).where(Tender.source_code == code)
+            ).scalars()
+        )
+        assert refs == {"p1a", "p1b"}
+
+    # Run 2: resumes FROM the saved cursor (page 2), serve the rest to the end.
+    fetched2: list[str] = []
+    cls2 = _chain_adapter_factory(code, _NEWEST_FIRST_PAGES, None, asyncio.Event(), fetched2)
+    with (
+        patch.dict(ADAPTERS_PATH, {code: cls2}, clear=False),
+        _PATCH_UPSERT,
+        _PATCH_PORTALS,
+        factory() as db,
+    ):
+        source = db.get(Source, src_id)
+        run = await poll_source(db, source)
+        assert run.status == "ok"
+
+    # The very first request of run 2 was the saved cursor (page 2), not the
+    # backlog start — no re-walk from page 1.
+    assert "CHAIN-P2" in fetched2[0]
+    assert not any("CHAIN-P3" in u for u in fetched1)  # run 1 never reached it
+
+
+@pytest.mark.parametrize("code", ["CF", "FTS"])
+@pytest.mark.asyncio
+async def test_newest_first_backlog_drains_across_cycles_without_skipping(code) -> None:
+    """The whole point: a NEWEST-first backlog drains FORWARD across successive
+    cancelled cycles — every page is fetched exactly once across the run, no
+    page skipped, no record duplicated — and the final cycle reaches the end of
+    the feed and completes `ok`, clearing the cursor and finally advancing the
+    date-watermark to present. Throughout the drain last_polled_at stays frozen
+    (newest-first), so the cursor is demonstrably what walks the backlog."""
+    _engine, factory = make_engine_and_session()
+    with factory() as db:
+        src = Source(code=code, name=code, base_url="x", enabled=True)
+        db.add(src)
+        db.commit()
+        src_id = src.id
+
+    # Each cycle resumes from the saved cursor, fetches one page, then the
+    # timeout cancels in the NEXT page's fetch — except the final cycle, which
+    # reaches the last page (no further fetch) and completes cleanly.
+    for block_marker in _CHAIN:  # blocks on P2, then P3, then P4...
+        reached = asyncio.Event()
+        fetched: list[str] = []
+        cls = _chain_adapter_factory(
+            code, _NEWEST_FIRST_PAGES, block_marker, reached, fetched
+        )
+        with (
+            patch.dict(ADAPTERS_PATH, {code: cls}, clear=False),
+            _PATCH_UPSERT,
+            _PATCH_PORTALS,
+            factory() as db,
+        ):
+            source = db.get(Source, src_id)
+            task = asyncio.create_task(poll_source(db, source))
+            await asyncio.wait_for(reached.wait(), timeout=5.0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        with factory() as db:
+            source = db.get(Source, src_id)
+            # Mid-drain the date-watermark stays frozen on the newest-first
+            # feed — only the cursor advances.
+            assert source.last_polled_at is None
+            assert source.resume_cursor is not None
+
+    # Final cycle: resume from the last saved cursor (page 4), reach end-of-feed.
+    fetched: list[str] = []
+    cls = _chain_adapter_factory(code, _NEWEST_FIRST_PAGES, None, asyncio.Event(), fetched)
+    with (
+        patch.dict(ADAPTERS_PATH, {code: cls}, clear=False),
+        _PATCH_UPSERT,
+        _PATCH_PORTALS,
+        factory() as db,
+    ):
+        source = db.get(Source, src_id)
+        run = await poll_source(db, source)
+        assert run.status == "ok"
+
+    with factory() as db:
+        source = db.get(Source, src_id)
+        # Every page's records present exactly once — full backlog drained,
+        # nothing skipped, nothing duplicated (the unique upsert + idempotent
+        # cursor walk).
+        rows = list(
+            db.execute(
+                select(Tender.source_ref).where(Tender.source_code == code)
+            ).scalars()
+        )
+        assert sorted(rows) == [
+            "p1a", "p1b", "p2a", "p2b", "p3a", "p3b", "p4a", "p4b",
+        ]
+        assert len(rows) == len(set(rows))  # no duplicates
+        # End of feed: cursor cleared, date-watermark finally advances to
+        # present so the next run starts a fresh window.
+        assert source.resume_cursor is None
+        assert source.last_polled_at is not None
+
+
+@pytest.mark.parametrize("code", ["CF", "FTS"])
+@pytest.mark.asyncio
+async def test_overlapping_refetch_from_cursor_creates_no_duplicates(code) -> None:
+    """Idempotency: re-fetching pages whose records were ALREADY committed
+    creates no duplicate tenders. Run 1 commits page 1 then cancels; run 2
+    resumes the cursor to the end; run 3 starts FRESH (no cursor) and re-walks
+    the whole chain — the maximal overlap, every record re-fetched. The
+    (source_code, source_ref) upsert makes the cursor walk safe to overlap."""
+    _engine, factory = make_engine_and_session()
+    with factory() as db:
+        src = Source(code=code, name=code, base_url="x", enabled=True)
+        db.add(src)
+        db.commit()
+        src_id = src.id
+
+    # Run 1: cancel in the page-2 fetch — cursor saved = page 2, page 1
+    # records committed.
+    reached = asyncio.Event()
+    cls1 = _chain_adapter_factory(
+        code, _NEWEST_FIRST_PAGES, "CHAIN-P2", reached, []
+    )
+    with (
+        patch.dict(ADAPTERS_PATH, {code: cls1}, clear=False),
+        _PATCH_UPSERT,
+        _PATCH_PORTALS,
+        factory() as db,
+    ):
+        source = db.get(Source, src_id)
+        task = asyncio.create_task(poll_source(db, source))
+        await asyncio.wait_for(reached.wait(), timeout=5.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # Run 2 resumes from the saved cursor (page 2) to the end.
+    cls2 = _chain_adapter_factory(code, _NEWEST_FIRST_PAGES, None, asyncio.Event(), [])
+    with (
+        patch.dict(ADAPTERS_PATH, {code: cls2}, clear=False),
+        _PATCH_UPSERT,
+        _PATCH_PORTALS,
+        factory() as db,
+    ):
+        source = db.get(Source, src_id)
+        assert (await poll_source(db, source)).status == "ok"
+
+    # Run 3 with no cursor (fresh) re-walks the WHOLE chain from page 1 — every
+    # record is re-fetched (the maximal overlap). Still no duplicates.
+    cls3 = _chain_adapter_factory(code, _NEWEST_FIRST_PAGES, None, asyncio.Event(), [])
+    with (
+        patch.dict(ADAPTERS_PATH, {code: cls3}, clear=False),
+        _PATCH_UPSERT,
+        _PATCH_PORTALS,
+        factory() as db,
+    ):
+        source = db.get(Source, src_id)
+        assert (await poll_source(db, source)).status == "ok"
+
+    with factory() as db:
+        rows = list(
+            db.execute(
+                select(Tender.source_ref).where(Tender.source_code == code)
+            ).scalars()
+        )
+        # All eight unique records, exactly once, despite the overlapping
+        # re-fetches across three runs.
+        assert sorted(rows) == [
+            "p1a", "p1b", "p2a", "p2b", "p3a", "p3b", "p4a", "p4b",
+        ]
+        assert len(rows) == len(set(rows))
