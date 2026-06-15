@@ -266,9 +266,11 @@ async def test_truncated_payload_salvages_prefix_and_advances_watermark() -> Non
     refs = {t.source_ref for t in tenders}
     assert {"ocds-fts-p1", "ocds-fts-p2a", "ocds-fts-p2b"} <= refs
     assert adapter.had_errors is True
-    # Page 2's salvaged records confirmed page 1 ascends — the watermark
-    # covers page 1, so the next run does not replay it.
-    assert adapter.progress_watermark == datetime(2026, 6, 1, 10, 0, tzinfo=UTC)
+    # Page 1 and page 2's salvaged records (p2a, p2b) were all consumed and the
+    # feed ascends — the watermark advances to the last confirmed date (p2b's
+    # 06-04). The cut record p2c (06-05) is re-fetched by the >= overlap on
+    # resume, so advancing past page 1 skips nothing.
+    assert adapter.progress_watermark == datetime(2026, 6, 4, 10, 0, tzinfo=UTC)
 
 
 _FTS_PKG = "https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages"
@@ -336,8 +338,9 @@ async def test_salvaged_page_continues_via_recovered_cursor() -> None:
     assert calls["n"] == 3  # FOLLOWED the recovered cursor past the bad page
     assert adapter.had_errors is True
     assert any("CONTINUING" in m for m in adapter.error_messages)
-    # p3 confirmed p2's max; the watermark moved well past the bad page.
-    assert adapter.progress_watermark == datetime(2026, 6, 4, 10, 0, tzinfo=UTC)
+    # p3 (06-05) was consumed past the bad page on an ascending feed, so the
+    # watermark advances to it — well past the bad page.
+    assert adapter.progress_watermark == datetime(2026, 6, 5, 10, 0, tzinfo=UTC)
 
 
 async def test_salvaged_page_falls_back_to_date_window_when_cursor_corrupted() -> None:
@@ -377,7 +380,9 @@ async def test_salvaged_page_falls_back_to_date_window_when_cursor_corrupted() -
     assert captured[1].url.params.get("updatedFrom") == "2026-06-03T10:00:00Z"
     assert adapter.had_errors is True
     assert any("RESTARTING" in m for m in adapter.error_messages)
-    assert adapter.progress_watermark == datetime(2026, 6, 3, 10, 0, tzinfo=UTC)
+    # The date-window restart fetched w2 (06-04), which confirmed the feed
+    # ascends past the salvaged w1 (06-03) — the watermark advances to 06-04.
+    assert adapter.progress_watermark == datetime(2026, 6, 4, 10, 0, tzinfo=UTC)
 
 
 async def test_salvaged_page_blocked_when_cannot_advance() -> None:

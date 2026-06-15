@@ -64,12 +64,11 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
         return None
 
 
-def _page_date_bounds(
-    releases: list[dict],
-) -> tuple[datetime | None, datetime | None]:
-    """(min, max) of the releases' `date` fields, for the progress tracker."""
-    page_min: datetime | None = None
-    page_max: datetime | None = None
+def _page_dates(releases: list[dict]) -> list[datetime]:
+    """The releases' parsed `date` fields, in document order, for the progress
+    tracker (undated/unparseable releases are omitted). Document order matters:
+    the tracker reads intra-page direction from the first page's record order."""
+    dates: list[datetime] = []
     for release in releases:
         raw = release.get("date")
         if not raw:
@@ -80,11 +79,8 @@ def _page_date_bounds(
             continue
         if stamp.tzinfo is None:
             stamp = stamp.replace(tzinfo=UTC)
-        if page_min is None or stamp < page_min:
-            page_min = stamp
-        if page_max is None or stamp > page_max:
-            page_max = stamp
-    return page_min, page_max
+        dates.append(stamp)
+    return dates
 
 
 class RateLimitedError(Exception):
@@ -200,8 +196,12 @@ class ContractsFinderAdapter(SourceAdapter):
                     )
 
             # Control only returns here after the consumer has processed
-            # every yielded release of this page — safe to mark it done.
-            tracker.page_done(*_page_date_bounds(releases))
+            # every yielded release of this page — safe to mark it done. The
+            # watermark is set HERE, just before the next page's network fetch
+            # (the await where a 900s-timeout cancellation lands); poll_source's
+            # cancellation-persist (except CancelledError) commits this
+            # value if the cancel hits mid-fetch.
+            tracker.page_done(_page_dates(releases))
             self.progress_watermark = tracker.watermark
 
             links = payload.get("links") or {}

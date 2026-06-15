@@ -183,10 +183,12 @@ async def test_persistent_429_aborts_gracefully_keeping_progress() -> None:
     assert len(tenders) == 2  # both good pages ingested before the abort
     assert adapter.had_errors is True
     assert any("429" in m for m in adapter.error_messages)
-    # Page 2's processing confirmed page 1; page 3 never confirmed page 2 —
-    # the safe watermark is page 1's max.
+    # Pages 1 and 2 were both fully consumed and the feed ascends, so every
+    # record dated <= page 2's max is behind us — the safe resume point is
+    # page 2's max (page 3, which 429'd, never started). The retry's window
+    # therefore shrinks to the page-3 region instead of replaying the backlog.
     assert adapter.progress_watermark == datetime(
-        2026, 6, 1, 10, 0, tzinfo=UTC
+        2026, 6, 5, 10, 0, tzinfo=UTC
     )
     # Backoff happened between 429 attempts (no Retry-After → exponential).
     assert any(s >= 10.0 for s in sleeps)

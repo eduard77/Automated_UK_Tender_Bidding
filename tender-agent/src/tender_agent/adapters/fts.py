@@ -163,11 +163,11 @@ def _body_mentions_next(text: str) -> bool:
     return '"next"' in text
 
 
-def _page_date_bounds(
-    releases: list[dict],
-) -> tuple[datetime | None, datetime | None]:
-    page_min: datetime | None = None
-    page_max: datetime | None = None
+def _page_dates(releases: list[dict]) -> list[datetime]:
+    """The releases' parsed `date` fields in document order, undated/unparseable
+    releases omitted. Document order matters: the progress tracker reads
+    intra-page direction from the first page's record order."""
+    dates: list[datetime] = []
     for release in releases:
         raw = release.get("date")
         if not raw:
@@ -178,11 +178,8 @@ def _page_date_bounds(
             continue
         if stamp.tzinfo is None:
             stamp = stamp.replace(tzinfo=UTC)
-        if page_min is None or stamp < page_min:
-            page_min = stamp
-        if page_max is None or stamp > page_max:
-            page_max = stamp
-    return page_min, page_max
+        dates.append(stamp)
+    return dates
 
 
 class FTSAdapter(SourceAdapter):
@@ -277,9 +274,14 @@ class FTSAdapter(SourceAdapter):
                     )
 
             # The consumer has processed every yielded release of this page
-            # by the time control returns here — safe to confirm progress.
-            page_min, page_max = _page_date_bounds(releases)
-            tracker.page_done(page_min, page_max)
+            # by the time control returns here — safe to confirm progress. The
+            # watermark is set just before the next page's network fetch (the
+            # await where a 900s-timeout cancellation lands); poll_source's
+            # cancellation-persist (except CancelledError) commits it if the
+            # cancel hits mid-fetch.
+            page_dates = _page_dates(releases)
+            page_max = max(page_dates) if page_dates else None
+            tracker.page_done(page_dates)
             self.progress_watermark = tracker.watermark
 
             if not salvaged:
