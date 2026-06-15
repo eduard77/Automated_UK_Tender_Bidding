@@ -1,6 +1,7 @@
 """Orchestrates a full poll-and-ingest cycle for one source."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from datetime import UTC, datetime, timedelta
@@ -178,56 +179,75 @@ async def poll_source(db: Session, source: Source) -> PollRun:
             )
 
         async with adapter:
-            async for normalised in adapter.fetch_since(since):
-                fetched += 1
-                tender, action = _upsert_tender(db, normalised)
-                matched_profile_ids: list[int] = []
-                if action == "new":
-                    new_count += 1
-                    matched_profile_ids = _record_filter_matches(db, tender)
-                elif action == "updated":
-                    updated_count += 1
-                    matched_profile_ids = _record_filter_matches(db, tender)
-                # Best-effort portal discovery; never blocks the tender upsert.
-                queued_portal_ids: list[int] = []
-                try:
-                    result = process_tender_for_portals(tender, db)
-                    queued_portal_ids = result.portal_ids_queued
-                except Exception:  # noqa: BLE001
-                    logger.warning("portal_discovery.failed", tender_id=tender.id)
-                # commit per record so a later failure doesn't lose progress
-                db.commit()
-                for portal_id in queued_portal_ids:
-                    schedule_classification(portal_id)
-                # Dispatch push notifications for new matches immediately.
-                # Document download + Anthropic requirements extraction used
-                # to run HERE in-line; the live 2026-06-11 Log stream showed
-                # that consumed the whole poll interval on FTS alone and
-                # starved late-list sources (EU_SUPPLY/PROACTIS/ATAMIS) from
-                # ever being reached. Enrichment now happens out-of-band in
-                # services.enrichment_worker.process_pending_enrichment, on
-                # its own scheduler interval. Push is best-effort; failures
-                # are logged in services/push and never raised, so a dead
-                # subscriber can't break ingestion.
-                if matched_profile_ids:
-                    push.send_match_notifications(db, tender, matched_profile_ids)
+            try:
+                async for normalised in adapter.fetch_since(since):
+                    fetched += 1
+                    tender, action = _upsert_tender(db, normalised)
+                    matched_profile_ids: list[int] = []
+                    if action == "new":
+                        new_count += 1
+                        matched_profile_ids = _record_filter_matches(db, tender)
+                    elif action == "updated":
+                        updated_count += 1
+                        matched_profile_ids = _record_filter_matches(db, tender)
+                    # Best-effort portal discovery; never blocks the tender upsert.
+                    queued_portal_ids: list[int] = []
+                    try:
+                        result = process_tender_for_portals(tender, db)
+                        queued_portal_ids = result.portal_ids_queued
+                    except Exception:  # noqa: BLE001
+                        logger.warning("portal_discovery.failed", tender_id=tender.id)
+                    # commit per record so a later failure doesn't lose progress
                     db.commit()
-                    logger.info(
-                        "ingest.enrichment_deferred",
-                        tender_id=tender.id,
-                        match_count=len(matched_profile_ids),
-                    )
-                # Resume point: advance + commit the watermark as pages
-                # confirm, so a 900s-timeout cancellation keeps forward
-                # progress and the next run resumes here, not from the backlog
-                # start (the CF/FTS non-advancing loop, 2026-06-14).
-                _persist_progress()
+                    for portal_id in queued_portal_ids:
+                        schedule_classification(portal_id)
+                    # Dispatch push notifications for new matches immediately.
+                    # Document download + Anthropic requirements extraction used
+                    # to run HERE in-line; the live 2026-06-11 Log stream showed
+                    # that consumed the whole poll interval on FTS alone and
+                    # starved late-list sources (EU_SUPPLY/PROACTIS/ATAMIS) from
+                    # ever being reached. Enrichment now happens out-of-band in
+                    # services.enrichment_worker.process_pending_enrichment, on
+                    # its own scheduler interval. Push is best-effort; failures
+                    # are logged in services/push and never raised, so a dead
+                    # subscriber can't break ingestion.
+                    if matched_profile_ids:
+                        push.send_match_notifications(db, tender, matched_profile_ids)
+                        db.commit()
+                        logger.info(
+                            "ingest.enrichment_deferred",
+                            tender_id=tender.id,
+                            match_count=len(matched_profile_ids),
+                        )
+                    # Resume point: advance + commit the watermark as pages
+                    # confirm, so a 900s-timeout cancellation keeps forward
+                    # progress and the next run resumes here, not from the backlog
+                    # start (the CF/FTS non-advancing loop, 2026-06-14).
+                    _persist_progress()
+            except asyncio.CancelledError:
+                # The 900s poll timeout cancels poll_source with a
+                # ``CancelledError`` (a BaseException) at the page-boundary
+                # ``await`` inside fetch_since — AFTER the adapter has set the
+                # just-confirmed page's watermark but BEFORE the loop body's
+                # per-record ``_persist_progress`` runs again. The cancel lands
+                # BETWEEN records (in the next page's fetch), so the session is
+                # clean and only the watermark is pending — commit it here so
+                # the resume point survives the timeout, then re-raise so the
+                # scheduler's wait_for still observes the cancellation. This is
+                # the exact path the original #131 bug skipped: ``except
+                # Exception`` cannot catch a BaseException. Defensive: a stray
+                # error persisting must not mask the CancelledError.
+                try:
+                    _persist_progress()
+                except Exception:  # noqa: BLE001
+                    logger.exception("ingest.final_persist_failed", source=source.code)
+                raise
             had_errors = bool(getattr(adapter, "had_errors", False))
             adapter_errors = list(getattr(adapter, "error_messages", []) or [])
         # A graceful end (clean completion OR an adapter-reported error such as
         # the CF 429 abort / FTS salvage) — capture the final confirmed page's
-        # progress too. (A timeout CANCELLATION never reaches here; its
-        # progress was already committed incrementally above.)
+        # progress too. (A timeout CANCELLATION is handled by the except
+        # CancelledError above.)
         _persist_progress()
         if had_errors:
             run.status = "error"
