@@ -208,19 +208,32 @@ class FTSAdapter(SourceAdapter):
             since = since.replace(tzinfo=UTC)
         base_url = f"{self.base_url}/ocdsReleasePackages"
         params = {"updatedFrom": since.strftime("%Y-%m-%dT%H:%M:%SZ")}
-        url: str | None = base_url
+        # Resume from the saved cursor when poll_source handed one in — a full
+        # next-page URL (a `links.next`, or a `base_url?updatedFrom=...` we
+        # saved when a salvage forced a date-window restart). It is
+        # self-contained, so we follow it like any cursor (no `params`), and
+        # the backlog drains forward across cancelled cycles regardless of
+        # feed direction (2026-06-15). No cursor → fresh window from `since`.
+        resume = self.resume_cursor
         # Send `params` (the `updatedFrom` window) on the next fetch. True for
-        # page 1 and after every date-window restart; False while following a
-        # `links.next` cursor, which already encodes the window.
-        send_params = True
+        # a fresh page 1 and after every date-window restart; False while
+        # following a `links.next` cursor (or a resume cursor), which already
+        # encodes the window.
+        if resume:
+            url: str | None = resume
+            send_params = False
+        else:
+            url = base_url
+            send_params = True
         page = 0
         tracker = PageProgressTracker()
         date_window_restarts = 0
         date_window_floor: datetime | None = None
         # Cursor URLs already followed THIS chain — guards an A→B→A cursor
         # cycle on a misbehaving feed. Cleared on a date-window restart (which
-        # starts a fresh chain from a strictly higher floor).
-        seen_cursors: set[str] = set()
+        # starts a fresh chain from a strictly higher floor). Seed it with the
+        # resume cursor so a feed that loops back to it terminates.
+        seen_cursors: set[str] = {resume} if resume else set()
         while url:
             page += 1
             try:
@@ -292,6 +305,12 @@ class FTSAdapter(SourceAdapter):
                     url = next_url
                 else:
                     url = None
+                # Persist the resume point: the next unconsumed page (None at
+                # the end), set just before its fetch await so poll_source's
+                # cancellation-persist saves a cursor that is ALWAYS available
+                # per page — the backlog drains forward even on a newest-first
+                # feed where the date-watermark freezes (2026-06-15).
+                self.resume_cursor = url
                 continue
 
             # --- salvaged page: CONTINUE past it, never halt here ----------
@@ -311,6 +330,7 @@ class FTSAdapter(SourceAdapter):
             if next_url and next_url != url and next_url not in seen_cursors:
                 seen_cursors.add(next_url)
                 url = next_url
+                self.resume_cursor = url
                 self.record_error(f"{diag}; recovered next cursor — CONTINUING")
                 logger.warning(
                     "fts.salvaged_continued",
@@ -338,6 +358,14 @@ class FTSAdapter(SourceAdapter):
                 url = base_url
                 send_params = True
                 seen_cursors.clear()
+                # The resume point for the NEXT run must be self-contained (it
+                # is followed as a cursor, with no params), so bake the window
+                # into the URL. This run continues via base_url+params; the
+                # next run that resumes here GETs the equivalent window.
+                self.resume_cursor = str(
+                    httpx.URL(base_url, params={"updatedFrom": stamp})
+                )
+                seen_cursors.add(self.resume_cursor)
                 self.record_error(
                     f"{diag}; cursor unrecoverable — RESTARTING from "
                     f"updatedFrom={stamp}"
@@ -366,6 +394,12 @@ class FTSAdapter(SourceAdapter):
                     salvaged=len(releases),
                     skipped_regions=skipped,
                 )
+                # Genuinely stuck on a permanently-bad page (cursor AND date
+                # progress both unrecoverable). Leave resume_cursor at the last
+                # good page so the next run retries from there rather than
+                # re-walking the whole window — the block is upstream-permanent
+                # (flagged via had_errors), not something a reset would fix.
+                url = None
             else:
                 self.record_error(f"{diag}; no further pages — end of feed")
                 logger.info(
@@ -373,4 +407,7 @@ class FTSAdapter(SourceAdapter):
                     page=page,
                     salvaged=len(releases),
                 )
-            url = None
+                # Reached the end of new data — clear the resume point so the
+                # next run starts a fresh window from last_polled_at.
+                url = None
+                self.resume_cursor = None

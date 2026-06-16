@@ -143,11 +143,20 @@ class ContractsFinderAdapter(SourceAdapter):
     async def fetch_since(self, since: datetime) -> AsyncIterator[NormalisedTender]:
         if since.tzinfo is None:
             since = since.replace(tzinfo=UTC)
-        params = {
-            "updatedFrom": since.strftime("%Y-%m-%dT%H:%M:%S"),
-            "limit": 100,
-        }
-        url = f"{self.base_url}/Search"
+        # Resume from the saved cursor when poll_source handed one in: it
+        # encodes the window AND the offset, so the backlog drains forward
+        # across cancelled cycles regardless of feed direction (2026-06-15).
+        # No cursor → start a fresh `updatedFrom` window from `since`.
+        resume = self.resume_cursor
+        if resume:
+            url: str | None = resume
+            params: dict | None = None
+        else:
+            url = f"{self.base_url}/Search"
+            params = {
+                "updatedFrom": since.strftime("%Y-%m-%dT%H:%M:%S"),
+                "limit": 100,
+            }
         page = 0
         tracker = PageProgressTracker()
 
@@ -158,6 +167,8 @@ class ContractsFinderAdapter(SourceAdapter):
                 # CF's rate limiter in the first place.
                 await self._sleep(INTER_PAGE_DELAY_S)
             try:
+                # `params` is the window only for a fresh page 1; a cursor URL
+                # (resume or `links.next`) already encodes it, so send None.
                 payload = await self._get_page(url, params if page == 1 else None)
             except RateLimitedError as exc:
                 # Graceful abort: everything confirmed so far stays via the
@@ -207,3 +218,10 @@ class ContractsFinderAdapter(SourceAdapter):
             links = payload.get("links") or {}
             next_url = links.get("next")
             url = next_url if next_url and next_url != url else None
+            # Persist the resume point HERE — set to the next unconsumed page
+            # (None at the end of the feed) just before its network await, so
+            # poll_source's cancellation-persist saves a cursor that is ALWAYS
+            # available per page (unlike the date watermark, which freezes on a
+            # newest-first feed). The next run resumes from this page, not page
+            # 1 — the backlog drains forward regardless of feed direction.
+            self.resume_cursor = url
