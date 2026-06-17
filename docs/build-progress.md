@@ -11,7 +11,7 @@ previous phase being marked DONE.
 | 0     | Reusable dashboard bot                                      | **PASS** (CI) | 2026-06-11 | Unit-test gate green; live gate is the operator's runbook below.     |
 | 1     | Get the silent sources pulling (Atamis, EU-Supply, Sell2Wales) | **PASS — with-blocked-upstreams-recorded** | 2026-06-12 | Every source reached each cycle; ATAMIS/EU_SUPPLY now ingest. Remaining 2 (NI 500, S2W expired-cert) are proven upstream outages, recorded in accounts-needed.md. |
 | 2     | Fix run-15-class discovery errors                           | **PASS (CI)** | 2026-06-12 | The prod `run_for_profile` path lost the whole run on one bad advert (guard lived only on legacy `run()`). Unified per-advert + per-page resilience into a shared helper; offline tests prove a run with a bad advert/page completes ok + inserts. Live bot run optional. |
-| 3     | Cross-source sector classification (the spine)              | **3a PASS (CI) · 3b pending** | 2026-06-12 | 3a (engine): AI sector classification at ingest (Haiku 4.5), backfill (Batch API), coverage readout. 3b (dashboard sector filter + setup wiring) is a separate run. |
+| 3     | Cross-source sector classification (the spine)              | **3a PASS (CI) · 3b PASS (CI)** | 2026-06-17 | 3a (engine): AI sector classification at ingest (Haiku 4.5), backfill (Batch API), coverage readout. 3b (dashboard sector filter + per-user setup wiring) shipped: taxonomy endpoint, OR-match sector filter, sector badges, per-user saved sectors that pre-apply. |
 | 4     | Keyword/value/buyer filters as first-class                  | not started   | —          |                                                                      |
 | 5     | Per-tender state (interested / not-interested / applied)    | not started   | —          |                                                                      |
 | 6     | Guided setup page (word → CPV picker → save)                | not started   | —          | Partly NEEDS DECISION when reached (preset taxonomy).                |
@@ -1046,3 +1046,80 @@ recovery scan bounds (window cutoff + auto-pagination limit), poisoned-row
 containment, the admin wrapper's plain error fields, the 409 lock, and the
 UTF-8 sanitiser. Full suite 962 passed / 3 skipped (the known dev-DB flake
 only). Ruff clean.
+
+## Phase 3b — PASS (CI) (2026-06-17): dashboard sector filter + per-user setup wiring
+
+### Verdict: Phase 3b PASS (CI). Consumes Phase 3a's classified data in the UI; no backend discovery/classification/scheduler/taxonomy touched.
+
+### What the user now sees and can do
+
+- **Sector filter on the search dashboard.** A new "Sector (default: all)" facet
+  lets the user tick any number of the 16 taxonomy sectors. Results match ANY
+  selected sector (OR, not AND), and a tender matches if a selected sector is its
+  `primary_sector` OR appears in its `secondary_sectors` — broad match across both
+  fields. No selection = no sector filter (everything). It narrows alongside the
+  existing text/CPV/region/value/source filters (AND across fields), and each
+  active sector shows as a removable chip with a "Reset all".
+- **Sector badge on every tender.** Each result row and "Today" card now carries a
+  mint-tinted `primary_sector` badge, so the user can see at a glance why a tender
+  matched.
+- **Setup page (`/setup`).** A new per-user preferences page: pick your sectors of
+  interest once and Save. The selection persists against your account.
+- **Saved sectors pre-apply.** On returning to the search dashboard, a logged-in
+  user's saved sectors load as the default filter and run a search automatically —
+  which they can still override ad-hoc without changing the saved setup.
+
+### What shipped (additive only)
+
+1. **Single source of truth for the 16 sectors.** New `GET /tenders/sectors`
+   serves the canonical `SECTORS` straight from
+   `services/classification/taxonomy.py` — the frontend never keeps a second copy
+   that can drift. The filter and the setup page both read it.
+2. **OR-match sector filter on `/tenders/search`.** New `sector` query param →
+   `TenderSearchParams.sectors`. Selected values are canonicalised against the
+   taxonomy (case/whitespace-tolerant; unknown values dropped) so junk never
+   reaches SQL. The WHERE clause is `primary_sector IN (...)` OR, per selected
+   sector, `CAST(secondary_sectors AS JSONB) @> '["…"]'` (secondary_sectors is a
+   JSON list, cast to JSONB for element containment) — all OR-ed. `primary_sector`
+   /`secondary_sectors` are now in the `TenderRead` / `TenderSearchResult` schemas
+   so the badge renders.
+3. **Per-user saved sectors (additive migration 0021).** A single nullable
+   `accounts.saved_sectors` JSON column — the same per-row ownership model as push
+   subscriptions / portal connections, so one user's saved sectors can never bleed
+   to another. `GET`/`PUT /me/sectors` (both `require_account` → 401 anonymous)
+   read/write ONLY `account.saved_sectors`; the PUT canonicalises + de-dupes. No
+   new auth scheme; reuses the existing session-cookie plumbing.
+4. **Dashboard UI.** Sector multi-select reuses the existing `ChipChoices` pattern;
+   a shared `SectorBadge` component; a new `/setup` page + nav link; `lib/api.ts`
+   gains `getSectors` / `getMySectors` / `saveMySectors` and the new types. The
+   existing look/feel is unchanged — this is an addition, not a redesign.
+
+### Tests
+
+- **Backend, offline (in-memory SQLite, no Postgres):** `tests/test_saved_sectors.py`
+  (5) — `/tenders/sectors` returns exactly the canonical 16; saved sectors empty by
+  default; round-trip with canonicalisation + junk-dropped + dedupe; **strictly
+  per-user** (account A's save is invisible to B, and B's write never touches A);
+  anonymous GET/PUT both 401.
+- **Backend, Postgres-gated (run in CI like the rest of `test_tender_search.py`):**
+  5 new sector tests — primary OR secondary match; OR across multiple selected;
+  empty selection returns everything; canonicalised + junk-dropped; sector AND-s
+  with other filters. This sandbox has no Postgres/Docker, so these were verified
+  by compiling the query for the Postgres dialect (confirmed `primary_sector IN
+  (...) OR CAST(secondary_sectors AS JSONB) @> …::JSONB`, junk dropped); they
+  execute against real Postgres in CI.
+- **Frontend (Vitest, 9 new / 15 total green):** `SectorFilter.test.tsx` —
+  selecting a sector adds `sector=` to the query + a removable chip; the
+  primary-sector badge renders on results; saved sectors pre-apply on load without
+  pressing Search; no pre-apply when none saved. `SetupPage.test.tsx` — loads the
+  user's saved sectors as pre-selected toggles; Save PUTs the edited selection;
+  anonymous users are asked to sign in (no save controls).
+- `npx tsc --noEmit` clean; ruff clean; additive migration only (0021, head).
+
+### Verification notes
+
+The full offline backend subset run here (saved-sectors + classification-coverage
++ accounts/entitlement/brief-gate) is 63 passed. The Postgres-backed search tests
+and the full pytest suite run in CI (this sandbox can't reach Postgres — the
+documented constraint). No classification engine, taxonomy contents, discovery, or
+scheduler code was touched.

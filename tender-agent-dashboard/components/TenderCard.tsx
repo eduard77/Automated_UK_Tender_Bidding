@@ -10,6 +10,8 @@ import {
   timeOnly,
 } from "@/lib/format";
 
+import SectorBadge from "./SectorBadge";
+
 type Variant = "default" | "priority" | "featured";
 
 export default function TenderCard({
@@ -73,6 +75,7 @@ export default function TenderCard({
             {tender.notice_type}
           </span>
         )}
+        {tender.primary_sector && <SectorBadge sector={tender.primary_sector} />}
         {isPriority && days !== null && days >= 0 && (
           <span
             className="ml-auto inline-flex items-center gap-1.5 text-amber"

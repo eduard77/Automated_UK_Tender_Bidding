@@ -1,15 +1,18 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import useSWR from "swr";
 
 import FilterChip from "./FilterChip";
 import PillKicker from "./PillKicker";
+import SectorBadge from "./SectorBadge";
 import {
   fetcher,
+  getMySectors,
   searchPath,
   type SearchSort,
+  type SectorTaxonomy,
   type TenderFacets,
   type TenderSearchParams,
   type TenderSearchResponse,
@@ -43,6 +46,8 @@ interface Draft {
   openOnly: boolean;
   statuses: string[];
   sources: string[];
+  // Sector multi-select (Phase 3b): match primary OR secondary, OR across all.
+  sectors: string[];
   includeDuplicates: boolean;
 }
 
@@ -59,6 +64,7 @@ const EMPTY_DRAFT: Draft = {
   openOnly: false,
   statuses: [],
   sources: [],
+  sectors: [],
   includeDuplicates: true,
 };
 
@@ -85,6 +91,7 @@ function draftToParams(d: Draft): TenderSearchParams {
     open_only: d.openOnly || undefined,
     status: d.statuses.length ? d.statuses : undefined,
     source: d.sources.length ? d.sources : undefined,
+    sector: d.sectors.length ? d.sectors : undefined,
     include_duplicates: d.includeDuplicates,
   };
 }
@@ -106,6 +113,7 @@ function paramsToDraft(p: TenderSearchParams): Draft {
     openOnly: p.open_only ?? false,
     statuses: p.status ?? [],
     sources: p.source ?? [],
+    sectors: p.sector ?? [],
     includeDuplicates: p.include_duplicates ?? true,
   };
 }
@@ -133,6 +141,29 @@ export default function SearchPage() {
   const facets = useSWR<TenderFacets>("/tenders/facets", fetcher, {
     revalidateOnFocus: false,
   });
+  // Canonical 16 sectors — single source of truth from the backend taxonomy.
+  const sectorTaxonomy = useSWR<SectorTaxonomy>("/tenders/sectors", fetcher, {
+    revalidateOnFocus: false,
+  });
+  const sectorOptions = sectorTaxonomy.data?.sectors ?? [];
+
+  // Pre-apply the user's SAVED sectors as the default filter on first load
+  // (Phase 3b). Logged-in users with a saved setup land on a pre-filtered
+  // dashboard; they can still override ad-hoc below without changing what's
+  // saved. Anonymous users (401 → null) and users with no saved sectors see
+  // the normal prompt state. Runs exactly once.
+  useEffect(() => {
+    let cancelled = false;
+    void getMySectors().then((saved) => {
+      if (cancelled || !saved || !saved.sectors?.length) return;
+      const sectors = saved.sectors;
+      setDraft((d) => ({ ...d, sectors }));
+      setApplied(draftToParams({ ...EMPTY_DRAFT, sectors }));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const key = applied
     ? searchPath({ ...applied, sort, page, page_size: PAGE_SIZE })
@@ -146,7 +177,7 @@ export default function SearchPage() {
     setDraft((d) => ({ ...d, [field]: value }));
 
   const toggleIn = (
-    field: "statuses" | "sources" | "region",
+    field: "statuses" | "sources" | "region" | "sectors",
     value: string,
   ) =>
     setDraft((d) => {
@@ -335,6 +366,30 @@ export default function SearchPage() {
           )}
         </Fieldset>
 
+        <Fieldset legend="Sector (default: all)">
+          {sectorTaxonomy.isLoading ? (
+            <span className="text-[13px] text-text-dim">Loading…</span>
+          ) : (
+            <>
+              <ChipChoices
+                options={sectorOptions}
+                selected={draft.sectors}
+                onToggle={(v) => toggleIn("sectors", v)}
+                labeller={(v) => v}
+              />
+              {draft.sectors.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => set("sectors", [])}
+                  className="mt-3 text-[12px] text-text-dim underline-offset-4 hover:text-text hover:underline"
+                >
+                  Clear sector selection
+                </button>
+              )}
+            </>
+          )}
+        </Fieldset>
+
         <div className="flex flex-wrap items-center justify-between gap-4 border-t border-border pt-6">
           <label className="flex items-center gap-3 text-text-muted text-[13px]">
             <input
@@ -477,6 +532,7 @@ function ResultCard({ result: r }: { result: TenderSearchResult }) {
             {statusLabel(r.status)}
           </span>
         )}
+        {r.primary_sector && <SectorBadge sector={r.primary_sector} />}
         {r.is_duplicate && (
           <Link
             href={r.duplicate_of_id ? `/tenders/${r.duplicate_of_id}` : "#"}
@@ -737,6 +793,15 @@ function ActiveFilterChips({
         label="Source"
         value={sourceLabel(s)}
         onRemove={() => onPatch({ source: (a.source ?? []).filter((x) => x !== s) })}
+      />,
+    );
+  for (const s of a.sector ?? [])
+    chips.push(
+      <FilterChip
+        key={`sector:${s}`}
+        label="Sector"
+        value={s}
+        onRemove={() => onPatch({ sector: (a.sector ?? []).filter((x) => x !== s) })}
       />,
     );
   if (a.include_duplicates === false)

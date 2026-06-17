@@ -44,6 +44,9 @@ export interface Tender {
   published_at: string | null;
   deadline_at: string | null;
   documents: TenderDocumentRaw[] | null;
+  // Sector classification (Phase 3a) — shown as a badge on the card.
+  primary_sector: string | null;
+  secondary_sectors: string[] | null;
   first_seen_at: string;
   last_seen_at: string;
 }
@@ -288,6 +291,9 @@ export interface TenderSearchResult {
   deadline_at: string | null;
   procurement_ref: string | null;
   duplicate_of_id: number | null;
+  // Sector classification (Phase 3a) — shown as a badge on the result row.
+  primary_sector: string | null;
+  secondary_sectors: string[] | null;
   is_duplicate: boolean;
 }
 
@@ -324,6 +330,9 @@ export interface TenderSearchParams {
   open_only?: boolean;
   status?: string[];
   source?: string[];
+  // Sector multi-select (Phase 3b): match primary OR secondary, OR across all
+  // selected. Empty = no sector filter (everything).
+  sector?: string[];
   include_duplicates?: boolean;
   sort?: SearchSort;
   page?: number;
@@ -353,6 +362,47 @@ export const searchTenders = (params: TenderSearchParams) =>
   request<TenderSearchResponse>(searchPath(params));
 
 export const getTenderFacets = () => request<TenderFacets>("/tenders/facets");
+
+// The canonical taxonomy (Phase 3b) — the 16 sectors, single source of truth.
+// Drives the dashboard sector filter and the setup page so the frontend never
+// keeps its own drifting copy.
+export interface SectorTaxonomy {
+  sectors: string[];
+}
+
+export const getSectors = () => request<SectorTaxonomy>("/tenders/sectors");
+
+// Per-user saved sector preferences (Phase 3b setup page). credentials:include
+// so the session cookie identifies the user; strictly per-user on the backend.
+export interface SavedSectors {
+  sectors: string[];
+}
+
+export async function getMySectors(): Promise<SavedSectors | null> {
+  const res = await fetch(`${API_BASE}/me/sectors`, { credentials: "include" });
+  // 401 when anonymous — treated as "no saved sectors" by callers.
+  if (!res.ok) return null;
+  return (await res.json()) as SavedSectors;
+}
+
+export async function saveMySectors(sectors: string[]): Promise<SavedSectors> {
+  const res = await fetch(`${API_BASE}/me/sectors`, {
+    method: "PUT",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sectors }),
+  });
+  if (!res.ok) throw new ApiError(res.status, res.statusText, await safeJson(res));
+  return (await res.json()) as SavedSectors;
+}
+
+async function safeJson(res: Response): Promise<unknown> {
+  try {
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Low-level fetcher
