@@ -1,0 +1,29 @@
+# Dashboard-local ignore list.
+#
+# These patterns are already covered by the repo-root .gitignore for *commits*,
+# but `az webapp up` decides what to put in its (forward-slash, Linux-safe) zip
+# by reading the .gitignore in the folder it is run from. Keeping a copy here
+# guarantees the manual Oryx deploy uploads ONLY source — Azure's Linux builder
+# then runs `npm install` + `npm run build` itself, so we never ship
+# Windows-built node_modules or a stale .next bundle.
+#
+# See docs/manual-dashboard-deploy.md for the deploy procedure.
+
+# Dependencies — Oryx reinstalls these on the server.
+node_modules/
+
+# Build output — Oryx rebuilds these on the server.
+.next/
+out/
+
+# Incremental TypeScript build info (large, machine-local).
+*.tsbuildinfo
+
+# The corrupt Windows zip-deploy artifact that caused the backslash failure.
+deploy.zip
+*.zip
+
+# Local env files (never deploy secrets; production values live in App Settings).
+.env
+.env.*
+!.env.example
