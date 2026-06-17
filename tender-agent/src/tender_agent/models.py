@@ -785,6 +785,13 @@ class Account(Base):
         Integer, nullable=False, default=0
     )
     period_anchor: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Sectors the user picked on the setup/preferences page (Phase 3b). A JSON
+    # list of canonical taxonomy sector strings, pre-applied as the default
+    # dashboard sector filter when this user returns. Lives on the account row,
+    # so it is strictly per-user — one user's saved sectors never reach another
+    # (the same ownership model as push_subscriptions / portal_credentials).
+    # NULL means "not set yet" → the dashboard shows everything.
+    saved_sectors: Mapped[list[str] | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )

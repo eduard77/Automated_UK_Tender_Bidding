@@ -20,6 +20,7 @@ from tender_agent.models import (
 )
 from tender_agent.schemas import (
     RegionFacet,
+    SectorTaxonomy,
     TenderDocumentFileRead,
     TenderFacets,
     TenderRead,
@@ -32,6 +33,7 @@ from tender_agent.services.accounts.entitlement import (
     is_entitled,
 )
 from tender_agent.services.brief.content_store import EXTRACTOR_VERSION
+from tender_agent.services.classification.taxonomy import SECTORS
 from tender_agent.services.tender_search import (
     SortKey,
     TenderSearchParams,
@@ -91,6 +93,10 @@ def search(
     open_only: bool = Query(False, description="Only live notices: future deadline + active"),
     status: list[str] = Query(default_factory=list),
     source: list[str] = Query(default_factory=list, description="source_code; default all"),
+    sector: list[str] = Query(
+        default_factory=list,
+        description="taxonomy sector(s); match primary OR secondary, OR across selected",
+    ),
     include_duplicates: bool = Query(
         True, description="Show all matches; duplicates are annotated, not hidden"
     ),
@@ -112,6 +118,7 @@ def search(
         open_only=open_only,
         status=status,
         source=source,
+        sectors=sector,
         include_duplicates=include_duplicates,
         sort=sort,
         page=page,
@@ -137,6 +144,16 @@ def facets(db: Session = Depends(get_db)) -> TenderFacets:
         statuses=statuses,
         regions=[RegionFacet(value=value, count=count) for value, count in regions],
     )
+
+
+@router.get("/sectors", response_model=SectorTaxonomy)
+def sectors() -> SectorTaxonomy:
+    """The canonical 16-sector taxonomy (Phase 3b), in taxonomy order.
+
+    Single source of truth for the dashboard sector filter and the setup page —
+    served straight from services.classification.taxonomy so the frontend can
+    never drift from what the classifier assigns. Does not touch the DB."""
+    return SectorTaxonomy(sectors=list(SECTORS))
 
 
 @router.get("/{tender_id}", response_model=TenderRead)

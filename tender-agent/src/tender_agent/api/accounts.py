@@ -17,6 +17,7 @@ from tender_agent.api.deps import current_account, require_account
 from tender_agent.config import settings
 from tender_agent.db import get_db
 from tender_agent.models import Account
+from tender_agent.schemas import SavedSectorsRead, SavedSectorsUpdate
 from tender_agent.services.accounts.auth import (
     AuthError,
     issue_session,
@@ -33,6 +34,7 @@ from tender_agent.services.accounts.entitlement import (
     grant_entitlement,
     is_plan_active,
 )
+from tender_agent.services.classification.taxonomy import canonical_sector
 
 logger = structlog.get_logger(__name__)
 
@@ -234,6 +236,45 @@ def me(
     if account is None:
         return None
     return _account_read(account)
+
+
+# ---------------------------------------------------------------------------
+# Saved sector preferences (Phase 3b setup page).
+#
+# Strictly per-user: both routes resolve the caller via `require_account`
+# (401 when anonymous) and read/write ONLY `account.saved_sectors`, so one
+# user's saved sectors can never be read or overwritten by another — the same
+# ownership guarantee as the per-user push subscriptions and portal
+# connections. Saved values are canonicalised against the fixed taxonomy, so
+# only real sector strings are ever stored.
+# ---------------------------------------------------------------------------
+
+
+@me_router.get("/me/sectors", response_model=SavedSectorsRead)
+def get_saved_sectors(
+    account: Account = Depends(require_account),
+) -> SavedSectorsRead:
+    """The caller's saved sectors (empty list when they've saved none yet)."""
+    return SavedSectorsRead(sectors=list(account.saved_sectors or []))
+
+
+@me_router.put("/me/sectors", response_model=SavedSectorsRead)
+def set_saved_sectors(
+    body: SavedSectorsUpdate,
+    account: Account = Depends(require_account),
+    db: Session = Depends(get_db),
+) -> SavedSectorsRead:
+    """Replace the caller's saved sectors. Each value is canonicalised against
+    the taxonomy; unknown values are dropped and duplicates collapsed, so only
+    real, de-duplicated sector strings are persisted."""
+    canonical: list[str] = []
+    for raw in body.sectors:
+        sector = canonical_sector(raw)
+        if sector and sector not in canonical:
+            canonical.append(sector)
+    account.saved_sectors = canonical
+    db.commit()
+    return SavedSectorsRead(sectors=canonical)
 
 
 # ---------------------------------------------------------------------------

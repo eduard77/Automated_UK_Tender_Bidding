@@ -110,6 +110,84 @@ def test_cpv_overlap(session: Session) -> None:
     assert b.id not in _ids(rows) and c.id not in _ids(rows)
 
 
+def test_sector_matches_primary_or_secondary(session: Session) -> None:
+    # Phase 3b: a tender matches a selected sector when it's the primary_sector
+    # OR appears in secondary_sectors (broad OR match across both fields).
+    in_primary = _t(session, primary_sector="IT & Digital")
+    in_secondary = _t(
+        session,
+        primary_sector="Construction & Built Environment",
+        secondary_sectors=["IT & Digital"],
+    )
+    nomatch = _t(
+        session,
+        primary_sector="Health & Social Care",
+        secondary_sectors=["Education & Training"],
+    )
+    total, rows = search_tenders(
+        session, TenderSearchParams(sectors=["IT & Digital"], source=[MARK])
+    )
+    assert _ids(rows) == {in_primary.id, in_secondary.id}
+    assert nomatch.id not in _ids(rows)
+    assert total == 2
+
+
+def test_sector_or_across_multiple_selected(session: Session) -> None:
+    # Multi-select is OR (not AND): a tender matches ANY selected sector.
+    it = _t(session, primary_sector="IT & Digital")
+    health = _t(session, primary_sector="Health & Social Care")
+    construction = _t(session, primary_sector="Construction & Built Environment")
+    _, rows = search_tenders(
+        session,
+        TenderSearchParams(
+            sectors=["IT & Digital", "Health & Social Care"], source=[MARK]
+        ),
+    )
+    assert _ids(rows) == {it.id, health.id}
+    assert construction.id not in _ids(rows)
+
+
+def test_sector_empty_selection_returns_everything(session: Session) -> None:
+    # No sector selected = no sector filter (the controlled set is unfiltered).
+    a = _t(session, primary_sector="IT & Digital")
+    b = _t(session, primary_sector="Health & Social Care")
+    c = _t(session, primary_sector=None)
+    _, rows = search_tenders(session, TenderSearchParams(sectors=[], source=[MARK]))
+    assert {a.id, b.id, c.id} <= _ids(rows)
+
+
+def test_sector_canonicalised_and_junk_dropped(session: Session) -> None:
+    # Case/whitespace drift still matches (canonicalised against the taxonomy);
+    # an unknown value is dropped rather than matching nothing-or-everything.
+    it = _t(session, primary_sector="IT & Digital")
+    _, rows = search_tenders(
+        session,
+        TenderSearchParams(sectors=["  it & digital "], source=[MARK]),
+    )
+    assert it.id in _ids(rows)
+    # A junk-only selection imposes no valid sector filter → controlled set back.
+    _, rows2 = search_tenders(
+        session, TenderSearchParams(sectors=["Nope Not Real"], source=[MARK])
+    )
+    assert it.id in _ids(rows2)
+
+
+def test_sector_combines_with_other_filters_as_and(session: Session) -> None:
+    # Sector narrows alongside existing filters (AND across fields).
+    match = _t(session, primary_sector="IT & Digital", region="London")
+    wrong_region = _t(session, primary_sector="IT & Digital", region="South West")
+    wrong_sector = _t(session, primary_sector="Health & Social Care", region="London")
+    _, rows = search_tenders(
+        session,
+        TenderSearchParams(
+            sectors=["IT & Digital"], region=["London"], source=[MARK]
+        ),
+    )
+    assert _ids(rows) == {match.id}
+    assert wrong_region.id not in _ids(rows)
+    assert wrong_sector.id not in _ids(rows)
+
+
 def test_region_exact_match_on_canonical_column(session: Session) -> None:
     # Region now filters the canonical `region` column by EXACT value (chunk 8),
     # not buyer_region free text. A tender resolved to North West (e.g. via a
