@@ -68,7 +68,20 @@ def list_tenders(
     if not include_duplicates:
         stmt = stmt.where(Tender.duplicate_of_id.is_(None))
     if matched_only:
-        stmt = stmt.join(FilterMatch, FilterMatch.tender_id == Tender.id).distinct()
+        # Filter to tenders that have at least one FilterMatch via a correlated
+        # EXISTS rather than join()+distinct(). A plain join multiplies a tender
+        # by its match count, so the old code added .distinct() to dedupe — but
+        # SELECT DISTINCT forces Postgres to compare whole rows, and Tender has
+        # `json` (not `jsonb`) columns (secondary_sectors, subcategories,
+        # documents, raw). The `json` type has NO equality operator, so DISTINCT
+        # raised "could not identify an equality operator for type json" — a hard
+        # 500 on this path only. EXISTS never multiplies rows, so no DISTINCT is
+        # needed and the json columns are never compared.
+        stmt = stmt.where(
+            select(FilterMatch.id)
+            .where(FilterMatch.tender_id == Tender.id)
+            .exists()
+        )
 
     stmt = stmt.order_by(Tender.published_at.desc().nullslast()).offset(offset).limit(limit)
     return list(db.execute(stmt).scalars().all())
