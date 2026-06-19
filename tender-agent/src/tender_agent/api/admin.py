@@ -12,12 +12,13 @@ import threading
 import structlog
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from tender_agent.api.credentials import DEFAULT_USER as CREDENTIALS_DEFAULT_USER
 from tender_agent.config import settings
 from tender_agent.db import get_db
-from tender_agent.models import FilterProfile, Tender
+from tender_agent.models import FilterProfile, Tender, TenderRequirements
 from tender_agent.schemas import TenderRequirementsRead
 from tender_agent.services.credentials import (
     CredentialsStoreError,
@@ -33,6 +34,7 @@ from tender_agent.services.discovery.proactis_discovery import (
 from tender_agent.services.discovery.proactis_filter_config import (
     ProactisFilterConfig,
 )
+from tender_agent.services.document_downloader import download_documents_for_tender
 from tender_agent.services.requirements_extractor import extract_requirements
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -43,22 +45,38 @@ logger = structlog.get_logger(__name__)
     "/extract-requirements/{tender_id}",
     response_model=TenderRequirementsRead,
 )
-def trigger_extract_requirements(
-    tender_id: int, db: Session = Depends(get_db)
+async def trigger_extract_requirements(
+    tender_id: int,
+    db: Session = Depends(get_db),
+    force: bool = Query(
+        False,
+        description="Re-run extraction even if requirements are already stored "
+        "(overwrites + re-charges). Default false: an already-extracted tender "
+        "returns its stored requirements untouched.",
+    ),
 ) -> TenderRequirementsRead:
-    """Re-run requirements extraction for a single tender, overwriting any
-    existing TenderRequirements row.
+    """Extract a tender's requirements ON-DEMAND — the human-interest trigger
+    that replaced the always-on enrichment worker (cost decision 2026-06-19,
+    docs/document-fetch-cost-audit.md). The dashboard tender-detail page calls
+    this the first time a human opens a tender.
 
-    Used by:
-    - the dashboard's "Generate brief" button on the tender detail page
-    - the `scripts/validate_extractor.py` validation harness
-    - operators investigating a specific tender by hand
+    Idempotent by default: if a TenderRequirements row already exists this
+    returns it as-is — no document download, no Anthropic call, no re-charge.
+    Pass `force=true` to overwrite (operators re-investigating, and the
+    `scripts/validate_extractor.py` harness call extract_requirements directly,
+    not this endpoint).
+
+    On a first extraction it downloads the tender's documents first (reusing the
+    unchanged document downloader) so the Sonnet call analyses the actual ITT
+    text rather than the description alone — the worker used to do this download
+    on the same tenders; only the trigger moved to on-demand.
 
     Status codes:
-    - 200: extraction succeeded, returns the new TenderRequirementsRead.
+    - 200: returns the TenderRequirementsRead (freshly extracted, or the stored
+      row when one already existed and force is false).
     - 404: tender does not exist.
-    - 422: tender has no description AND no downloaded documents — there's
-      nothing to extract from. Run the document downloader first.
+    - 422: tender has no description AND no extractable documents — nothing to
+      extract from.
     - 503: ANTHROPIC_API_KEY is not configured on the backend.
     - 502: the extractor was called but failed (Claude error, JSON parse error,
       etc.). Check structured logs for `requirements.api_error` /
@@ -68,11 +86,34 @@ def trigger_extract_requirements(
     if tender is None:
         raise HTTPException(status_code=404, detail="tender not found")
 
+    # Idempotency / caching: opening an already-analysed tender must never
+    # re-run extraction or re-charge. Checked before the API-key gate so a
+    # stored brief is still readable even if the key is later unset.
+    if not force:
+        existing = db.execute(
+            select(TenderRequirements).where(
+                TenderRequirements.tender_id == tender_id
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return existing
+
     if not settings.anthropic_api_key:
         raise HTTPException(
             status_code=503,
             detail="anthropic_api_key not configured on the backend",
         )
+
+    # Fetch the documents first so extraction analyses the ITT pack, not just
+    # the description. Best-effort: a flaky download must not block extraction —
+    # extract_requirements falls back to the description when no document text
+    # is available. Reuses the existing downloader unchanged (the fetch
+    # mechanism is not altered; only when it runs for this tender).
+    try:
+        await download_documents_for_tender(db, tender)
+        db.refresh(tender)
+    except Exception:  # noqa: BLE001
+        logger.exception("extract.document_download_failed", tender_id=tender_id)
 
     has_description = bool(tender.description and tender.description.strip())
     has_documents = bool(tender.document_files)
