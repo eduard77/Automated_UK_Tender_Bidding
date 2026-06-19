@@ -25,6 +25,10 @@ def _fake_db_with(get_result: object | None) -> MagicMock:
     """A MagicMock that quacks like a SQLAlchemy Session for our needs."""
     db = MagicMock()
     db.get = MagicMock(return_value=get_result)
+    # The endpoint's idempotency probe (SELECT existing TenderRequirements)
+    # must report "none stored yet" for these error-path tenders, so the
+    # request proceeds to the 404/422/503 branch under test.
+    db.execute.return_value.scalar_one_or_none.return_value = None
     return db
 
 
@@ -53,6 +57,9 @@ def _tender(*, description: str | None, has_documents: bool) -> Tender:
     )
     t.id = 42
     t.document_files = ["fake-doc"] if has_documents else []
+    # No attachment URLs → the on-demand download short-circuits to a no-op,
+    # so these error-path tests never touch the network or the (mock) DB.
+    t.documents = []
     return t
 
 

@@ -68,14 +68,21 @@ class Settings(BaseSettings):
 
     # Enrichment worker (Phase-1 rev 3, 2026-06-11). Decouples slow per-tender
     # work (PDF download + Anthropic requirements extraction) from the polling
-    # hot path. Without this, an early-list source with many filter-matched
-    # tenders consumes the entire poll interval doing ~10–15 s per-tender AI
-    # calls, starving late-list sources (the live evidence: EU_SUPPLY/ATAMIS
-    # at the tail of the list never got reached). The worker runs on its own
-    # interval and processes a bounded batch of matched-but-unenriched
-    # tenders each cycle. Disable to roll the feature back to the in-line
-    # behaviour (not recommended).
-    enrichment_worker_enabled: bool = True
+    # hot path.
+    #
+    # Cost decision (2026-06-19, docs/document-fetch-cost-audit.md): the
+    # per-matched-tender Sonnet extraction this worker runs is the recurring AI
+    # cost driver (~$0.05/tender, ~20k tokens of document text), and it fired
+    # for every filter-matched tender BEFORE any human had shown interest —
+    # spend the "machines act, humans interpret" motto says should wait for a
+    # human. So automatic enrichment is now OFF by default: requirements are
+    # extracted ON-DEMAND when a human first opens a tender, via
+    # POST /admin/extract-requirements/{id} (idempotent — once stored, opening
+    # again neither re-runs nor re-charges). The worker code stays intact and
+    # re-enablable (set TENDER_AGENT_ENRICHMENT_WORKER_ENABLED=true) for a
+    # bulk/operator backfill; classification (Haiku, cheap) is independent and
+    # still runs automatically for every tender.
+    enrichment_worker_enabled: bool = False
     enrichment_worker_interval_minutes: int = 5
     enrichment_worker_batch_size: int = 5
 
