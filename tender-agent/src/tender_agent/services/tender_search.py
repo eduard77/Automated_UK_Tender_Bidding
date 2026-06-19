@@ -16,10 +16,12 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 
-from sqlalchemy import ColumnElement, Select, and_, func, or_, select
+from sqlalchemy import ColumnElement, Select, and_, cast, func, or_, select
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session
 
 from tender_agent.models import Tender
+from tender_agent.services.classification.taxonomy import canonical_sector
 from tender_agent.services.regions import CANONICAL_REGIONS
 
 # Status value that represents an "open"/live notice. The table uses
@@ -56,6 +58,9 @@ class TenderSearchParams:
     open_only: bool = False
     status: list[str] = field(default_factory=list)
     source: list[str] = field(default_factory=list)
+    # Sector multi-select (Phase 3b). A tender matches if ANY selected sector is
+    # its primary_sector OR appears in its secondary_sectors (broad OR match).
+    sectors: list[str] = field(default_factory=list)
     include_duplicates: bool = True
     sort: SortKey = SortKey.deadline_asc
     page: int = 1
@@ -142,6 +147,27 @@ def _build_conditions(params: TenderSearchParams) -> list[ColumnElement[bool]]:
 
     if params.source:
         conditions.append(Tender.source_code.in_(params.source))
+
+    # Sector — multi-select OR. A tender matches if a selected sector is its
+    # primary_sector OR appears in its secondary_sectors JSON list. Selected
+    # values are canonicalised against the fixed taxonomy (the single source of
+    # truth) so junk/case-drift never reaches the query; unknown values are
+    # dropped. secondary_sectors is a JSON array, so it's cast to JSONB and
+    # matched element-wise with the `@>` containment operator (per selected
+    # sector, OR-ed together).
+    if params.sectors:
+        valid = []
+        for raw in params.sectors:
+            canon = canonical_sector(raw)
+            if canon and canon not in valid:
+                valid.append(canon)
+        if valid:
+            secondary = cast(Tender.secondary_sectors, JSONB)
+            sector_clauses: list[ColumnElement[bool]] = [
+                Tender.primary_sector.in_(valid)
+            ]
+            sector_clauses.extend(secondary.contains([s]) for s in valid)
+            conditions.append(or_(*sector_clauses))
 
     # Dedup: default shows everything (annotated downstream); when off, only
     # primaries (rows that are not a duplicate of another).

@@ -16,6 +16,7 @@ const NAV_LINKS: NavLink[] = [
   { href: "/", label: "Today", matches: (p) => p === "/" || p.startsWith("/tenders") },
   { href: "/search", label: "Search", matches: (p) => p.startsWith("/search") },
   { href: "/filters", label: "Filters" },
+  { href: "/setup", label: "Setup", matches: (p) => p.startsWith("/setup") },
   { href: "/vault", label: "Vault", matches: (p) => p.startsWith("/vault") },
   { href: "/portals", label: "Portals", matches: (p) => p.startsWith("/portals") },
   { href: "/platforms", label: "Platforms", matches: (p) => p.startsWith("/platforms") },

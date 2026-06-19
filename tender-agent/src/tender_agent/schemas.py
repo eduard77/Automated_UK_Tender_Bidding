@@ -66,6 +66,9 @@ class TenderRead(BaseModel):
     published_at: datetime | None
     deadline_at: datetime | None
     documents: list[dict] | None
+    # Sector classification (Phase 3a) — shown as a badge on the tender card.
+    primary_sector: str | None = None
+    secondary_sectors: list[str] | None = None
     first_seen_at: datetime
     last_seen_at: datetime
 
@@ -101,6 +104,11 @@ class TenderSearchResult(BaseModel):
     deadline_at: datetime | None
     procurement_ref: str | None
     duplicate_of_id: int | None
+    # Sector classification (Phase 3a). Shown as a badge on the result so the
+    # user can see why a tender matched the sector filter; secondary_sectors is
+    # included because a match can come from either field.
+    primary_sector: str | None = None
+    secondary_sectors: list[str] | None = None
     # Computed by the endpoint from duplicate_of_id (Tender has no such column),
     # so it carries a default for model_validate(orm_obj) and is set after.
     is_duplicate: bool = False
@@ -132,6 +140,28 @@ class TenderFacets(BaseModel):
     sources: list[str]
     statuses: list[str]
     regions: list[RegionFacet]
+
+
+class SectorTaxonomy(BaseModel):
+    """The fixed sector taxonomy (Phase 3b) — the canonical 16 top-level sectors,
+    in taxonomy order. Served from services.classification.taxonomy so the
+    dashboard's sector filter and setup page read a SINGLE source of truth and
+    can never drift from what the classifier assigns."""
+
+    sectors: list[str]
+
+
+class SavedSectorsRead(BaseModel):
+    """A user's saved sector preferences (Phase 3b setup page)."""
+
+    sectors: list[str]
+
+
+class SavedSectorsUpdate(BaseModel):
+    """Replace a user's saved sectors. Values are canonicalised against the
+    taxonomy server-side; unknown values are dropped."""
+
+    sectors: list[str]
 
 
 class FilterProfileCreate(BaseModel):

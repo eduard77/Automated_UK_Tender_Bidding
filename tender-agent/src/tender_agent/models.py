@@ -43,6 +43,16 @@ class Source(Base):
     base_url: Mapped[str] = mapped_column(String(512), nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     last_polled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Cursor-based backlog resume point (2026-06-15). The next-page URL
+    # (OCDS `links.next`) the source's drain has reached; the next poll resumes
+    # its fetch FROM here instead of rebuilding an `updatedFrom` window. Set
+    # incrementally per confirmed page by poll_source — and ALWAYS available
+    # per page, so the backlog drains forward across 900s-timeout cancellations
+    # even on a NEWEST-first feed where the date-watermark (last_polled_at)
+    # correctly freezes rather than skip older unfetched pages. NULL = start a
+    # fresh window from last_polled_at (the pre-cursor behaviour). Cleared when
+    # a run reaches the end of new data (status ok).
+    resume_cursor: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
@@ -414,6 +424,13 @@ class PollRun(Base):
     # compares it across consecutive runs to tell catching_up from
     # fetch_failing. NULL for runs that confirmed no page (or pre-migration).
     watermark_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Pagination cursor this run reached (2026-06-15). The OCDS `links.next`
+    # URL of the next unconsumed page — available per page regardless of feed
+    # direction, so it advances run-to-run while a NEWEST-first feed's
+    # watermark_at stays NULL. The sources-health diagnosis reads a changed
+    # cursor as forward progress (catching_up) where the frozen watermark
+    # alone would read fetch_failing. NULL once the feed is fully drained.
+    resume_cursor: Mapped[str | None] = mapped_column(Text)
 
     source: Mapped[Source] = relationship(back_populates="runs")
 
@@ -768,6 +785,13 @@ class Account(Base):
         Integer, nullable=False, default=0
     )
     period_anchor: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Sectors the user picked on the setup/preferences page (Phase 3b). A JSON
+    # list of canonical taxonomy sector strings, pre-applied as the default
+    # dashboard sector filter when this user returns. Lives on the account row,
+    # so it is strictly per-user — one user's saved sectors never reach another
+    # (the same ownership model as push_subscriptions / portal_credentials).
+    # NULL means "not set yet" → the dashboard shows everything.
+    saved_sectors: Mapped[list[str] | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )

@@ -396,6 +396,112 @@ def test_health_fetch_failing_when_watermark_does_not_advance(client, factory) -
     assert cf["diagnosis"] == "fetch_failing"
 
 
+def test_health_catching_up_when_cursor_advances_but_watermark_frozen(
+    client, factory
+) -> None:
+    """The 2026-06-15 newest-first case: the date-watermark FREEZES (stays
+    NULL — advancing it would skip older unfetched pages), so on watermark
+    alone the drain reads `fetch_failing` forever. But the pagination cursor
+    advances run-to-run as the backlog drains, and that MUST read
+    `catching_up`. This is the signal cursor-based resume added."""
+    now = datetime.now(UTC)
+    with factory() as db:
+        src = Source(code="FTS", name="Find a Tender", base_url="x", enabled=True)
+        db.add(src)
+        db.commit()
+        db.add_all(
+            [
+                # Older timed-out run: watermark frozen (newest-first feed),
+                # cursor reached page 3.
+                PollRun(
+                    source_id=src.id,
+                    started_at=now - POLL_INTERVAL * 2,
+                    finished_at=now - POLL_INTERVAL * 2 + timedelta(minutes=15),
+                    status="error",
+                    error="poll timed out after 900s and was cancelled",
+                    watermark_at=None,
+                    resume_cursor="https://fts.invalid/cursor-page-3",
+                ),
+                # Newest run: watermark STILL frozen, but the cursor advanced to
+                # page 7 — forward progress through the backlog.
+                PollRun(
+                    source_id=src.id,
+                    started_at=now - POLL_INTERVAL,
+                    finished_at=now - POLL_INTERVAL + timedelta(minutes=15),
+                    status="error",
+                    error="poll timed out after 900s and was cancelled",
+                    watermark_at=None,
+                    resume_cursor="https://fts.invalid/cursor-page-7",
+                ),
+            ]
+        )
+        db.add(
+            Tender(
+                source_code="FTS",
+                source_ref="fts-1",
+                title="t",
+                first_seen_at=now,
+                last_seen_at=now,
+            )
+        )
+        db.commit()
+    body = client.get("/admin/diagnostics/sources-health").json()
+    fts = next(s for s in body["sources"] if s["code"] == "FTS")
+    assert fts["diagnosis"] == "catching_up"
+    # The cursor presence is surfaced so the operator can see a drain in flight.
+    assert fts["latest_runs"][0]["has_resume_cursor"] is True
+
+
+def test_health_fetch_failing_when_cursor_stuck_and_watermark_frozen(
+    client, factory
+) -> None:
+    """The genuine-stuck case on a newest-first feed: watermark frozen AND the
+    cursor unchanged run-to-run (each cycle times out fetching the same page,
+    fetching 0). Neither resume signal advanced — `fetch_failing`, not
+    `catching_up`."""
+    now = datetime.now(UTC)
+    stuck_cursor = "https://fts.invalid/cursor-page-3"
+    with factory() as db:
+        src = Source(code="FTS", name="Find a Tender", base_url="x", enabled=True)
+        db.add(src)
+        db.commit()
+        db.add_all(
+            [
+                PollRun(
+                    source_id=src.id,
+                    started_at=now - POLL_INTERVAL * 2,
+                    finished_at=now - POLL_INTERVAL * 2 + timedelta(minutes=15),
+                    status="error",
+                    error="poll timed out after 900s and was cancelled",
+                    watermark_at=None,
+                    resume_cursor=stuck_cursor,
+                ),
+                PollRun(
+                    source_id=src.id,
+                    started_at=now - POLL_INTERVAL,
+                    finished_at=now - POLL_INTERVAL + timedelta(minutes=15),
+                    status="error",
+                    error="poll timed out after 900s and was cancelled",
+                    watermark_at=None,
+                    resume_cursor=stuck_cursor,  # unchanged — no progress
+                ),
+            ]
+        )
+        db.add(
+            Tender(
+                source_code="FTS",
+                source_ref="fts-1",
+                title="t",
+                first_seen_at=now,
+                last_seen_at=now,
+            )
+        )
+        db.commit()
+    body = client.get("/admin/diagnostics/sources-health").json()
+    fts = next(s for s in body["sources"] if s["code"] == "FTS")
+    assert fts["diagnosis"] == "fetch_failing"
+
+
 def test_health_browser_source_stale_run_reads_as_note_not_fault(client, factory) -> None:
     """2026-06-14: PROACTIS is browser-driven (login-gated, run on its OWN
     cycle via run_for_profile / proactis_discovery_job), NOT part of the HTTP

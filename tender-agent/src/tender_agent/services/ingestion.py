@@ -1,6 +1,7 @@
 """Orchestrates a full poll-and-ingest cycle for one source."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from datetime import UTC, datetime, timedelta
@@ -138,11 +139,18 @@ async def poll_source(db: Session, source: Source) -> PollRun:
 
     try:
         adapter = adapter_cls()
+        # Hand the saved cursor to the adapter as its resume point. A
+        # cursor-paginated adapter (CF, FTS) resumes its fetch FROM here
+        # instead of rebuilding an `updatedFrom` window; others ignore it.
+        # This is what drains the backlog forward regardless of feed sort
+        # direction (2026-06-15): the cursor is available per page even when
+        # the date-watermark freezes on a newest-first feed.
+        adapter.resume_cursor = source.resume_cursor
 
         def _persist_progress() -> None:
-            """Advance the durable resume point from the adapter's
-            confirmed-page watermark and COMMIT it now — called as each page
-            confirms.
+            """Advance the durable resume point — the date watermark AND the
+            pagination cursor — from the adapter and COMMIT it now, called as
+            each page confirms.
 
             This is what makes a backlog catch-up resumable. The 900s
             per-source poll timeout cancels poll_source with a
@@ -150,84 +158,121 @@ async def poll_source(db: Session, source: Source) -> PollRun:
             ``except Exception`` below AND the final finalisation/commit.
             Unless progress is already committed when the cancel lands, the
             whole sweep is discarded and the next run restarts from the
-            backlog start: the CF/FTS 900s non-advancing loop. Committing the
-            watermark per confirmed page means a cancelled mid-sweep run keeps
-            everything fetched so far and the next run resumes from here.
-            Monotonic — never moves the watermark backwards."""
+            backlog start: the CF/FTS 900s non-advancing loop.
+
+            Two resume signals are persisted:
+
+            - ``last_polled_at`` / ``watermark_at`` — the date watermark
+              (PageProgressTracker). Monotonic; the SAFE fresh-window floor.
+              It FREEZES on a newest-first feed (advancing would skip older
+              unfetched pages), so on its own it left the loop non-advancing.
+            - ``resume_cursor`` — the OCDS ``links.next`` of the next
+              unconsumed page. Available for EVERY page regardless of feed
+              direction, so it advances even while the watermark is frozen.
+              The next run resumes its fetch from this cursor (page N+1), not
+              page 1 — the backlog genuinely drains forward across cycles.
+            """
             if adapter is None:
                 return
+            changed = False
             progress = getattr(adapter, "progress_watermark", None)
-            if progress is None:
+            if progress is not None:
+                current = source.last_polled_at
+                if current is not None and current.tzinfo is None:
+                    current = current.replace(tzinfo=UTC)
+                if current is None or progress > current:
+                    source.last_polled_at = progress
+                    run.watermark_at = progress
+                    changed = True
+            cursor = getattr(adapter, "resume_cursor", None)
+            if cursor != source.resume_cursor:
+                source.resume_cursor = cursor
+                run.resume_cursor = cursor
+                changed = True
+            if not changed:
                 return
-            current = source.last_polled_at
-            if current is not None and current.tzinfo is None:
-                current = current.replace(tzinfo=UTC)
-            if current is not None and progress <= current:
-                return
-            source.last_polled_at = progress
-            run.watermark_at = progress
             run.fetched = fetched
             run.new_count = new_count
             run.updated_count = updated_count
             db.commit()
             logger.info(
-                "ingest.watermark_advance",
+                "ingest.progress_advance",
                 source=source.code,
-                watermark=progress.isoformat(),
+                watermark=progress.isoformat() if progress else None,
+                has_resume_cursor=cursor is not None,
                 fetched=fetched,
             )
 
         async with adapter:
-            async for normalised in adapter.fetch_since(since):
-                fetched += 1
-                tender, action = _upsert_tender(db, normalised)
-                matched_profile_ids: list[int] = []
-                if action == "new":
-                    new_count += 1
-                    matched_profile_ids = _record_filter_matches(db, tender)
-                elif action == "updated":
-                    updated_count += 1
-                    matched_profile_ids = _record_filter_matches(db, tender)
-                # Best-effort portal discovery; never blocks the tender upsert.
-                queued_portal_ids: list[int] = []
-                try:
-                    result = process_tender_for_portals(tender, db)
-                    queued_portal_ids = result.portal_ids_queued
-                except Exception:  # noqa: BLE001
-                    logger.warning("portal_discovery.failed", tender_id=tender.id)
-                # commit per record so a later failure doesn't lose progress
-                db.commit()
-                for portal_id in queued_portal_ids:
-                    schedule_classification(portal_id)
-                # Dispatch push notifications for new matches immediately.
-                # Document download + Anthropic requirements extraction used
-                # to run HERE in-line; the live 2026-06-11 Log stream showed
-                # that consumed the whole poll interval on FTS alone and
-                # starved late-list sources (EU_SUPPLY/PROACTIS/ATAMIS) from
-                # ever being reached. Enrichment now happens out-of-band in
-                # services.enrichment_worker.process_pending_enrichment, on
-                # its own scheduler interval. Push is best-effort; failures
-                # are logged in services/push and never raised, so a dead
-                # subscriber can't break ingestion.
-                if matched_profile_ids:
-                    push.send_match_notifications(db, tender, matched_profile_ids)
+            try:
+                async for normalised in adapter.fetch_since(since):
+                    fetched += 1
+                    tender, action = _upsert_tender(db, normalised)
+                    matched_profile_ids: list[int] = []
+                    if action == "new":
+                        new_count += 1
+                        matched_profile_ids = _record_filter_matches(db, tender)
+                    elif action == "updated":
+                        updated_count += 1
+                        matched_profile_ids = _record_filter_matches(db, tender)
+                    # Best-effort portal discovery; never blocks the tender upsert.
+                    queued_portal_ids: list[int] = []
+                    try:
+                        result = process_tender_for_portals(tender, db)
+                        queued_portal_ids = result.portal_ids_queued
+                    except Exception:  # noqa: BLE001
+                        logger.warning("portal_discovery.failed", tender_id=tender.id)
+                    # commit per record so a later failure doesn't lose progress
                     db.commit()
-                    logger.info(
-                        "ingest.enrichment_deferred",
-                        tender_id=tender.id,
-                        match_count=len(matched_profile_ids),
-                    )
-                # Resume point: advance + commit the watermark as pages
-                # confirm, so a 900s-timeout cancellation keeps forward
-                # progress and the next run resumes here, not from the backlog
-                # start (the CF/FTS non-advancing loop, 2026-06-14).
-                _persist_progress()
+                    for portal_id in queued_portal_ids:
+                        schedule_classification(portal_id)
+                    # Dispatch push notifications for new matches immediately.
+                    # Document download + Anthropic requirements extraction used
+                    # to run HERE in-line; the live 2026-06-11 Log stream showed
+                    # that consumed the whole poll interval on FTS alone and
+                    # starved late-list sources (EU_SUPPLY/PROACTIS/ATAMIS) from
+                    # ever being reached. Enrichment now happens out-of-band in
+                    # services.enrichment_worker.process_pending_enrichment, on
+                    # its own scheduler interval. Push is best-effort; failures
+                    # are logged in services/push and never raised, so a dead
+                    # subscriber can't break ingestion.
+                    if matched_profile_ids:
+                        push.send_match_notifications(db, tender, matched_profile_ids)
+                        db.commit()
+                        logger.info(
+                            "ingest.enrichment_deferred",
+                            tender_id=tender.id,
+                            match_count=len(matched_profile_ids),
+                        )
+                    # Resume point: advance + commit the watermark as pages
+                    # confirm, so a 900s-timeout cancellation keeps forward
+                    # progress and the next run resumes here, not from the backlog
+                    # start (the CF/FTS non-advancing loop, 2026-06-14).
+                    _persist_progress()
+            except asyncio.CancelledError:
+                # The 900s poll timeout cancels poll_source with a
+                # ``CancelledError`` (a BaseException) at the page-boundary
+                # ``await`` inside fetch_since — AFTER the adapter has set the
+                # just-confirmed page's watermark but BEFORE the loop body's
+                # per-record ``_persist_progress`` runs again. The cancel lands
+                # BETWEEN records (in the next page's fetch), so the session is
+                # clean and only the watermark is pending — commit it here so
+                # the resume point survives the timeout, then re-raise so the
+                # scheduler's wait_for still observes the cancellation. This is
+                # the exact path the original #131 bug skipped: ``except
+                # Exception`` cannot catch a BaseException. Defensive: a stray
+                # error persisting must not mask the CancelledError.
+                try:
+                    _persist_progress()
+                except Exception:  # noqa: BLE001
+                    logger.exception("ingest.final_persist_failed", source=source.code)
+                raise
             had_errors = bool(getattr(adapter, "had_errors", False))
             adapter_errors = list(getattr(adapter, "error_messages", []) or [])
         # A graceful end (clean completion OR an adapter-reported error such as
         # the CF 429 abort / FTS salvage) — capture the final confirmed page's
-        # progress too. (A timeout CANCELLATION never reaches here; its
-        # progress was already committed incrementally above.)
+        # progress too. (A timeout CANCELLATION is handled by the except
+        # CancelledError above.)
         _persist_progress()
         if had_errors:
             run.status = "error"
@@ -240,9 +285,14 @@ async def poll_source(db: Session, source: Source) -> PollRun:
             else:
                 error = "upstream HTTP requests failed (see adapter log events)"
         else:
-            # Reached present day — the resume point IS now.
+            # Reached present day — the resume point IS now, and the cursor
+            # chain is fully drained, so clear it: the next run starts a fresh
+            # `updatedFrom` window from here instead of re-following a stale
+            # end-of-feed cursor.
             source.last_polled_at = datetime.now(UTC)
             run.watermark_at = source.last_polled_at
+            source.resume_cursor = None
+            run.resume_cursor = None
             run.status = "ok"
     except Exception as exc:  # noqa: BLE001
         error = f"{type(exc).__name__}: {exc}"

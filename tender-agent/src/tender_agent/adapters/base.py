@@ -36,47 +36,89 @@ class TruncatedResponseError(httpx.TransportError):
 
 
 class PageProgressTracker:
-    """Confirm-then-advance watermark over a paged feed.
+    """Direction-aware resume watermark over a paged feed.
 
-    The poll watermark normally only advances on a fully-clean run, so a
-    source failing on page N re-fetches the ENTIRE window every retry (the
-    CF 429 spiral, 2026-06-12: each retry re-pulled a 10-day backlog of 16+
-    pages, which itself re-triggered the 429). This tracker lets an adapter
-    persist partial progress safely:
+    The resume watermark must advance for EVERY page whose records have been
+    committed — otherwise a backlog catch-up that the 900s poll timeout
+    cancels mid-sweep keeps no progress and the next run restarts from the
+    backlog start, times out again, and never drains (the CF/FTS 2026-06-14
+    non-advancing loop). But it must NEVER move onto a date whose still-
+    unfetched records would then be skipped. Those two pulls are reconciled by
+    the feed's sort direction:
 
-    - `page_done(page_min, page_max)` is called after each page's records
-      have been fully consumed by the ingester.
-    - Page k's max timestamp becomes the watermark only once page k+1
-      PROVES the feed ascends (its min >= page k's max). A descending or
-      unordered feed therefore never advances mid-run — advancing on a
-      newest-first feed would silently skip every older unfetched page.
-    - The final page is never confirmed, so a resume re-fetches at most one
-      page of overlap; the upsert change-hash makes that idempotent.
+    - On an ASCENDING (oldest-first) feed, once pages 1..k have been consumed
+      in order every record dated <= the max date seen is on a consumed page,
+      so resuming from that max skips nothing (the >= overlap re-fetches at
+      most the boundary, which the upsert content-hash makes idempotent). The
+      watermark therefore advances to the running max after EACH consumed
+      page — including the first page and a single-page window, so a cancelled
+      run keeps the progress of every committed page.
+    - On a DESCENDING / unordered feed, advancing would skip the older, still-
+      unfetched pages, so the tracker FREEZES and never advances.
+
+    Direction is read from the strongest signal available:
+
+    - A later page whose records START at/after the previous page's max proves
+      the feed ascends globally (authoritative); one that starts BEFORE proves
+      it descends/unordered → freeze.
+    - Before any cross-page signal exists (i.e. on the first page), the page's
+      OWN record order is a provisional read. CF and FTS are cursor-harvested
+      OCDS ``updatedFrom`` feeds, globally sorted by update time, so they order
+      records the same within a page as across pages — an ascending first page
+      means an ascending feed. This is what lets a run cancelled ON PAGE 1 keep
+      page 1's progress instead of discarding it.
+    - A page with fewer than two dated records carries no intra-page signal and
+      leaves the direction UNKNOWN until a cross-page signal arrives; the
+      watermark holds (stays put) until then rather than guessing.
+
+    The watermark is monotonic — it never moves backwards.
     """
 
     def __init__(self) -> None:
-        self._pending_max: datetime | None = None
-        self._frozen = False
         self.watermark: datetime | None = None
+        self._running_max: datetime | None = None
+        self._prev_page_max: datetime | None = None
+        self._ascending = False
+        self._frozen = False
 
-    def page_done(
-        self, page_min: datetime | None, page_max: datetime | None
-    ) -> None:
+    def page_done(self, page_dates: list[datetime] | None) -> None:
+        """Confirm a page whose records have been fully consumed.
+
+        ``page_dates`` are the records' ``date`` values in the order the feed
+        delivered them (document order); the caller omits undated records.
+        Passing them in order (rather than a pre-reduced min/max) is what lets
+        the tracker read intra-page direction on the first page.
+        """
         if self._frozen:
             return
-        if self._pending_max is not None and page_min is not None:
-            if page_min >= self._pending_max:
-                # Ascension confirmed — the previous page is safely behind us.
-                self.watermark = self._pending_max
+        dates = [d for d in (page_dates or []) if d is not None]
+        if not dates:
+            return  # no dated records — can't reason about progress; hold
+        page_min = min(dates)
+        page_max = max(dates)
+
+        if self._prev_page_max is not None:
+            # Cross-page signal — authoritative over any intra-page read.
+            if page_min >= self._prev_page_max:
+                self._ascending = True
             else:
-                # Newest-first or unordered feed: freeze. Never advance on a
-                # feed where later pages hold OLDER records.
+                # Later page holds OLDER records: descending/unordered. Freeze
+                # before advancing — moving forward would skip those pages.
                 self._frozen = True
                 return
-        if page_max is not None and (
-            self._pending_max is None or page_max > self._pending_max
-        ):
-            self._pending_max = page_max
+        elif len(dates) >= 2:
+            # First page, provisional intra-page read (globally-sorted feed).
+            if dates[-1] > dates[0]:
+                self._ascending = True
+            elif dates[-1] < dates[0]:
+                self._frozen = True
+                return
+
+        if self._running_max is None or page_max > self._running_max:
+            self._running_max = page_max
+        if self._ascending:
+            self.watermark = self._running_max
+        self._prev_page_max = page_max
 
 
 class SourceAdapter(ABC):
@@ -115,6 +157,20 @@ class SourceAdapter(ABC):
         # it on a FAILED run so retries resume from the last confirmed page
         # instead of re-fetching the whole window. None = no safe progress.
         self.progress_watermark: datetime | None = None
+        # Cursor-based resume point (2026-06-15). Dual role on the
+        # cursor-paginated adapters (CF, FTS):
+        #   INPUT  — poll_source sets it to the source's saved cursor BEFORE
+        #            iterating; a non-None value means "resume the fetch from
+        #            this next-page URL, not from an `updatedFrom` window".
+        #   OUTPUT — the adapter OVERWRITES it per confirmed page with that
+        #            page's `links.next` (the next unconsumed page), set just
+        #            before the next page's network await so a 900s-timeout
+        #            cancellation persists it. None once the feed is drained.
+        # Unlike progress_watermark this is available for EVERY page regardless
+        # of feed sort direction, so the backlog drains forward even when the
+        # date-watermark freezes on a newest-first feed. Adapters that don't
+        # paginate by cursor leave it None and ignore the input.
+        self.resume_cursor: str | None = None
 
     @staticmethod
     def check_body_complete(response: httpx.Response) -> None:
