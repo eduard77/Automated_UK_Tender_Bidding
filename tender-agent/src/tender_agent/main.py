@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import logging
 import sys
+import traceback
 from contextlib import asynccontextmanager
 
 import structlog
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from tender_agent import scheduler
 from tender_agent.api import accounts as accounts_api
@@ -131,6 +133,33 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(
+    request: Request, exc: Exception
+) -> JSONResponse:
+    """Last-resort handler so a route bug can NEVER again become a silent 500.
+
+    The /tenders?matched_only=true outage (json-DISTINCT) produced a 500 with
+    NO traceback in the logs: nothing logged the exception, so the cause was
+    invisible in `az webapp log tail`. This handler logs the full traceback as
+    a structured field on every unhandled (non-HTTPException) error, then
+    returns a generic 500 body — internals are logged, never leaked to the
+    client. HTTPException keeps its own handler and is unaffected."""
+    logger = structlog.get_logger(__name__)
+    logger.error(
+        "unhandled_exception",
+        method=request.method,
+        path=request.url.path,
+        query=str(request.url.query),
+        error=str(exc),
+        error_type=type(exc).__name__,
+        traceback=traceback.format_exc(),
+    )
+    return JSONResponse(
+        status_code=500, content={"detail": "internal server error"}
+    )
 
 
 @app.get("/health")
