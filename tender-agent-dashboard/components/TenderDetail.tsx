@@ -17,16 +17,21 @@ import {
   isFetchTaskActive,
   startFetchDocuments,
   startGenerateBrief,
+  triggerExtractRequirements,
   type BriefDocumentConsidered,
   type BriefJson,
   type BriefKeyRisk,
   type BriefPreviewCounts,
   type BriefScoring,
+  type EvaluationCriterion,
   type FetchTask,
+  type QuestionToAnswer,
+  type RequirementItem,
   type RiskSeverity,
   type Tender,
   type TenderBrief,
   type TenderDocumentFile,
+  type TenderRequirements,
 } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import {
@@ -142,6 +147,7 @@ export default function TenderDetail({ id }: { id: number }) {
       <Header tender={tender.data} />
       <Description description={tender.data.description} />
       <Sidebar tender={tender.data} />
+      <RequirementsPanel tenderId={id} />
       <BriefPanel
         tenderId={id}
         brief={brief.data ?? null}
@@ -397,6 +403,308 @@ function DataPoint({
 // ---------------------------------------------------------------------------
 // Brief panel (chunk 5 — bid / no-bid, key risks first)
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Requirements panel — on-demand extraction (cost fix)
+// ---------------------------------------------------------------------------
+// Automatic per-tender requirements extraction is OFF in the backend
+// (docs/document-fetch-cost-audit.md) — the expensive Sonnet analysis was the
+// recurring cost driver and ran for every matched tender before anyone looked
+// at it. It now runs the first time a human opens the tender: we read the
+// stored requirements, and only if none exist yet (HTTP 404) do we trigger
+// extraction once, show an "analysing…" state, then render. Re-opening an
+// already-analysed tender just reads the cached row — no re-run, no re-charge
+// (the backend endpoint is idempotent too).
+function RequirementsPanel({ tenderId }: { tenderId: number }) {
+  const req = useSWR<TenderRequirements>(
+    `/tenders/${tenderId}/requirements`,
+    fetcher,
+    { revalidateOnFocus: false, shouldRetryOnError: false },
+  );
+  const [triggered, setTriggered] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [trigError, setTrigError] = useState<string | null>(null);
+
+  const mutate = req.mutate;
+  const trigger = useCallback(async () => {
+    setBusy(true);
+    setTrigError(null);
+    try {
+      await triggerExtractRequirements(tenderId);
+      await mutate();
+    } catch (e) {
+      setTrigError(
+        e instanceof Error ? e.message : "Couldn't analyse this tender.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }, [tenderId, mutate]);
+
+  // 404 means "not extracted yet" — the cue to run extraction on first open.
+  const notExtracted = req.error instanceof ApiError && req.error.status === 404;
+  useEffect(() => {
+    if (notExtracted && !triggered) {
+      setTriggered(true);
+      void trigger();
+    }
+  }, [notExtracted, triggered, trigger]);
+
+  if (req.data) {
+    return <RequirementsView req={req.data} />;
+  }
+  if (trigError) {
+    return (
+      <RequirementsError
+        message={trigError}
+        onRetry={() => {
+          setTriggered(true);
+          void trigger();
+        }}
+      />
+    );
+  }
+  if (busy || notExtracted) {
+    return <RequirementsAnalysing />;
+  }
+  if (req.error) {
+    return (
+      <RequirementsError
+        message="Couldn't load requirements."
+        onRetry={() => void req.mutate()}
+      />
+    );
+  }
+  return <RequirementsLoading />;
+}
+
+function RequirementsAnalysing() {
+  return (
+    <section
+      role="status"
+      className="rounded-2xl border border-border-strong bg-bg-elevated p-8 backdrop-blur-md"
+      style={{ borderRadius: "24px" }}
+    >
+      <PillKicker withDot={false}>Requirements</PillKicker>
+      <p className="text-text mt-5" style={{ fontSize: "16px", lineHeight: 1.6 }}>
+        <span className="mr-2 inline-block animate-pulse">●</span>
+        Analysing the tender documents…
+      </p>
+      <p className="text-text-muted mt-3" style={{ fontSize: "13px" }}>
+        First open only — usually under a minute. The page updates automatically.
+      </p>
+    </section>
+  );
+}
+
+function RequirementsLoading() {
+  return (
+    <section
+      role="status"
+      aria-busy
+      className="rounded-2xl border border-border-strong bg-bg-elevated p-8 backdrop-blur-md"
+      style={{ borderRadius: "24px" }}
+    >
+      <PillKicker withDot={false}>Requirements</PillKicker>
+      <p className="text-text-muted shimmer mt-5" style={{ fontSize: "14px" }}>
+        Loading…
+      </p>
+    </section>
+  );
+}
+
+function RequirementsError({
+  message,
+  onRetry,
+}: {
+  message: string;
+  onRetry: () => void;
+}) {
+  return (
+    <section
+      role="alert"
+      className="rounded-2xl border border-danger/40 bg-bg-elevated p-8 backdrop-blur-md"
+      style={{ borderRadius: "24px" }}
+    >
+      <PillKicker withDot={false}>Requirements</PillKicker>
+      <h2
+        className="font-display text-text mt-5 mb-3"
+        style={{ fontSize: "22px" }}
+      >
+        Couldn&apos;t analyse this tender
+      </h2>
+      <p
+        className="text-text-muted mb-6"
+        style={{ fontSize: "14px", lineHeight: 1.6 }}
+      >
+        {message}
+      </p>
+      <button type="button" onClick={onRetry} className="btn-secondary">
+        ↻ Retry
+      </button>
+    </section>
+  );
+}
+
+function RequirementsView({ req }: { req: TenderRequirements }) {
+  const mandatory = req.mandatory_requirements ?? [];
+  const criteria = req.evaluation_criteria ?? [];
+  const questions = req.questions_to_answer ?? [];
+  const risks = req.risk_flags ?? [];
+
+  return (
+    <section
+      className="rounded-2xl border border-border-strong bg-bg-elevated p-8 backdrop-blur-md"
+      style={{ borderRadius: "24px" }}
+    >
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <PillKicker withDot={false}>Requirements</PillKicker>
+        {req.recommendation && (
+          <span
+            className="rounded-full border border-border-strong px-3 py-1 uppercase"
+            style={{ fontSize: "11px", letterSpacing: "0.04em" }}
+          >
+            {req.recommendation}
+          </span>
+        )}
+      </div>
+
+      {req.summary && (
+        <p
+          className="text-text mt-5"
+          style={{ fontSize: "16px", lineHeight: 1.6 }}
+        >
+          {req.summary}
+        </p>
+      )}
+      {req.recommendation_reason && (
+        <p
+          className="text-text-muted mt-3"
+          style={{ fontSize: "14px", lineHeight: 1.6 }}
+        >
+          {req.recommendation_reason}
+        </p>
+      )}
+
+      {mandatory.length > 0 && (
+        <div className="mt-7">
+          <h3
+            className="text-text-muted mb-3 uppercase"
+            style={{ fontSize: "12px", letterSpacing: "0.04em" }}
+          >
+            Mandatory requirements
+          </h3>
+          <ul className="space-y-2">
+            {mandatory.map((r: RequirementItem, i: number) => (
+              <li
+                key={r.id ?? i}
+                className="text-text"
+                style={{ fontSize: "14px", lineHeight: 1.55 }}
+              >
+                <span className="mr-2 text-text-muted">•</span>
+                {r.requirement}
+                {r.confidence && r.confidence !== "high" && (
+                  <span className="text-text-muted" style={{ fontSize: "12px" }}>
+                    {" "}
+                    ({r.confidence} confidence)
+                  </span>
+                )}
+                {r.evidence_needed && (
+                  <span
+                    className="text-text-muted block"
+                    style={{ fontSize: "12px", marginLeft: "1rem" }}
+                  >
+                    Evidence: {r.evidence_needed}
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {criteria.length > 0 && (
+        <div className="mt-7">
+          <h3
+            className="text-text-muted mb-3 uppercase"
+            style={{ fontSize: "12px", letterSpacing: "0.04em" }}
+          >
+            Evaluation criteria
+          </h3>
+          <ul className="space-y-2">
+            {criteria.map((c: EvaluationCriterion, i: number) => (
+              <li
+                key={i}
+                className="text-text"
+                style={{ fontSize: "14px", lineHeight: 1.55 }}
+              >
+                <span className="mr-2 text-text-muted">•</span>
+                {c.criterion}
+                {c.weight_pct != null && (
+                  <span className="text-text-muted" style={{ fontSize: "12px" }}>
+                    {" "}
+                    ({c.weight_pct}%)
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {questions.length > 0 && (
+        <div className="mt-7">
+          <h3
+            className="text-text-muted mb-3 uppercase"
+            style={{ fontSize: "12px", letterSpacing: "0.04em" }}
+          >
+            Questions to answer
+          </h3>
+          <ul className="space-y-2">
+            {questions.map((q: QuestionToAnswer, i: number) => (
+              <li
+                key={q.id ?? i}
+                className="text-text"
+                style={{ fontSize: "14px", lineHeight: 1.55 }}
+              >
+                <span className="mr-2 text-text-muted">•</span>
+                {q.question}
+                {q.word_limit != null && (
+                  <span className="text-text-muted" style={{ fontSize: "12px" }}>
+                    {" "}
+                    ({q.word_limit} words)
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {risks.length > 0 && (
+        <div className="mt-7">
+          <h3
+            className="text-text-muted mb-3 uppercase"
+            style={{ fontSize: "12px", letterSpacing: "0.04em" }}
+          >
+            Risk flags
+          </h3>
+          <div className="flex flex-wrap gap-2">
+            {risks.map((flag: string, i: number) => (
+              <span
+                key={i}
+                className="rounded-full border border-border-strong px-3 py-1 text-text-muted"
+                style={{ fontSize: "12px" }}
+              >
+                {flag}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
 
 function BriefPanel({
   tenderId,

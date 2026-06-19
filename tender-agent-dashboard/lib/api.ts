@@ -51,30 +51,34 @@ export interface Tender {
   last_seen_at: string;
 }
 
+// These mirror the JSON the backend requirements_extractor produces (the
+// TenderRequirements columns are untyped list[dict] server-side). Keep the
+// keys in sync with services/requirements_extractor.py's USER_TEMPLATE.
 export interface EvaluationCriterion {
-  name: string;
-  weight?: number | null;
-  description?: string | null;
+  criterion: string;
+  weight_pct?: number | null;
+  notes?: string | null;
 }
 
 export interface RequirementItem {
-  text: string;
-  category?: string | null;
-  evidence_required?: string | null;
-  source_excerpt?: string | null;
+  id?: string | null;
+  requirement: string;
+  evidence_needed?: string | null; // mandatory_requirements
+  weight?: string | null; // desired_requirements
   confidence?: "low" | "medium" | "high" | null;
 }
 
 export interface DocumentRequired {
   name: string;
-  description?: string | null;
-  mandatory?: boolean | null;
+  kind?: string | null;
+  notes?: string | null;
 }
 
 export interface QuestionToAnswer {
+  id?: string | null;
   question: string;
   word_limit?: number | null;
-  weight?: number | null;
+  weight?: string | null;
   section?: string | null;
 }
 
@@ -465,6 +469,16 @@ export const getTender = (id: number) => request<Tender>(`/tenders/${id}`);
 
 export const getTenderRequirements = (id: number) =>
   request<TenderRequirements>(`/tenders/${id}/requirements`);
+
+// On-demand requirements extraction (cost fix): automatic extraction is off,
+// so the first time a human opens a tender the detail page triggers it here.
+// Idempotent on the backend — once stored, this returns the cached row without
+// re-running or re-charging, so calling it on a tender that's already analysed
+// is safe.
+export const triggerExtractRequirements = (id: number) =>
+  request<TenderRequirements>(`/admin/extract-requirements/${id}`, {
+    method: "POST",
+  });
 
 export const getTenderDocuments = (id: number) =>
   request<TenderDocumentFile[]>(`/tenders/${id}/documents`);
